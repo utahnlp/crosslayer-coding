@@ -3,6 +3,8 @@ import torch
 from typing import Dict, List, Tuple, Optional, Iterator, Callable, Union, Generator
 import logging
 import time
+from tqdm import tqdm
+import sys
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -257,7 +259,7 @@ class ActivationStore:
         tokens_added_this_fill = 0
         start_time = time.time()
 
-        logger.info(
+        logger.debug(
             f"Filling buffer. Current unread: {num_unread}. Target: {self.target_buffer_size_tokens}. Needed: {max(0, tokens_needed)}."
         )
 
@@ -293,7 +295,7 @@ class ActivationStore:
         end_time = time.time()
         current_buffer_size = self.read_indices.shape[0]
         final_unread = (~self.read_indices).sum().item()
-        logger.info(
+        logger.debug(
             f"Buffer fill finished in {end_time - start_time:.2f}s. Added {tokens_added_this_fill} tokens. "
             f"Total buffer size: {current_buffer_size}. Unread tokens: {final_unread}."
         )
@@ -429,8 +431,7 @@ class ActivationStore:
             )
 
         logger.info(
-            f"Estimating normalization statistics using up to "
-            f"{self.normalization_estimation_batches} batches from the generator..."
+            f">>> NORMALIZATION PHASE: Estimating statistics from {self.normalization_estimation_batches} batches <<<"
         )
 
         # Use Welford's algorithm for numerical stability
@@ -446,14 +447,40 @@ class ActivationStore:
         processed_batches = 0
         start_time = time.time()
 
+        # Store the original batches to reuse them later and not waste them
+        stored_batches = []
+        max_store_batches = min(
+            self.normalization_estimation_batches, 5
+        )  # Store at most 5 batches to save memory
+
+        print("\nComputing normalization statistics...")
+        sys.stdout.flush()  # Force output to display
+
+        norm_progress = tqdm(
+            range(self.normalization_estimation_batches),
+            desc="Normalization Progress",
+            leave=True,  # Keep the progress bar after completion
+        )
+
         try:
-            for batch_idx in range(self.normalization_estimation_batches):
+            for batch_idx in norm_progress:
                 try:
                     # Get next batch
                     batch_inputs_dict, batch_outputs_dict = next(
                         self.activation_generator
                     )
                     processed_batches += 1
+
+                    # Update progress bar description
+                    norm_progress.set_description(
+                        f"Processed batch {processed_batches}/{self.normalization_estimation_batches}"
+                    )
+
+                    # Store batch for later use in training (to avoid wasting data)
+                    if len(stored_batches) < max_store_batches:
+                        stored_batches.append(
+                            (batch_inputs_dict.copy(), batch_outputs_dict.copy())
+                        )
 
                     # Initialize stats dicts on first batch
                     if batch_idx == 0:
@@ -554,18 +581,41 @@ class ActivationStore:
                 )
 
             end_time = time.time()
-            logger.info(
-                f"Normalization statistics estimated successfully from {count} tokens "
-                f"({processed_batches} batches) in {end_time - start_time:.2f}s."
+            print(
+                f"\n>>> NORMALIZATION COMPLETE: Estimated from {count} tokens in {end_time - start_time:.2f}s <<<"
             )
+            sys.stdout.flush()  # Force output to display
+
+            # Now initialize the buffer with the stored batches to avoid wasting them
+            if stored_batches and not self.buffer_initialized:
+                logger.info(
+                    f"Initializing buffer with {len(stored_batches)} stored batches from normalization phase"
+                )
+                for batch_inputs_dict, batch_outputs_dict in stored_batches:
+                    # Initialize buffer metadata if this is the first batch
+                    if not self.buffer_initialized:
+                        self._initialize_buffer_metadata(
+                            (batch_inputs_dict, batch_outputs_dict)
+                        )
+
+                    # Now add the batch to our buffer
+                    self._add_batch_to_buffer((batch_inputs_dict, batch_outputs_dict))
+
+                logger.info(
+                    f"Buffer initialized with {(~self.read_indices).sum().item()} unread tokens"
+                )
+
         elif count <= 1:
             logger.warning(
-                f"Not enough data ({count} tokens) available to estimate normalization statistics reliably."
+                f">>> NORMALIZATION FAILED: Not enough data ({count} tokens) available <<<"
             )
             self.normalization_method = "none"  # Fall back to no normalization
         else:  # count == 0
-            logger.warning("No data processed during normalization estimation.")
+            logger.warning(">>> NORMALIZATION FAILED: No data processed <<<")
             self.normalization_method = "none"  # Fall back
+
+        print("\n>>> NORMALIZATION PHASE COMPLETE - STARTING TRAINING <<<\n")
+        sys.stdout.flush()  # Force output to display
 
     def _normalize_batch(
         self,

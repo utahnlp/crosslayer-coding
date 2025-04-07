@@ -22,8 +22,7 @@ class JumpReLU(torch.autograd.Function):
         Returns:
             Output tensor with JumpReLU applied
         """
-        ctx.save_for_backward(input)
-        ctx.threshold = threshold
+        ctx.save_for_backward(input, threshold)  # Save threshold for backward pass
         ctx.bandwidth = bandwidth
 
         # JumpReLU: 0 if x < threshold, x if x >= threshold
@@ -37,10 +36,9 @@ class JumpReLU(torch.autograd.Function):
             grad_output: Gradient from subsequent layer
 
         Returns:
-            Gradients for input and threshold.
+            Gradients for input and log_threshold.
         """
-        (input,) = ctx.saved_tensors
-        threshold = ctx.threshold
+        (input, threshold) = ctx.saved_tensors
         bandwidth = ctx.bandwidth
 
         # Mask for inputs within the STE window around the threshold
@@ -54,23 +52,19 @@ class JumpReLU(torch.autograd.Function):
         )  # Pass gradient only within the window
 
         # 2. Gradient for threshold
-        # d(JumpReLU)/d(theta) = d(z * H(z-theta))/d(theta) = z * d(H(z-theta))/d(theta)
+        # For d(JumpReLU)/d(threshold), we use:
+        # d(z * H(z-theta))/d(theta) = z * d(H(z-theta))/d(theta)
         # Using STE for dH/d(theta): approx -1/bandwidth within the window
-        # So, d(JumpReLU)/d(theta) approx z * (-1/bandwidth) = -input / bandwidth
-        # Full gradient dL/d(theta) = dL/d(output) * d(output)/d(theta)
         local_grad_theta = (-input / bandwidth) * is_near_threshold_float
         grad_threshold_per_element = grad_output * local_grad_theta
 
-        # Sum gradients across batch/sequence dimensions to match threshold shape [num_features]
+        # Sum gradients across batch/sequence dimensions to match threshold shape
         if grad_threshold_per_element.dim() > 1:
             dims_to_sum = tuple(range(grad_threshold_per_element.dim() - 1))
             grad_threshold = grad_threshold_per_element.sum(dim=dims_to_sum)
         else:
-            # Handle case where input might be 1D (e.g., single feature inference)
-            # Although unlikely in training batches
-            grad_threshold = (
-                grad_threshold_per_element  # Already correct shape potentially
-            )
+            # Handle case where input might be 1D
+            grad_threshold = grad_threshold_per_element
 
         # Return gradients for input, threshold, and None for bandwidth
         return grad_input, grad_threshold, None
@@ -109,9 +103,10 @@ class CrossLayerTranscoder(BaseTranscoder):
         # Initialize parameters
         self._init_parameters()
 
-        # JumpReLU activation parameters
-        self.threshold = nn.Parameter(
-            torch.ones(config.num_features) * config.jumprelu_threshold
+        # Use log_threshold to ensure positivity of the threshold
+        self.log_threshold = nn.Parameter(
+            torch.ones(config.num_features)
+            * torch.log(torch.tensor(config.jumprelu_threshold))
         )
         self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
 
@@ -136,7 +131,9 @@ class CrossLayerTranscoder(BaseTranscoder):
         Returns:
             Activated tensor
         """
-        return JumpReLU.apply(x, self.threshold, self.bandwidth)
+        # Convert log_threshold to threshold via exponentiation
+        threshold = torch.exp(self.log_threshold)
+        return JumpReLU.apply(x, threshold, self.bandwidth)
 
     def get_preactivations(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Get pre-activation values for features at the specified layer.

@@ -22,6 +22,8 @@ import time
 
 # Import components from the clt library
 # (Ensure the 'clt' directory is in your Python path or installed)
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 try:
     from clt.config import CLTConfig, TrainingConfig
     from clt.training.trainer import CLTTrainer
@@ -93,7 +95,7 @@ training_config = TrainingConfig(
     dataset_trust_remote_code=False,  # Standard dataset, no special code needed
     cache_path=None,  # Path to cache downloaded data (optional)
     # Activation extraction parameters
-    context_size=128,  # Using smaller context size to avoid sequence length issues
+    context_size=128,
     store_batch_size_prompts=2,  # Reduced to avoid potential memory issues
     batch_size=6,  # Reduced to conserve memory (total tokens = batch_size * context_size = 768)
     exclude_special_tokens=True,
@@ -102,17 +104,19 @@ training_config = TrainingConfig(
     n_batches_in_buffer=4,  # Reduced buffer size to conserve memory
     # Using 'none' normalization to avoid extraction issues in tutorial
     # In production, 'estimated_mean_std' would be preferred
-    normalization_method="none",
-    normalization_estimation_batches=10,  # Only used if normalization_method is not "none"
+    normalization_method="estimated_mean_std",
+    normalization_estimation_batches=10,  # Number of batches used for statistics estimation
     # Training parameters
     learning_rate=3e-4,
-    training_steps=100,  # Very small number for quick tutorial demonstration
-    sparsity_lambda=30,  # Increased from 0.001 for more visible effect
-    sparsity_c=5.0,  # Default value from paper
-    preactivation_coef=100,  # Increased from 3e-6 for more visible effect
+    training_steps=1000,
+    sparsity_lambda=30,
+    sparsity_c=1.0,  # Default value from paper: 1.0
+    preactivation_coef=3e-6,  # Default value: 3e-6
     optimizer="adamw",
     lr_scheduler="linear",
-    max_samples=100000,  # Reduced from 50 to lower memory requirements
+    max_samples=1000000,
+    eval_interval=10,
+    log_interval=10,
     enable_wandb=True,
     wandb_project="clt-tutorial",
 )
@@ -195,13 +199,21 @@ except Exception as e:
     raise
 
 # Start training
-# This will run for `training_config.training_steps` and print progress.
-# eval_every controls how often L0 sparsity is computed and checkpoints are saved.
-print("\nStarting training...")
-print("The trainer will first estimate normalization statistics, then begin training.")
+print("\nStep 2: Setup phase...")
+if training_config.normalization_method == "estimated_mean_std":
+    print("Estimating normalization statistics from the dataset...")
+    print("This process analyzes activation distributions to standardize inputs.")
+    print(
+        f"Using {training_config.normalization_estimation_batches} batches for estimation."
+    )
+else:
+    print(f"Using normalization method: {training_config.normalization_method}")
+
+print("\nStep 3: Beginning training...")
 print(
-    "This may take a moment as it loads the model and first batches from the dataset."
+    f"Training for {training_config.training_steps} steps with batch size {training_config.batch_size}."
 )
+print("The process will load the model and create the activation pipeline.")
 
 try:
     start_train_time = time.time()

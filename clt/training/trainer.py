@@ -315,62 +315,61 @@ class CLTTrainer:
             print(f"Warning: Failed to save metrics to {metrics_path}: {e}")
 
     def _compute_l0(
-        self, threshold: float = 0.01
+        self, inputs: Dict[int, torch.Tensor]
     ) -> Dict[str, Union[float, Dict[str, float]]]:
-        """Compute L0 statistics for the model using a sample batch.
+        """Compute L0 stats: avg active features per token, summed across layers.
 
         Args:
-            threshold: Threshold for counting activations
+            inputs: Dictionary mapping layer indices to input activations from the
+                    current training batch.
 
         Returns:
-            Dictionary of L0 statistics
+            Dictionary of L0 statistics:
+                - total_l0: Average active features per token, summed across layers.
+                - avg_l0: Average of the per-layer L0s (total_l0 / num_layers).
+                - sparsity: Overall sparsity (1 - total_l0 / total_possible_features).
+                - per_layer: Dictionary mapping layer index to its avg active features
+                  per token.
         """
-        try:
-            # Get a sample batch (only need inputs for feature activation)
-            inputs, _ = next(iter(self.activation_store))  # Use iterator protocol
-        except StopIteration:
+        # Ensure inputs are valid
+        if not inputs or not any(v.numel() > 0 for v in inputs.values()):
             print(
-                "Warning: Could not get batch for L0 computation (store empty?). "
+                "Warning: Received empty or invalid inputs for L0 computation. "
                 "Returning zeros."
             )
-            # Return default zero values if no batch is available
             return {
-                "avg_l0": 0.0,
                 "total_l0": 0.0,
-                "total_features": self.clt_config.num_layers
-                * self.clt_config.num_features,
-                "sparsity": 1.0,
-                "per_layer": {
-                    f"layer_{i}": 0.0 for i in range(self.clt_config.num_layers)
-                },
-            }
-        except Exception as e:
-            print(f"Error getting batch for L0 computation: {e}. Returning zeros.")
-            # Return default zero values on other errors
-            return {
                 "avg_l0": 0.0,
-                "total_l0": 0.0,
-                "total_features": self.clt_config.num_layers
-                * self.clt_config.num_features,
                 "sparsity": 1.0,
                 "per_layer": {
                     f"layer_{i}": 0.0 for i in range(self.clt_config.num_layers)
                 },
             }
 
-        # Ensure inputs are on the correct device (ActivationStore should handle this,
-        # but double-check)
-        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        # Ensure inputs are on the correct device
+        try:
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        except Exception as e:
+            print(
+                f"Error moving inputs to device in L0 computation: {e}. "
+                f"Returning zeros."
+            )
+            return {
+                "total_l0": 0.0,
+                "avg_l0": 0.0,
+                "sparsity": 1.0,
+                "per_layer": {
+                    f"layer_{i}": 0.0 for i in range(self.clt_config.num_layers)
+                },
+            }
 
         # Get activations
         with torch.no_grad():
-            # Assuming model.get_feature_activations takes the input dict
             activations = self.model.get_feature_activations(inputs)
 
-        # Compute L0 for each layer
-        l0_per_layer = {}
-        total_l0 = 0.0  # Use float for accumulation
-        total_features = 0
+        per_layer_l0 = {}
+        total_l0 = 0.0  # Sum of per-layer average active features per token
+        num_valid_layers = 0
 
         # Ensure activations keys match expected layers if possible
         expected_layers = set(range(self.clt_config.num_layers))
@@ -383,43 +382,46 @@ class CLTTrainer:
 
         # Iterate through layers present in activations
         for layer_idx, layer_activations in activations.items():
-            if layer_activations.numel() == 0:
-                l0 = 0.0
+            # layer_activations shape: [num_tokens, num_features]
+            if layer_activations.numel() == 0 or layer_activations.shape[0] == 0:
+                per_layer_l0[f"layer_{layer_idx}"] = 0.0
                 print(
                     f"Warning: Empty activations for layer {layer_idx} in L0 "
                     f"computation."
                 )
-            else:
-                # Count non-zero activations (above threshold)
-                above_threshold = (
-                    (layer_activations.abs() > threshold).float().mean().item()
-                )
-                l0 = (
-                    above_threshold * self.clt_config.num_features
-                )  # Assuming num_features is per layer
+                continue
 
-            l0_per_layer[f"layer_{layer_idx}"] = l0
-            total_l0 += l0
-            total_features += self.clt_config.num_features
+            # 1. Count active features for EACH token (sum along feature dim)
+            # Shape: [num_tokens]
+            active_count_per_token = (layer_activations != 0).float().sum(dim=-1)
 
-        # Compute average L0 - handle division by zero if no layers found
-        num_active_layers = len(activations)
-        avg_l0 = total_l0 / num_active_layers if num_active_layers > 0 else 0.0
-        total_expected_features = (
+            # 2. Average this count across tokens for this layer
+            avg_active_this_layer = active_count_per_token.mean().item()
+
+            per_layer_l0[f"layer_{layer_idx}"] = avg_active_this_layer
+            total_l0 += avg_active_this_layer
+            num_valid_layers += 1
+
+        # Calculate average L0 across layers
+        avg_l0 = total_l0 / num_valid_layers if num_valid_layers > 0 else 0.0
+
+        # Calculate overall sparsity
+        total_possible_features = (
             self.clt_config.num_layers * self.clt_config.num_features
         )
         sparsity = (
-            1.0 - (total_l0 / total_expected_features)
-            if total_expected_features > 0
+            1.0 - (total_l0 / total_possible_features)
+            if total_possible_features > 0
             else 1.0
         )
+        # Clamp sparsity between 0 and 1
+        sparsity = max(0.0, min(1.0, sparsity))
 
         return {
-            "avg_l0": avg_l0,
-            "total_l0": total_l0,
-            "total_features": total_expected_features,  # Report expected total features
+            "total_l0": total_l0,  # Avg active features/token summed across layers
+            "avg_l0": avg_l0,  # Average of per-layer L0s
             "sparsity": sparsity,
-            "per_layer": l0_per_layer,
+            "per_layer": per_layer_l0,  # Avg active features/token per layer
         }
 
     def _save_checkpoint(self, step: int):
@@ -559,11 +561,45 @@ class CLTTrainer:
         print(f"Training for {self.training_config.training_steps} steps.")
         print(f"Logging to {self.log_dir}")
 
+        # Check if using normalization and notify user
+        if self.training_config.normalization_method == "estimated_mean_std":
+            print("\n>>> NORMALIZATION PHASE <<<")
+            print(
+                "Normalization statistics are being estimated from dataset activations."
+            )
+            print(
+                "This may take some time, but happens only once before training begins."
+            )
+            print(
+                f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n"
+            )
+
+        # Make sure we flush stdout to ensure prints appear immediately,
+        # especially important in Jupyter/interactive environments
+        import sys
+
+        sys.stdout.flush()
+
+        # Wait for 1 second to ensure output is displayed before training starts
+        time.sleep(1)
+
         # Training loop using ActivationStore as iterator
-        pbar = tqdm(range(self.training_config.training_steps), desc="Training CLT")
+        print("\n>>> TRAINING PHASE <<<")
+        sys.stdout.flush()
+
+        # Use tqdm to create progress bar for training
+        pbar = tqdm(
+            range(self.training_config.training_steps),
+            desc="Training CLT",
+            leave=True,  # Keep progress bar after completion
+        )
+
         step = 0
         try:
             for step in pbar:
+                # Force display update of progress bar
+                pbar.refresh()
+
                 try:
                     # Get batch directly from the iterator
                     inputs, targets = next(self.activation_store)
@@ -573,11 +609,6 @@ class CLTTrainer:
                 except Exception as e:
                     print(f"\nError getting batch at step {step}: {e}. Skipping step.")
                     continue  # Skip this step if batch fetching fails
-
-                # Ensure tensors are on the correct device
-                # (ActivationStore should handle this)
-                # inputs = {k: v.to(self.device) for k, v in inputs.items()}
-                # targets = {k: v.to(self.device) for k, v in targets.items()}
 
                 # --- Check for empty batch --- (Optional but good practice)
                 if (
@@ -625,12 +656,18 @@ class CLTTrainer:
                     self.scheduler.step()
 
                 # --- Update progress bar ---
-                pbar.set_description(
+                description = (
                     f"Loss: {loss_dict.get('total', float('nan')):.4f} "
                     f"(R: {loss_dict.get('reconstruction', float('nan')):.4f} "
                     f"S: {loss_dict.get('sparsity', float('nan')):.4f} "
                     f"P: {loss_dict.get('preactivation', float('nan')):.4f})"
                 )
+                pbar.set_description(description)
+
+                # Force update to display progress
+                if step % 1 == 0:  # Update every step
+                    pbar.refresh()
+                    sys.stdout.flush()
 
                 # --- Log metrics ---
                 self._log_metrics(step, loss_dict)
@@ -647,13 +684,16 @@ class CLTTrainer:
                 )
 
                 if run_eval_flag:
-                    l0_stats = self._compute_l0()
+                    # Pass the current input batch to _compute_l0
+                    l0_stats = self._compute_l0(inputs)
                     self.metrics["l0_stats"].append({"step": step, **l0_stats})
                     l0_msg = (
-                        f"L0: {l0_stats['avg_l0']:.2f} "
+                        f"Layerwise L0: {l0_stats['avg_l0']:.2f} "
+                        f"Total L0: {l0_stats['total_l0']:.2f} "
                         f"(Spar: {l0_stats['sparsity']:.3f})"
                     )
                     pbar.set_postfix_str(l0_msg)
+                    pbar.refresh()  # Force update
 
                     # Log evaluation metrics to WandB
                     self.wandb_logger.log_evaluation(step, l0_stats)
