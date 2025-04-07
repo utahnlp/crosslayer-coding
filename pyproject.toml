@@ -1,0 +1,52 @@
+[tool.black]
+line-length = 88
+target-version = ['py37']
+include = '\.pyi?$'
+
+[tool.flake8]
+max-line-length = 88
+extend-ignore = "E203"  # Ignore whitespace before ':' (conflicts with Black)
+per-file-ignores = []
+exclude = [
+    ".git",
+    "__pycache__",
+    "build",
+    "dist",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "clt"
+version = "0.0.1"
+description = "Cross-Layer Transcoder Library"
+readme = "README.md"
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",  # Assuming MIT, change if needed
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "torch>=2.0.0",
+    "nnsight>=0.1.0",
+    "transformers>=4.30.0",
+    "tqdm>=4.64.0",
+    "numpy>=1.24.0",
+    # pytest is primarily a dev dependency
+    # Add other core dependencies here as needed
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    # Add other development dependencies like linters, formatters etc.
+]
+
+[tool.setuptools.packages.find]
+where = ["."]  # Root directory contains the 'clt' package
+include = ["clt*"]
+exclude = ["tests*"] # Exclude tests from the package itself 
