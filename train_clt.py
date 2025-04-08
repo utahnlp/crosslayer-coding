@@ -6,6 +6,7 @@ Script to train a Cross-Layer Transcoder (CLT) on GPT-2.
 import argparse
 import torch
 from pathlib import Path
+from typing import Literal, Optional
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.training.trainer import CLTTrainer
@@ -15,18 +16,142 @@ def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="Train a CLT on GPT-2")
 
-    # Model configuration
+    # --- CLT Configuration ---
     parser.add_argument(
         "--num-features", type=int, default=300, help="Number of features per layer"
     )
     parser.add_argument(
-        "--model", type=str, default="gpt2", help="Model to extract activations from"
+        "--activation-fn",
+        type=str,
+        choices=["jumprelu", "relu"],
+        default="jumprelu",
+        help="Activation function for CLT",
+    )
+    parser.add_argument(
+        "--jumprelu-threshold",
+        type=float,
+        default=0.03,
+        help="Threshold for JumpReLU activation",
+    )
+    parser.add_argument(
+        "--clt-dtype",
+        type=str,
+        default=None,
+        help="Data type for the CLT model (e.g., float16)",
     )
 
-    # Training configuration
+    # --- Base Model Configuration ---
     parser.add_argument(
-        "--batch-size", type=int, default=64, help="Batch size for training"
+        "--model",
+        type=str,
+        default="gpt2",
+        help="Base model to extract activations from",
     )
+    parser.add_argument(
+        "--model-dtype",
+        type=str,
+        default=None,
+        help="Data type for the base model (e.g., bfloat16, float16)",
+    )
+
+    # --- Dataset Configuration ---
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        required=True,
+        help="Path or name of the HuggingFace dataset",
+    )
+    parser.add_argument(
+        "--dataset-split", type=str, default="train", help="Dataset split to use"
+    )
+    parser.add_argument(
+        "--dataset-text-column",
+        type=str,
+        default="text",
+        help="Name of the column containing text data",
+    )
+    parser.add_argument(
+        "--streaming", action="store_true", default=True, help="Use streaming dataset"
+    )
+    parser.add_argument(
+        "--no-streaming",
+        action="store_false",
+        dest="streaming",
+        help="Do not use streaming dataset",
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        default=False,
+        help="Trust remote code for dataset loading",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Maximum number of samples to process from dataset",
+    )
+    parser.add_argument(
+        "--cache-path",
+        type=str,
+        default=None,
+        help="Path to cache extracted activations",
+    )
+
+    # --- Tokenization & Batching Configuration ---
+    parser.add_argument(
+        "--context-size",
+        type=int,
+        default=1024,
+        help="Context window size for processing",
+    )
+    parser.add_argument(
+        "--prepend-bos", action="store_true", default=True, help="Prepend BOS token"
+    )
+    parser.add_argument(
+        "--no-prepend-bos",
+        action="store_false",
+        dest="prepend_bos",
+        help="Do not prepend BOS token",
+    )
+    parser.add_argument(
+        "--exclude-special-tokens",
+        action="store_true",
+        default=False,
+        help="Exclude special tokens during activation extraction",
+    )
+    parser.add_argument(
+        "--store-batch-size-prompts",
+        type=int,
+        default=4,
+        help="Number of prompts per activation extraction batch",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=64, help="Batch size for CLT training"
+    )
+    parser.add_argument(
+        "--n-batches-in-buffer",
+        type=int,
+        default=16,
+        help="Number of extraction batches to keep in the buffer",
+    )
+
+    # --- Normalization Configuration ---
+    parser.add_argument(
+        "--normalization-method",
+        type=str,
+        choices=["mean_std", "estimated_mean_std", "none"],
+        default="mean_std",
+        help="Method for normalizing activations",
+    )
+    parser.add_argument(
+        "--normalization-estimation-batches",
+        type=int,
+        default=50,
+        help="Number of batches to estimate normalization stats (if method='estimated_mean_std')",
+    )
+
+    # --- Training & Optimization Configuration ---
     parser.add_argument(
         "--learning-rate", type=float, default=1e-4, help="Learning rate"
     )
@@ -40,46 +165,81 @@ def parse_args():
         help="Coefficient for sparsity penalty",
     )
     parser.add_argument(
-        "--jumprelu-threshold",
+        "--sparsity-c",
         type=float,
-        default=0.03,
-        help="Threshold for JumpReLU activation",
-    )
-
-    # Data configuration
-    parser.add_argument(
-        "--dataset", type=str, required=True, help="Path to text dataset"
+        default=1.0,
+        help="Parameter for sparsity penalty shape",
     )
     parser.add_argument(
-        "--dataset-split", type=str, default="train", help="Dataset split to use"
+        "--preactivation-coef",
+        type=float,
+        default=3e-6,
+        help="Coefficient for pre-activation loss",
     )
     parser.add_argument(
-        "--dataset-text-column",
+        "--optimizer",
         type=str,
-        default="text",
-        help="Name of the column containing text data",
+        choices=["adam", "adamw"],
+        default="adamw",
+        help="Optimizer to use",
     )
     parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        help="Maximum number of samples to process",
-    )
-    parser.add_argument(
-        "--context-size",
-        type=int,
-        default=1024,
-        help="Context window size for processing",
+        "--lr-scheduler",
+        type=str,
+        choices=["linear", "cosine", "none"],
+        default="linear",
+        help="Learning rate scheduler type ('none' to disable)",
     )
 
-    # Output configuration
+    # --- Logging & Evaluation Configuration ---
     parser.add_argument(
         "--output-dir", type=str, default="clt_output", help="Directory to save outputs"
     )
-
-    # Device configuration
     parser.add_argument(
-        "--device", type=str, default=None, help="Device to use (e.g., 'cuda', 'cpu')"
+        "--log-interval", type=int, default=100, help="Log metrics every N steps"
+    )
+    parser.add_argument(
+        "--eval-interval", type=int, default=1000, help="Evaluate model every N steps"
+    )
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=1000,
+        help="Save checkpoint every N steps",
+    )
+    parser.add_argument(
+        "--dead-feature-window",
+        type=int,
+        default=1000,
+        help="Number of steps until a feature is considered dead",
+    )
+
+    # --- WandB Configuration ---
+    parser.add_argument(
+        "--enable-wandb",
+        action="store_true",
+        default=False,
+        help="Enable WandB logging",
+    )
+    parser.add_argument(
+        "--wandb-project", type=str, default=None, help="WandB project name"
+    )
+    parser.add_argument(
+        "--wandb-entity", type=str, default=None, help="WandB entity name"
+    )
+    parser.add_argument(
+        "--wandb-run-name", type=str, default=None, help="WandB run name"
+    )
+    parser.add_argument(
+        "--wandb-tags", nargs="+", default=None, help="List of WandB tags"
+    )
+
+    # --- Device Configuration ---
+    parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Device to use (e.g., 'cuda', 'cpu', 'mps')",
     )
 
     return parser.parse_args()
@@ -129,8 +289,14 @@ def main():
         num_features=args.num_features,
         num_layers=num_layers,
         d_model=d_model,
-        activation_fn="jumprelu",
+        activation_fn=args.activation_fn,
         jumprelu_threshold=args.jumprelu_threshold,
+        clt_dtype=args.clt_dtype,
+    )
+
+    # Handle 'none' scheduler case
+    lr_scheduler_arg: Optional[Literal["linear", "cosine"]] = (
+        args.lr_scheduler if args.lr_scheduler != "none" else None
     )
 
     training_config = TrainingConfig(
@@ -139,26 +305,45 @@ def main():
         training_steps=args.training_steps,
         # Model parameters
         model_name=args.model,
+        model_dtype=args.model_dtype,
         # Dataset parameters
         dataset_path=args.dataset,
         dataset_split=args.dataset_split,
         dataset_text_column=args.dataset_text_column,
-        streaming=True,
+        streaming=args.streaming,
+        dataset_trust_remote_code=args.trust_remote_code,
         max_samples=args.max_samples,
+        cache_path=args.cache_path,
         # Tokenization parameters
         context_size=args.context_size,
-        prepend_bos=True,
-        exclude_special_tokens=True,
+        prepend_bos=args.prepend_bos,
+        exclude_special_tokens=args.exclude_special_tokens,
         # Batch size parameters
         batch_size=args.batch_size,
-        store_batch_size_prompts=4,
-        n_batches_in_buffer=16,
+        store_batch_size_prompts=args.store_batch_size_prompts,
+        n_batches_in_buffer=args.n_batches_in_buffer,
         # Normalization parameters
-        normalization_method="mean_std",
+        normalization_method=args.normalization_method,
+        normalization_estimation_batches=args.normalization_estimation_batches,
         # Loss function coefficients
         sparsity_lambda=args.sparsity_lambda,
-        sparsity_c=1.0,
-        preactivation_coef=3e-6,
+        sparsity_c=args.sparsity_c,
+        preactivation_coef=args.preactivation_coef,
+        # Optimizer parameters
+        optimizer=args.optimizer,
+        lr_scheduler=lr_scheduler_arg,
+        # Logging parameters
+        log_interval=args.log_interval,
+        eval_interval=args.eval_interval,
+        checkpoint_interval=args.checkpoint_interval,
+        # Dead feature tracking
+        dead_feature_window=args.dead_feature_window,
+        # WandB logging configuration
+        enable_wandb=args.enable_wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_tags=args.wandb_tags,
     )
 
     # Create trainer
@@ -172,7 +357,7 @@ def main():
 
     # Train model
     print("Starting training...")
-    trainer.train(eval_every=1000)
+    trainer.train(eval_every=args.eval_interval)
 
     print("Training complete!")
 

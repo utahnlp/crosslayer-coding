@@ -111,7 +111,7 @@ training_config = TrainingConfig(
     # Training parameters
     learning_rate=3e-5,
     training_steps=1000,
-    sparsity_lambda=5,  # Default unknown
+    sparsity_lambda=15,  # Default unknown
     sparsity_c=1.0,  # Default value from paper: 1.0
     preactivation_coef=3e-6,  # Default value: 3e-6
     optimizer="adamw",
