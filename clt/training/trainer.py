@@ -257,8 +257,8 @@ class CLTTrainer:
         self.log_dir = log_dir or f"clt_train_{int(time.time())}"
         os.makedirs(self.log_dir, exist_ok=True)
 
-        # Initialize model
-        self.model = CrossLayerTranscoder(clt_config).to(self.device)
+        # Initialize model, passing device for direct initialization
+        self.model = CrossLayerTranscoder(clt_config, device=self.device)
 
         # Initialize optimizer
         if training_config.optimizer == "adam":
@@ -339,6 +339,7 @@ class CLTTrainer:
         return ActivationExtractorCLT(
             model_name=self.training_config.model_name,
             device=self.device,
+            model_dtype=self.training_config.model_dtype,
             context_size=self.training_config.context_size,
             store_batch_size_prompts=self.training_config.store_batch_size_prompts,
             exclude_special_tokens=self.training_config.exclude_special_tokens,
@@ -486,7 +487,6 @@ class CLTTrainer:
             return
         try:
             self.model.load(checkpoint_path)
-            self.model = self.model.to(self.device)
             print(f"Loaded model checkpoint from {checkpoint_path}")
         except Exception as e:
             print(f"Error loading model checkpoint from {checkpoint_path}: {e}")

@@ -11,6 +11,9 @@ class CLTConfig:
     d_model: int  # Dimension of model's hidden state
     activation_fn: Literal["jumprelu", "relu"] = "jumprelu"
     jumprelu_threshold: float = 0.03  # Threshold for JumpReLU activation
+    clt_dtype: Optional[str] = (
+        None  # Optional dtype for the CLT model itself (e.g., "float16")
+    )
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -30,6 +33,9 @@ class TrainingConfig:
 
     # Model parameters
     model_name: str = "gpt2"  # Name of the model to extract activations from
+    model_dtype: Optional[str] = (
+        None  # Optional dtype for the model (e.g., "float16", "bfloat16")
+    )
 
     # Dataset parameters
     dataset_path: str = "NeelNanda/pile-10k"  # Path or name of the HuggingFace dataset

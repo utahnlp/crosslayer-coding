@@ -68,7 +68,7 @@ BASE_MODEL_NAME = "gpt2"  # Using GPT-2 small
 # We need to match the base model's dimensions
 gpt2_num_layers = 12
 gpt2_d_model = 768
-expansion_factor = 4  # Reduced from 2 to lower memory requirements even further
+expansion_factor = 4
 
 # For the tutorial, let's use a smaller number of features than d_model
 clt_num_features = gpt2_d_model * expansion_factor
@@ -76,6 +76,7 @@ clt_config = CLTConfig(
     num_features=clt_num_features,
     num_layers=gpt2_num_layers,  # Must match the base model
     d_model=gpt2_d_model,  # Must match the base model
+    # clt_dtype="bfloat16",
     activation_fn="jumprelu",  # As described in the paper
     jumprelu_threshold=0.03,  # Default value from paper
 )
@@ -87,6 +88,7 @@ print(clt_config)
 training_config = TrainingConfig(
     # Model parameters
     model_name=BASE_MODEL_NAME,  # Model to extract activations from
+    # model_dtype="bfloat16",
     # Dataset parameters
     dataset_path="monology/pile-uncopyrighted",  # Common dataset with lots of text
     dataset_split="train",
@@ -107,9 +109,9 @@ training_config = TrainingConfig(
     normalization_method="estimated_mean_std",
     normalization_estimation_batches=10,  # Number of batches used for statistics estimation
     # Training parameters
-    learning_rate=1e-5,
+    learning_rate=3e-5,
     training_steps=1000,
-    sparsity_lambda=1,  # Default unknown
+    sparsity_lambda=5,  # Default unknown
     sparsity_c=1.0,  # Default value from paper: 1.0
     preactivation_coef=3e-6,  # Default value: 3e-6
     optimizer="adamw",

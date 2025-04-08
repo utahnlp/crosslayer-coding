@@ -20,6 +20,7 @@ class ActivationExtractorCLT:
         self,
         model_name: str,
         device: Optional[Union[str, torch.device]] = None,
+        model_dtype: Optional[Union[str, torch.dtype]] = None,
         context_size: int = 128,
         store_batch_size_prompts: int = 512,
         mlp_input_module_path_template: str = "transformer.h.{}.mlp.input",
@@ -35,6 +36,7 @@ class ActivationExtractorCLT:
         Args:
             model_name: Name or path of the Hugging Face transformer model.
             device: Device to run the model on ('cuda', 'cpu', etc.). Auto-detects if None.
+            model_dtype: Optional data type for model weights (e.g., torch.float16, "bfloat16").
             context_size: Maximum sequence length for tokenization.
             store_batch_size_prompts: Number of text prompts to process in each model forward pass.
             mlp_input_module_path_template: String template for the NNsight path to MLP input modules.
@@ -50,6 +52,7 @@ class ActivationExtractorCLT:
         self.device = device or (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
+        self.model_dtype = self._resolve_dtype(model_dtype)
         self.context_size = context_size
         self.store_batch_size_prompts = store_batch_size_prompts
         self.mlp_input_module_path_template = mlp_input_module_path_template
@@ -76,9 +79,28 @@ class ActivationExtractorCLT:
         self.model, self.tokenizer = self._load_model_and_tokenizer()
         self.num_layers = self._get_num_layers()
 
+    def _resolve_dtype(
+        self, dtype_input: Optional[Union[str, torch.dtype]]
+    ) -> Optional[torch.dtype]:
+        """Converts string dtype names to torch.dtype objects."""
+        if isinstance(dtype_input, torch.dtype):
+            return dtype_input
+        if isinstance(dtype_input, str):
+            try:
+                return getattr(torch, dtype_input)
+            except AttributeError:
+                logger.warning(f"Unsupported dtype string: '{dtype_input}'. Ignoring.")
+                return None
+        return None
+
     def _load_model_and_tokenizer(self):
-        """Loads the LanguageModel and its tokenizer."""
-        model = LanguageModel(self.model_name, device_map=self.device, dispatch=True)
+        """Loads the LanguageModel and its tokenizer, passing dtype."""
+        model = LanguageModel(
+            self.model_name,
+            device_map=self.device,
+            torch_dtype=self.model_dtype,
+            dispatch=True,
+        )
         tokenizer = model.tokenizer
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
