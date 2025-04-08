@@ -6,12 +6,14 @@ import os
 import json
 import time
 import importlib.util
+import sys
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
 from clt.training.data import ActivationStore
 from clt.training.losses import LossManager
 from clt.nnsight.extractor import ActivationExtractorCLT
+from .evaluator import CLTEvaluator  # Import the new evaluator
 
 
 class WandBLogger:
@@ -68,57 +70,123 @@ class WandBLogger:
             print(f"WandB logging initialized: {wandb.run.name}")
 
     def log_step(
-        self, step: int, loss_dict: Dict[str, float], lr: Optional[float] = None
+        self,
+        step: int,
+        loss_dict: Dict[str, float],
+        lr: Optional[float] = None,
+        sparsity_lambda: Optional[float] = None,
     ):
-        """Log metrics for a training step.
+        """Log metrics for a training step under the 'training/' group.
 
         Args:
             step: Current training step
-            loss_dict: Dictionary of loss values
+            loss_dict: Dictionary of loss values (e.g., total, reconstruction, sparsity)
             lr: Current learning rate
+            sparsity_lambda: Current sparsity coefficient lambda
         """
         if not self.enabled:
             return
 
         import wandb
 
-        # Create metrics dict with 'train/' prefix for losses
-        metrics = {f"train/{k}": v for k, v in loss_dict.items()}
+        # Rename loss keys for clarity and add 'training/' prefix
+        metrics = {}
+        for key, value in loss_dict.items():
+            if key == "total":
+                metrics["training/total_loss"] = value
+            elif key == "sparsity":
+                metrics["training/sparsity_loss"] = value
+            elif key == "reconstruction":
+                # Reconstruction loss is part of training, log it here too if present
+                metrics["training/reconstruction_loss"] = value
+            elif key == "preactivation":
+                metrics["training/preactivation_loss"] = value
+            else:
+                # Keep other potential keys, prepending 'training/'
+                metrics[f"training/{key}"] = value
 
-        # Add learning rate if provided
+        # Add learning rate
         if lr is not None:
-            metrics["train/learning_rate"] = lr
+            metrics["training/learning_rate"] = lr
+
+        # Add sparsity lambda
+        if sparsity_lambda is not None:
+            metrics["training/sparsity_lambda"] = sparsity_lambda
 
         # Log to wandb
         wandb.log(metrics, step=step)
 
-    def log_evaluation(self, step: int, l0_stats: Dict[str, Any]):
-        """Log evaluation metrics.
+    def log_evaluation(self, step: int, eval_metrics: Dict[str, Any]):
+        """Log evaluation metrics, organized by the structure from CLTEvaluator.
 
         Args:
             step: Current training step
-            l0_stats: Dictionary of L0 statistics
+            eval_metrics: Dictionary of evaluation metrics from CLTEvaluator
+                          (keys like 'reconstruction/', 'sparsity/', 'layerwise/')
         """
         if not self.enabled:
             return
 
         import wandb
 
-        # Create metrics dict
-        metrics = {
-            "eval/avg_l0": l0_stats.get("avg_l0", 0.0),
-            "eval/total_l0": l0_stats.get("total_l0", 0.0),
-            "eval/sparsity": l0_stats.get("sparsity", 1.0),
-        }
+        # Log metrics directly, assuming keys are already structured
+        # e.g., 'reconstruction/mse', 'sparsity/avg_l0', 'layerwise/l0/layer_0'
+        wandb_log_dict: Dict[str, Any] = {}
+        for key, value in eval_metrics.items():
+            if key.startswith("layerwise/"):
+                # Handle nested layerwise data (histograms and scalars)
+                layerwise_category = key.split("/")[
+                    1
+                ]  # e.g., 'l0', 'log_feature_density'
+                if isinstance(value, dict):
+                    for layer_key, layer_value in value.items():
+                        # Construct wandb key: e.g., layerwise/l0/layer_0
+                        wandb_key = f"{key}/{layer_key}"  # Correctly forms e.g. layerwise/log_feature_density/layer_0
+                        if isinstance(layer_value, list):
+                            # Log list data as histogram
+                            try:
+                                wandb_log_dict[wandb_key] = wandb.Histogram(layer_value)
+                            except Exception as e:
+                                print(
+                                    f"Wandb: Error creating histogram for {wandb_key}: {e}"
+                                )
+                                # Fallback: log mean or placeholder
+                                try:
+                                    mean_val = (
+                                        sum(layer_value) / len(layer_value)
+                                        if layer_value
+                                        else 0.0
+                                    )
+                                    wandb_log_dict[f"{wandb_key}_mean"] = mean_val
+                                except TypeError:
+                                    wandb_log_dict[f"{wandb_key}_mean"] = -1.0
+                        elif isinstance(layer_value, (float, int)):
+                            # Log scalar layerwise data
+                            wandb_log_dict[wandb_key] = layer_value
+                else:
+                    # If the top level key itself is scalar (shouldn't happen with current structure)
+                    wandb_log_dict[key] = value
+            elif key.endswith("_agg_hist") and isinstance(value, list):
+                # Handle aggregate histogram data (e.g., sparsity/log_feature_density_agg_hist)
+                try:
+                    wandb_log_dict[key] = wandb.Histogram(value)
+                except Exception as e:
+                    print(f"Wandb: Error creating aggregate histogram for {key}: {e}")
+                    # Optional Fallback: log mean of aggregate data
+                    try:
+                        mean_val = sum(value) / len(value) if value else 0.0
+                        wandb_log_dict[f"{key}_mean"] = mean_val
+                    except TypeError:
+                        wandb_log_dict[f"{key}_mean"] = -1.0
 
-        # Add per-layer metrics if available
-        per_layer = l0_stats.get("per_layer", {})
-        if isinstance(per_layer, dict):
-            for layer_name, l0_value in per_layer.items():
-                metrics[f"eval/l0/{layer_name}"] = l0_value
+            elif isinstance(value, (float, int)):  # Handle top-level scalars
+                # Log directly, e.g., 'reconstruction/mse', 'sparsity/avg_l0', 'dead_features/total_eval'
+                wandb_log_dict[key] = value
+            # Add other specific handling if needed (e.g., for specific non-scalar, non-layerwise data)
 
-        # Log to wandb
-        wandb.log(metrics, step=step)
+        # Log the prepared dictionary to wandb
+        if wandb_log_dict:
+            wandb.log(wandb_log_dict, step=step)
 
     def log_artifact(
         self, artifact_path: str, artifact_type: str, name: Optional[str] = None
@@ -223,16 +291,43 @@ class CLTTrainer:
         # Initialize loss manager
         self.loss_manager = LossManager(training_config)
 
+        # Initialize Evaluator
+        self.evaluator = CLTEvaluator(self.model, self.device)
+
+        # Initialize dead neuron counters
+        self.n_forward_passes_since_fired = torch.zeros(
+            (clt_config.num_layers, clt_config.num_features),
+            device=self.device,
+            dtype=torch.long,
+        )
+
         # Training metrics
         self.metrics: Dict[str, list] = {
             "train_losses": [],
-            "l0_stats": [],
             "eval_metrics": [],
         }
 
         # Initialize WandB logger
         self.wandb_logger = WandBLogger(
             training_config=training_config, clt_config=clt_config, log_dir=self.log_dir
+        )
+
+    @property
+    def dead_neurons_mask(self) -> torch.Tensor:
+        """Boolean mask indicating dead neurons based on inactivity window."""
+        # Ensure counter is initialized
+        if (
+            not hasattr(self, "n_forward_passes_since_fired")
+            or self.n_forward_passes_since_fired is None
+        ):
+            # Return an all-false mask if counter doesn't exist yet
+            return torch.zeros(
+                (self.clt_config.num_layers, self.clt_config.num_features),
+                dtype=torch.bool,
+                device=self.device,
+            )
+        return (
+            self.n_forward_passes_since_fired > self.training_config.dead_feature_window
         )
 
     def _create_activation_extractor(self) -> ActivationExtractorCLT:
@@ -282,24 +377,34 @@ class CLTTrainer:
         return store
 
     def _log_metrics(self, step: int, loss_dict: Dict[str, float]):
-        """Log training metrics.
+        """Log training metrics, including current LR and lambda.
 
         Args:
             step: Current training step
-            loss_dict: Dictionary of loss values
+            loss_dict: Dictionary of loss values from LossManager
         """
-        # Add to metrics
+        # Add step to training loss record (for saving to JSON)
         self.metrics["train_losses"].append({"step": step, **loss_dict})
 
-        # Get current learning rate if scheduler is used
+        # --- Gather additional metrics for logging --- #
         current_lr = None
         if self.scheduler is not None:
+            # Assuming one parameter group
             current_lr = self.scheduler.get_last_lr()[0]
 
-        # Log to WandB
-        self.wandb_logger.log_step(step, loss_dict, lr=current_lr)
+        current_lambda = self.loss_manager.get_current_sparsity_lambda()
 
-        # Log less frequently for potentially large runs
+        # --- Log to WandB --- #
+        # Note: Dead features from trainer window are no longer logged here.
+        # We use the dead feature count calculated during evaluation step.
+        self.wandb_logger.log_step(
+            step,
+            loss_dict,
+            lr=current_lr,
+            sparsity_lambda=current_lambda,
+        )
+
+        # --- Save metrics periodically --- #
         log_interval = self.training_config.log_interval
         if step % log_interval == 0:
             self._save_metrics()
@@ -313,116 +418,6 @@ class CLTTrainer:
                 json.dump(self.metrics, f, indent=2, default=str)
         except Exception as e:
             print(f"Warning: Failed to save metrics to {metrics_path}: {e}")
-
-    def _compute_l0(
-        self, inputs: Dict[int, torch.Tensor]
-    ) -> Dict[str, Union[float, Dict[str, float]]]:
-        """Compute L0 stats: avg active features per token, summed across layers.
-
-        Args:
-            inputs: Dictionary mapping layer indices to input activations from the
-                    current training batch.
-
-        Returns:
-            Dictionary of L0 statistics:
-                - total_l0: Average active features per token, summed across layers.
-                - avg_l0: Average of the per-layer L0s (total_l0 / num_layers).
-                - sparsity: Overall sparsity (1 - total_l0 / total_possible_features).
-                - per_layer: Dictionary mapping layer index to its avg active features
-                  per token.
-        """
-        # Ensure inputs are valid
-        if not inputs or not any(v.numel() > 0 for v in inputs.values()):
-            print(
-                "Warning: Received empty or invalid inputs for L0 computation. "
-                "Returning zeros."
-            )
-            return {
-                "total_l0": 0.0,
-                "avg_l0": 0.0,
-                "sparsity": 1.0,
-                "per_layer": {
-                    f"layer_{i}": 0.0 for i in range(self.clt_config.num_layers)
-                },
-            }
-
-        # Ensure inputs are on the correct device
-        try:
-            inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        except Exception as e:
-            print(
-                f"Error moving inputs to device in L0 computation: {e}. "
-                f"Returning zeros."
-            )
-            return {
-                "total_l0": 0.0,
-                "avg_l0": 0.0,
-                "sparsity": 1.0,
-                "per_layer": {
-                    f"layer_{i}": 0.0 for i in range(self.clt_config.num_layers)
-                },
-            }
-
-        # Get activations
-        with torch.no_grad():
-            activations = self.model.get_feature_activations(inputs)
-
-        per_layer_l0 = {}
-        total_l0 = 0.0  # Sum of per-layer average active features per token
-        num_valid_layers = 0
-
-        # Ensure activations keys match expected layers if possible
-        expected_layers = set(range(self.clt_config.num_layers))
-        actual_layers = set(activations.keys())
-        if expected_layers != actual_layers:
-            print(
-                f"Warning: Mismatch between expected layers ({expected_layers}) "
-                f"and activation keys ({actual_layers}) during L0 computation."
-            )
-
-        # Iterate through layers present in activations
-        for layer_idx, layer_activations in activations.items():
-            # layer_activations shape: [num_tokens, num_features]
-            if layer_activations.numel() == 0 or layer_activations.shape[0] == 0:
-                per_layer_l0[f"layer_{layer_idx}"] = 0.0
-                print(
-                    f"Warning: Empty activations for layer {layer_idx} in L0 "
-                    f"computation."
-                )
-                continue
-
-            # 1. Count active features for EACH token (sum along feature dim)
-            # Shape: [num_tokens]
-            active_count_per_token = (layer_activations != 0).float().sum(dim=-1)
-
-            # 2. Average this count across tokens for this layer
-            avg_active_this_layer = active_count_per_token.mean().item()
-
-            per_layer_l0[f"layer_{layer_idx}"] = avg_active_this_layer
-            total_l0 += avg_active_this_layer
-            num_valid_layers += 1
-
-        # Calculate average L0 across layers
-        avg_l0 = total_l0 / num_valid_layers if num_valid_layers > 0 else 0.0
-
-        # Calculate overall sparsity
-        total_possible_features = (
-            self.clt_config.num_layers * self.clt_config.num_features
-        )
-        sparsity = (
-            1.0 - (total_l0 / total_possible_features)
-            if total_possible_features > 0
-            else 1.0
-        )
-        # Clamp sparsity between 0 and 1
-        sparsity = max(0.0, min(1.0, sparsity))
-
-        return {
-            "total_l0": total_l0,  # Avg active features/token summed across layers
-            "avg_l0": avg_l0,  # Average of per-layer L0s
-            "sparsity": sparsity,
-            "per_layer": per_layer_l0,  # Avg active features/token per layer
-        }
 
     def _save_checkpoint(self, step: int):
         """Save a checkpoint of the model and activation store state.
@@ -576,8 +571,6 @@ class CLTTrainer:
 
         # Make sure we flush stdout to ensure prints appear immediately,
         # especially important in Jupyter/interactive environments
-        import sys
-
         sys.stdout.flush()
 
         # Wait for 1 second to ensure output is displayed before training starts
@@ -630,6 +623,49 @@ class CLTTrainer:
                     self.training_config.training_steps,
                 )
 
+                # --- Update Dead Neuron Counters ---
+                # We need feature activations *after* non-linearity
+                if hasattr(self, "n_forward_passes_since_fired"):
+                    with torch.no_grad():
+                        # Get feature activations (post-nonlinearity) for the current batch
+                        # Assuming inputs is the dictionary of layer activations fed to the model
+                        feature_activations_batch = self.model.get_feature_activations(
+                            inputs
+                        )
+
+                        for layer_idx, layer_acts in feature_activations_batch.items():
+                            # Ensure layer index is within bounds of the counter tensor
+                            if layer_idx < self.n_forward_passes_since_fired.shape[0]:
+                                if layer_acts.numel() > 0:
+                                    # layer_acts shape: [batch_tokens, num_features]
+                                    # Check which features fired (activation > threshold)
+                                    fired_mask_per_token = (
+                                        layer_acts > 1e-6
+                                    )  # Shape: [batch_tokens, num_features]
+                                    fired_features_this_layer = (
+                                        fired_mask_per_token.any(dim=0)
+                                    )  # Shape: [num_features]
+
+                                    # Ensure fired_features mask matches counter dimension
+                                    if (
+                                        fired_features_this_layer.shape[0]
+                                        == self.n_forward_passes_since_fired.shape[1]
+                                    ):
+                                        # Increment counters for all features in this layer
+                                        self.n_forward_passes_since_fired[
+                                            layer_idx
+                                        ] += 1
+                                        # Reset counters for features that fired
+                                        self.n_forward_passes_since_fired[layer_idx][
+                                            fired_features_this_layer
+                                        ] = 0
+                                    else:
+                                        print(
+                                            f"Warning: Shape mismatch for dead neuron update at layer {layer_idx}. "
+                                            f"Activations shape: {layer_acts.shape}, Fired mask shape: {fired_features_this_layer.shape}, "
+                                            f"Counter shape: {self.n_forward_passes_since_fired.shape}"
+                                        )
+
                 # --- Backward pass ---
                 if torch.isnan(loss):
                     print(
@@ -656,11 +692,14 @@ class CLTTrainer:
                     self.scheduler.step()
 
                 # --- Update progress bar ---
+                # Include total dead features from training step log dict
+                # dead_str = f"Dead: {loss_dict.get('sparsity/total_dead_features', 0)}" # Removed
                 description = (
                     f"Loss: {loss_dict.get('total', float('nan')):.4f} "
                     f"(R: {loss_dict.get('reconstruction', float('nan')):.4f} "
                     f"S: {loss_dict.get('sparsity', float('nan')):.4f} "
                     f"P: {loss_dict.get('preactivation', float('nan')):.4f})"
+                    # f"{dead_str}"  # Removed
                 )
                 pbar.set_description(description)
 
@@ -684,21 +723,47 @@ class CLTTrainer:
                 )
 
                 if run_eval_flag:
-                    # Pass the current input batch to _compute_l0
-                    l0_stats = self._compute_l0(inputs)
-                    self.metrics["l0_stats"].append({"step": step, **l0_stats})
-                    l0_msg = (
-                        f"Layerwise L0: {l0_stats['avg_l0']:.2f} "
-                        f"Total L0: {l0_stats['total_l0']:.2f} "
-                        f"(Spar: {l0_stats['sparsity']:.3f})"
+                    # Detach mask for evaluator, which runs with no_grad
+                    current_dead_mask = self.dead_neurons_mask.detach().clone()
+
+                    # Use the evaluator to compute metrics, passing the mask
+                    eval_metrics = self.evaluator.compute_metrics(
+                        inputs,
+                        targets,
+                        dead_neuron_mask=current_dead_mask,  # Pass the mask
                     )
-                    pbar.set_postfix_str(l0_msg)
+
+                    # Store evaluation metrics (for saving to JSON)
+                    self.metrics["eval_metrics"].append({"step": step, **eval_metrics})
+
+                    # --- Update Progress Bar Postfix --- #
+                    l0_str = f"AvgL0: {eval_metrics.get('sparsity/avg_l0', 0.0):.2f}"
+                    ev_str = f"EV: {eval_metrics.get('reconstruction/explained_variance', 0.0):.3f}"
+
+                    # Use the pre-calculated aggregate density if available
+                    avg_density_mean = eval_metrics.get("sparsity/feature_density_mean")
+                    dens_str = (
+                        f"Dens: {avg_density_mean:.3f}"
+                        if avg_density_mean is not None
+                        else "Dens: N/A"
+                    )
+
+                    # Add total dead features from evaluation metrics
+                    eval_dead_str = (
+                        f"Dead(Eval): {eval_metrics.get('dead_features/total_eval', 0)}"
+                    )
+
+                    # Note: Lambda is logged during training step
+                    eval_msg = f"{l0_str}, {ev_str}, {dens_str}, {eval_dead_str}"
+
+                    pbar.set_postfix_str(eval_msg)
                     pbar.refresh()  # Force update
 
-                    # Log evaluation metrics to WandB
-                    self.wandb_logger.log_evaluation(step, l0_stats)
+                    # --- Log evaluation metrics to WandB --- #
+                    # The eval_metrics dict already has the desired structure
+                    self.wandb_logger.log_evaluation(step, eval_metrics)
 
-                    # Save metrics after evaluation
+                    # --- Save metrics JSON after evaluation --- #
                     self._save_metrics()
 
                 if save_checkpoint_flag:

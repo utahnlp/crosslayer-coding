@@ -96,9 +96,9 @@ training_config = TrainingConfig(
     cache_path=None,  # Path to cache downloaded data (optional)
     # Activation extraction parameters
     context_size=128,
-    store_batch_size_prompts=2,  # Reduced to avoid potential memory issues
-    batch_size=6,  # Reduced to conserve memory (total tokens = batch_size * context_size = 768)
-    exclude_special_tokens=True,
+    store_batch_size_prompts=10,  # Extraction batch size
+    batch_size=6,  # Training batch size
+    exclude_special_tokens=True,  # currently not doing anything
     prepend_bos=True,
     # Buffer and normalization parameters
     n_batches_in_buffer=4,  # Reduced buffer size to conserve memory
@@ -107,16 +107,16 @@ training_config = TrainingConfig(
     normalization_method="estimated_mean_std",
     normalization_estimation_batches=10,  # Number of batches used for statistics estimation
     # Training parameters
-    learning_rate=3e-4,
+    learning_rate=1e-5,
     training_steps=1000,
-    sparsity_lambda=30,
+    sparsity_lambda=1,  # Default unknown
     sparsity_c=1.0,  # Default value from paper: 1.0
     preactivation_coef=3e-6,  # Default value: 3e-6
     optimizer="adamw",
     lr_scheduler="linear",
-    max_samples=1000000,
     eval_interval=10,
     log_interval=10,
+    dead_feature_window=500,
     enable_wandb=True,
     wandb_project="clt-tutorial",
 )

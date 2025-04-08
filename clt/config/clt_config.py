@@ -70,6 +70,9 @@ class TrainingConfig:
     eval_interval: int = 1000  # How often to run evaluation
     checkpoint_interval: int = 1000  # How often to save checkpoints
 
+    # Dead feature tracking
+    dead_feature_window: int = 1000  # Steps until a feature is considered dead
+
     # WandB logging configuration
     enable_wandb: bool = False  # Whether to use Weights & Biases logging
     wandb_project: Optional[str] = None  # WandB project name
@@ -100,3 +103,4 @@ class TrainingConfig:
         assert self.context_size > 0, "Context size must be positive"
         assert self.sparsity_lambda >= 0, "Sparsity lambda must be non-negative"
         assert isinstance(self.streaming, bool), "Streaming must be boolean"
+        assert self.dead_feature_window > 0, "Dead feature window must be positive"

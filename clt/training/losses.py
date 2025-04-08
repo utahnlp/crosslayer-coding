@@ -3,12 +3,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple
 
-from clt.config.clt_config import TrainingConfig
+from clt.config import TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
 
 
 class LossManager:
-    """Manages the computation of loss functions for CLT training."""
+    """Manages the computation of different loss components for the CLT."""
 
     def __init__(self, config: TrainingConfig):
         """Initialize the loss manager.
@@ -17,7 +17,8 @@ class LossManager:
             config: Training configuration
         """
         self.config = config
-        self.mse_loss = nn.MSELoss()
+        self.reconstruction_loss_fn = nn.MSELoss()
+        self.current_sparsity_lambda = 0.0  # Initialize lambda
 
     def compute_reconstruction_loss(
         self, predicted: Dict[int, torch.Tensor], target: Dict[int, torch.Tensor]
@@ -42,7 +43,9 @@ class LossManager:
         num_layers = 0
         for layer_idx in predicted:
             if layer_idx in target:
-                layer_loss = self.mse_loss(predicted[layer_idx], target[layer_idx])
+                layer_loss = self.reconstruction_loss_fn(
+                    predicted[layer_idx], target[layer_idx]
+                )
                 total_loss += layer_loss
                 num_layers += 1
 
@@ -55,7 +58,7 @@ class LossManager:
         activations: Dict[int, torch.Tensor],
         current_step: int,
         total_steps: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, float]:
         """Compute the sparsity penalty for the feature activations.
 
         Args:
@@ -65,10 +68,10 @@ class LossManager:
             total_steps: Total number of training steps
 
         Returns:
-            Sparsity penalty loss
+            Tuple of (sparsity penalty loss, current lambda)
         """
         if not activations:
-            return torch.tensor(0.0)
+            return torch.tensor(0.0), 0.0
 
         # Create a linear scaling for lambda from 0 to config value
         # This allows the model to learn useful features before enforcing sparsity
@@ -124,9 +127,11 @@ class LossManager:
 
         # Normalize by number of elements and apply lambda
         if total_elements > 0:
-            return lambda_factor * total_penalty / total_elements
+            penalty = lambda_factor * total_penalty / total_elements
+            return penalty, lambda_factor
         else:
-            return torch.tensor(0.0, device=device)
+            penalty = torch.tensor(0.0, device=device)
+            return penalty, lambda_factor
 
     def compute_preactivation_loss(
         self, model: CrossLayerTranscoder, inputs: Dict[int, torch.Tensor]
@@ -202,18 +207,23 @@ class LossManager:
 
         # Compute loss components
         reconstruction_loss = self.compute_reconstruction_loss(predictions, targets)
-        sparsity_loss = self.compute_sparsity_penalty(
+        sparsity_penalty, current_lambda = self.compute_sparsity_penalty(
             model, activations, current_step, total_steps
         )
+        self.current_sparsity_lambda = current_lambda  # Store the lambda
         preactivation_loss = self.compute_preactivation_loss(model, inputs)
 
         # Compute total loss
-        total_loss = reconstruction_loss + sparsity_loss + preactivation_loss
+        total_loss = reconstruction_loss + sparsity_penalty + preactivation_loss
 
         # Return loss components
         return total_loss, {
             "total": total_loss.item(),
             "reconstruction": reconstruction_loss.item(),
-            "sparsity": sparsity_loss.item(),
+            "sparsity": sparsity_penalty.item(),
             "preactivation": preactivation_loss.item(),
         }
+
+    def get_current_sparsity_lambda(self) -> float:
+        """Returns the most recently calculated sparsity lambda."""
+        return self.current_sparsity_lambda
