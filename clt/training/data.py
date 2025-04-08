@@ -257,6 +257,8 @@ class ActivationStore:
         num_unread = (~self.read_indices).sum().item()
         tokens_needed = self.target_buffer_size_tokens - num_unread
         tokens_added_this_fill = 0
+        total_fetch_time = 0.0  # Initialize total fetch time
+        fetch_count = 0  # Initialize fetch count
         start_time = time.time()
 
         mem_before = 0
@@ -277,7 +279,14 @@ class ActivationStore:
 
         while tokens_added_this_fill < tokens_needed:
             try:
+                fetch_start_time = time.time()  # START timer
                 batch = next(self.activation_generator)
+                fetch_end_time = time.time()  # END timer
+                fetch_duration = fetch_end_time - fetch_start_time
+                total_fetch_time += fetch_duration
+                fetch_count += 1
+                # Optional: Log individual fetch times if needed for debugging
+                # logger.debug(f"Time to fetch batch from generator: {fetch_duration:.4f}s")
 
                 # Initialize buffer metadata if this is the very first batch
                 if not self.buffer_initialized:
@@ -305,10 +314,15 @@ class ActivationStore:
                 raise e  # Re-raise by default
 
         end_time = time.time()
+        fill_duration = end_time - start_time
+        avg_fetch_time = (
+            total_fetch_time / fetch_count if fetch_count > 0 else 0.0
+        )  # Calculate average
         current_buffer_size = self.read_indices.shape[0]
         final_unread = (~self.read_indices).sum().item()
         logger.debug(
-            f"Buffer fill finished in {end_time - start_time:.2f}s. Added {tokens_added_this_fill} tokens. "
+            f"Buffer fill finished in {fill_duration:.2f}s. Added {tokens_added_this_fill} tokens. "
+            f"Avg fetch time: {avg_fetch_time:.4f}s over {fetch_count} fetches. "  # Log average time
             f"Total buffer size: {current_buffer_size}. Unread tokens: {final_unread}."
         )
 
