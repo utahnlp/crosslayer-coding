@@ -257,20 +257,12 @@ class ActivationStore:
         num_unread = (~self.read_indices).sum().item()
         tokens_needed = self.target_buffer_size_tokens - num_unread
         tokens_added_this_fill = 0
-        total_fetch_time = 0.0  # Initialize total fetch time
-        fetch_count = 0  # Initialize fetch count
         start_time = time.time()
 
-        mem_before = 0
-        if self.device.type == "cuda" and torch.cuda.is_available():
+        if torch.cuda.is_available() and self.device.type == "cuda":
             mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
             logger.debug(
                 f"Fill Buffer - Start. Mem: {mem_before:.2f} MB. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
-            )
-        elif self.device.type == "mps" and torch.backends.mps.is_available():
-            mem_before = torch.mps.current_allocated_memory() / (1024**2)  # MB
-            logger.debug(
-                f"Fill Buffer - Start. MPS Mem: {mem_before:.2f} MB. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
             )
         else:
             logger.debug(
@@ -279,14 +271,7 @@ class ActivationStore:
 
         while tokens_added_this_fill < tokens_needed:
             try:
-                fetch_start_time = time.time()  # START timer
                 batch = next(self.activation_generator)
-                fetch_end_time = time.time()  # END timer
-                fetch_duration = fetch_end_time - fetch_start_time
-                total_fetch_time += fetch_duration
-                fetch_count += 1
-                # Optional: Log individual fetch times if needed for debugging
-                # logger.debug(f"Time to fetch batch from generator: {fetch_duration:.4f}s")
 
                 # Initialize buffer metadata if this is the very first batch
                 if not self.buffer_initialized:
@@ -314,28 +299,17 @@ class ActivationStore:
                 raise e  # Re-raise by default
 
         end_time = time.time()
-        fill_duration = end_time - start_time
-        avg_fetch_time = (
-            total_fetch_time / fetch_count if fetch_count > 0 else 0.0
-        )  # Calculate average
         current_buffer_size = self.read_indices.shape[0]
         final_unread = (~self.read_indices).sum().item()
         logger.debug(
-            f"Buffer fill finished in {fill_duration:.2f}s. Added {tokens_added_this_fill} tokens. "
-            f"Avg fetch time: {avg_fetch_time:.4f}s over {fetch_count} fetches. "  # Log average time
+            f"Buffer fill finished in {end_time - start_time:.2f}s. Added {tokens_added_this_fill} tokens. "
             f"Total buffer size: {current_buffer_size}. Unread tokens: {final_unread}."
         )
 
-        mem_after = 0
-        if self.device.type == "cuda" and torch.cuda.is_available():
+        if torch.cuda.is_available() and self.device.type == "cuda":
             mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
             logger.debug(
                 f"Fill Buffer - End. Mem: {mem_after:.2f} MB (+{mem_after - mem_before:.2f} MB). Added: {tokens_added_this_fill}"
-            )
-        elif self.device.type == "mps" and torch.backends.mps.is_available():
-            mem_after = torch.mps.current_allocated_memory() / (1024**2)  # MB
-            logger.debug(
-                f"Fill Buffer - End. MPS Mem: {mem_after:.2f} MB (+{mem_after - mem_before:.2f} MB). Added: {tokens_added_this_fill}"
             )
         else:
             logger.debug(f"Fill Buffer - End. Added: {tokens_added_this_fill}")
@@ -364,10 +338,8 @@ class ActivationStore:
             # Prune the buffers and the read_indices tensor
             num_to_prune = first_unread_idx
             mem_before = 0
-            if self.device.type == "cuda" and torch.cuda.is_available():
+            if torch.cuda.is_available() and self.device.type == "cuda":
                 mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-            elif self.device.type == "mps" and torch.backends.mps.is_available():
-                mem_before = torch.mps.current_allocated_memory() / (1024**2)  # MB
 
             for layer_idx in self.layer_indices:
                 self.buffered_inputs[layer_idx] = self.buffered_inputs[layer_idx][
@@ -378,20 +350,6 @@ class ActivationStore:
                 ]
             self.read_indices = self.read_indices[num_to_prune:]
             # logger.debug(f"Pruned {num_to_prune} read tokens from buffer. New size: {self.read_indices.shape[0]}")
-
-            mem_after = 0
-            if self.device.type == "cuda" and torch.cuda.is_available():
-                mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-                logger.debug(
-                    f"Prune Buffer: Pruned {num_to_prune}. Mem Before: {mem_before:.2f} MB, After: {mem_after:.2f} MB, Diff: {mem_after - mem_before:.2f} MB"
-                )
-            elif self.device.type == "mps" and torch.backends.mps.is_available():
-                mem_after = torch.mps.current_allocated_memory() / (1024**2)  # MB
-                logger.debug(
-                    f"Prune Buffer: Pruned {num_to_prune}. MPS Mem Before: {mem_before:.2f} MB, After: {mem_after:.2f} MB, Diff: {mem_after - mem_before:.2f} MB"
-                )
-            else:
-                logger.debug(f"Prune Buffer: Pruned {num_to_prune} tokens.")
 
             if torch.cuda.is_available() and self.device.type == "cuda":
                 mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
