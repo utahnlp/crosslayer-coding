@@ -170,6 +170,13 @@ class CLTEvaluator:
             **density_metrics,  # Contains the layerwise density/heuristic data
             **dead_neuron_metrics,  # Contains layerwise dead features and total eval dead features
         }
+        # Explicitly delete intermediate tensors to potentially free memory sooner
+        del reconstructions
+        del feature_activations
+        # Optionally empty cache, though it has a performance cost
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
+
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_after_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
             elapsed_str = _format_elapsed_time(time.time() - self.start_time)
