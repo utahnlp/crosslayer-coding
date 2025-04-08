@@ -794,17 +794,6 @@ class CLTTrainer:
                         f"Step {step} - End [{elapsed_str}]. Mem: {mem_end_step:.2f} MB"
                     )
 
-                # --- Explicitly delete tensors --- #
-                try:
-                    del inputs
-                    del targets
-                    # Loss might not exist if NaN occurred
-                    if "loss" in locals():
-                        del loss
-                except NameError:
-                    # Handle cases where variables might not be defined (e.g., first step error)
-                    pass
-
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
                 checkpoint_interval = self.training_config.checkpoint_interval
@@ -864,6 +853,16 @@ class CLTTrainer:
                     self._save_checkpoint(step)
                     # Optionally remove older checkpoints here if desired
 
+            # --- Explicitly delete tensors at the very end of the loop iteration --- #
+            try:
+                del inputs
+                del targets
+                # Loss might not exist if NaN occurred or skip step happened
+                if "loss" in locals() and loss is not None:
+                    del loss
+            except NameError:
+                # Handle cases where variables might not be defined (e.g., error on first step)
+                pass
         except KeyboardInterrupt:
             print("\nTraining interrupted by user.")
         finally:
