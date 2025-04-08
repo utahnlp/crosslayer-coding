@@ -3,6 +3,8 @@ from typing import Dict, Any, Optional, List
 import torch.nn.functional as F
 import numpy as np  # Import numpy for mean calculation
 import logging  # Import logging
+import time  # Import time
+import datetime  # Import datetime
 
 from clt.models.clt import CrossLayerTranscoder
 
@@ -10,18 +12,37 @@ from clt.models.clt import CrossLayerTranscoder
 logger = logging.getLogger(__name__)
 
 
+# Helper function to format elapsed time
+def _format_elapsed_time(seconds: float) -> str:
+    """Formats elapsed seconds into HH:MM:SS or MM:SS."""
+    td = datetime.timedelta(seconds=int(seconds))
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if td.days > 0 or hours > 0:
+        return f"{td.days * 24 + hours:02d}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{minutes:02d}:{seconds:02d}"
+
+
 class CLTEvaluator:
     """Handles evaluation metrics computation for the CLT model."""
 
-    def __init__(self, model: CrossLayerTranscoder, device: torch.device):
+    def __init__(
+        self,
+        model: CrossLayerTranscoder,
+        device: torch.device,
+        start_time: Optional[float] = None,
+    ):
         """Initialize the evaluator.
 
         Args:
             model: The CrossLayerTranscoder model to evaluate.
             device: The device to perform computations on.
+            start_time: The initial time.time() from the trainer for elapsed time logging.
         """
         self.model = model
         self.device = device
+        self.start_time = start_time or time.time()  # Store start time
 
     @staticmethod
     def _log_density(density: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
@@ -73,7 +94,8 @@ class CLTEvaluator:
         mem_before_eval = 0
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_before_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
-            logger.debug(f"Eval - Start. Mem: {mem_before_eval:.2f} MB")
+            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+            logger.debug(f"Eval - Start [{elapsed_str}]. Mem: {mem_before_eval:.2f} MB")
 
         # Ensure data is on the correct device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
@@ -150,8 +172,9 @@ class CLTEvaluator:
         }
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_after_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
+            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
             logger.debug(
-                f"Eval - End. Mem: {mem_after_eval:.2f} MB (+{mem_after_eval - mem_before_eval:.2f} MB)"
+                f"Eval - End [{elapsed_str}]. Mem: {mem_after_eval:.2f} MB (+{mem_after_eval - mem_before_eval:.2f} MB)"
             )
 
         return all_metrics

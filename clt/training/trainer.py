@@ -8,6 +8,7 @@ import time
 import importlib.util
 import sys
 import logging  # Add logging import
+import datetime  # Import datetime for formatting
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
@@ -18,6 +19,18 @@ from .evaluator import CLTEvaluator  # Import the new evaluator
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
+
+
+# Helper function to format elapsed time
+def _format_elapsed_time(seconds: float) -> str:
+    """Formats elapsed seconds into HH:MM:SS or MM:SS."""
+    td = datetime.timedelta(seconds=int(seconds))
+    hours, remainder = divmod(td.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if td.days > 0 or hours > 0:
+        return f"{td.days * 24 + hours:02d}:{minutes:02d}:{seconds:02d}"
+    else:
+        return f"{minutes:02d}:{seconds:02d}"
 
 
 class WandBLogger:
@@ -261,6 +274,9 @@ class CLTTrainer:
         self.log_dir = log_dir or f"clt_train_{int(time.time())}"
         os.makedirs(self.log_dir, exist_ok=True)
 
+        # Record start time
+        self.start_time = time.time()
+
         # Initialize model, passing device for direct initialization
         self.model = CrossLayerTranscoder(clt_config, device=self.device)
 
@@ -290,13 +306,13 @@ class CLTTrainer:
 
         # Initialize activation extractor and store
         self.activation_extractor = self._create_activation_extractor()
-        self.activation_store = self._create_activation_store()
+        self.activation_store = self._create_activation_store(self.start_time)
 
         # Initialize loss manager
         self.loss_manager = LossManager(training_config)
 
         # Initialize Evaluator
-        self.evaluator = CLTEvaluator(self.model, self.device)
+        self.evaluator = CLTEvaluator(self.model, self.device, self.start_time)
 
         # Initialize dead neuron counters
         self.n_forward_passes_since_fired = torch.zeros(
@@ -350,8 +366,11 @@ class CLTTrainer:
             prepend_bos=self.training_config.prepend_bos,
         )
 
-    def _create_activation_store(self) -> ActivationStore:
+    def _create_activation_store(self, start_time: float) -> ActivationStore:
         """Create an activation store based on training config using the new extractor.
+
+        Args:
+            start_time: The training start time for elapsed time logging.
 
         Returns:
             Configured ActivationStore instance
@@ -377,6 +396,7 @@ class CLTTrainer:
                 self.training_config.normalization_estimation_batches
             ),
             device=self.device,
+            start_time=start_time,  # Pass start_time here
         )
 
         return store
@@ -438,8 +458,9 @@ class CLTTrainer:
         mem_before_save = 0
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_before_save = torch.cuda.memory_allocated(self.device) / (1024**2)
+            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
             logger.debug(
-                f"Checkpoint Step {step} - Before Save. Mem: {mem_before_save:.2f} MB"
+                f"Checkpoint Step {step} - Before Save [{elapsed_str}]. Mem: {mem_before_save:.2f} MB"
             )
 
         try:
@@ -484,8 +505,9 @@ class CLTTrainer:
 
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_after_save = torch.cuda.memory_allocated(self.device) / (1024**2)
+            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
             logger.debug(
-                f"Checkpoint Step {step} - After Save. Mem: {mem_after_save:.2f} MB (+{mem_after_save - mem_before_save:.2f} MB)"
+                f"Checkpoint Step {step} - After Save [{elapsed_str}]. Mem: {mem_after_save:.2f} MB (+{mem_after_save - mem_before_save:.2f} MB)"
             )
 
     def load_checkpoint(
@@ -767,7 +789,10 @@ class CLTTrainer:
                 self._log_metrics(step, loss_dict)
                 if torch.cuda.is_available() and self.device.type == "cuda":
                     mem_end_step = torch.cuda.memory_allocated(self.device) / (1024**2)
-                    logger.debug(f"Step {step} - End. Mem: {mem_end_step:.2f} MB")
+                    elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+                    logger.debug(
+                        f"Step {step} - End [{elapsed_str}]. Mem: {mem_end_step:.2f} MB"
+                    )
 
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
