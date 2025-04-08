@@ -375,15 +375,13 @@ class ActivationStore:
             # logger.debug(f"Pruned {num_to_prune} read tokens from buffer. New size: {self.read_indices.shape[0]}")
 
             if torch.cuda.is_available() and self.device.type == "cuda":
+                # --- Force cache clearing AFTER pruning tensors --- #
+                torch.cuda.empty_cache()
+                # --- Log memory AFTER cache clearing --- #
                 mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
                 elapsed_str = _format_elapsed_time(time.time() - self.start_time)
                 logger.debug(
                     f"Prune Buffer [{elapsed_str}]: Pruned {num_to_prune}. Mem Before: {mem_before:.2f} MB, After: {mem_after:.2f} MB, Diff: {mem_after - mem_before:.2f} MB"
-                )
-            else:
-                elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                logger.debug(
-                    f"Prune Buffer [{elapsed_str}]: Pruned {num_to_prune} tokens."
                 )
 
     def get_batch(self) -> ActivationBatchCLT:
