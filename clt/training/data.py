@@ -300,11 +300,6 @@ class ActivationStore:
                 tokens_added = self._add_batch_to_buffer(batch)
                 tokens_added_this_fill += tokens_added
 
-                # Optimization: If target buffer size is huge and generator is slow,
-                # we might log progress periodically.
-                # if tokens_added_this_fill > 0 and tokens_added_this_fill % (self.target_buffer_size_tokens // 10) == 0:
-                #    logger.info(f"Buffer fill progress: Added {tokens_added_this_fill}/{tokens_needed} tokens...")
-
             except StopIteration:
                 logger.info("Activation generator exhausted.")
                 self.generator_exhausted = True
@@ -398,15 +393,16 @@ class ActivationStore:
             StopIteration: If the generator is exhausted and the buffer becomes empty.
             RuntimeError: If unable to provide a batch after attempting to refill.
         """
-        mem_start_get_batch = 0
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            mem_start_get_batch = torch.cuda.memory_allocated(self.device) / (
-                1024**2
-            )  # MB
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Get Batch - Start [{elapsed_str}]. Mem: {mem_start_get_batch:.2f} MB"
-            )
+        # --- Commented out per-batch memory logging --- #
+        # mem_start_get_batch = 0.0 # Type hint was fixed previously
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     mem_start_get_batch = torch.cuda.memory_allocated(self.device) / (
+        #         1024**2
+        #     )  # MB
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Get Batch - Start [{elapsed_str}]. Mem: {mem_start_get_batch:.2f} MB"
+        #     )
 
         # Initialize and fill buffer on first call or if needed
         num_unread = (~self.read_indices).sum().item()
@@ -471,14 +467,15 @@ class ActivationStore:
         # Or based on the number of read tokens at the start.
         self._prune_buffer()  # Prune every time for simplicity here
 
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            mem_end_get_batch = torch.cuda.memory_allocated(self.device) / (
-                1024**2
-            )  # MB
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Get Batch - End [{elapsed_str}]. Mem: {mem_end_get_batch:.2f} MB (+{mem_end_get_batch - mem_start_get_batch:.2f} MB)"
-            )
+        # --- Commented out per-batch memory logging --- #
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     mem_end_get_batch = torch.cuda.memory_allocated(self.device) / (
+        #         1024**2
+        #     )  # MB
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Get Batch - End [{elapsed_str}]. Mem: {mem_end_get_batch:.2f} MB (+{mem_end_get_batch - mem_start_get_batch:.2f} MB)"
+        #     )
 
         return batch_inputs, batch_targets
 
