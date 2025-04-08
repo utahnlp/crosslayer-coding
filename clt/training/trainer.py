@@ -455,13 +455,14 @@ class CLTTrainer:
 
         # Save model checkpoint
         model_checkpoint_path = os.path.join(self.log_dir, f"clt_checkpoint_{step}.pt")
-        mem_before_save = 0
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            mem_before_save = torch.cuda.memory_allocated(self.device) / (1024**2)
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Checkpoint Step {step} - Before Save [{elapsed_str}]. Mem: {mem_before_save:.2f} MB"
-            )
+        # --- Commented out memory logging --- #
+        # mem_before_save = 0
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     mem_before_save = torch.cuda.memory_allocated(self.device) / (1024**2)
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Checkpoint Step {step} - Before Save [{elapsed_str}]. Mem: {mem_before_save:.2f} MB"
+        #     )
 
         try:
             self.model.save(model_checkpoint_path)
@@ -503,12 +504,13 @@ class CLTTrainer:
         except Exception as e:
             print(f"Warning: Failed to save latest activation store state: {e}")
 
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            mem_after_save = torch.cuda.memory_allocated(self.device) / (1024**2)
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Checkpoint Step {step} - After Save [{elapsed_str}]. Mem: {mem_after_save:.2f} MB (+{mem_after_save - mem_before_save:.2f} MB)"
-            )
+        # --- Commented out memory logging --- #
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     mem_after_save = torch.cuda.memory_allocated(self.device) / (1024**2)
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Checkpoint Step {step} - After Save [{elapsed_str}]. Mem: {mem_after_save:.2f} MB (+{mem_after_save - mem_before_save:.2f} MB)"
+        #     )
 
     def load_checkpoint(
         self, checkpoint_path: str, store_checkpoint_path: Optional[str] = None
@@ -618,10 +620,11 @@ class CLTTrainer:
         # Training loop using ActivationStore as iterator
         print("\n>>> TRAINING PHASE <<<")
         sys.stdout.flush()
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            logger.info(
-                f"Training Start Mem: {torch.cuda.memory_allocated(self.device) / (1024**2):.2f} MB"
-            )
+        # --- Commented out memory logging --- #
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     logger.info(
+        #         f"Training Start Mem: {torch.cuda.memory_allocated(self.device) / (1024**2):.2f} MB"
+        #     )
 
         # Use tqdm to create progress bar for training
         pbar = tqdm(
@@ -638,12 +641,14 @@ class CLTTrainer:
 
                 try:
                     # Get batch directly from the iterator
+                    # --- Commented out memory logging --- #
                     # mem_before_get_batch = 0 # REMOVED
                     # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                     #      mem_before_get_batch = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
 
                     inputs, targets = next(self.activation_store)
 
+                    # --- Commented out memory logging --- #
                     # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                     #     mem_after_get_batch = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
                     #     logger.debug(f"Step {step} - After get_batch: Mem {mem_after_get_batch:.2f} MB (+{mem_after_get_batch - mem_before_get_batch:.2f} MB)") # REMOVED
@@ -667,6 +672,7 @@ class CLTTrainer:
                 # --- Forward pass and compute loss ---
                 self.optimizer.zero_grad()
                 # Loss manager needs the model, inputs, targets, and step info
+                # --- Commented out memory logging --- #
                 # mem_before_forward = 0 # REMOVED
                 # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                 #     mem_before_forward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
@@ -679,6 +685,7 @@ class CLTTrainer:
                     self.training_config.training_steps,
                 )
 
+                # --- Commented out memory logging --- #
                 # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                 #     mem_after_forward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
                 #     logger.debug(f"Step {step} - After forward/loss: Mem {mem_after_forward:.2f} MB (+{mem_after_forward - mem_before_forward:.2f} MB)") # REMOVED
@@ -735,12 +742,14 @@ class CLTTrainer:
                     # Optionally log more details or raise an error
                 else:
                     try:
+                        # --- Commented out memory logging --- #
                         # mem_before_backward = 0 # REMOVED
                         # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                         #     mem_before_backward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
 
                         loss.backward()
 
+                        # --- Commented out memory logging --- #
                         # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                         #     mem_after_backward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
                         #     logger.debug(f"Step {step} - After backward: Mem {mem_after_backward:.2f} MB (+{mem_after_backward - mem_before_backward:.2f} MB)") # REMOVED
@@ -754,12 +763,14 @@ class CLTTrainer:
                         continue  # Skip optimizer step if backward fails
 
                     # --- Optimizer step ---
+                    # --- Commented out memory logging --- #
                     # mem_before_optimizer = 0 # REMOVED
                     # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                     #     mem_before_optimizer = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
 
                     self.optimizer.step()
 
+                    # --- Commented out memory logging --- #
                     # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
                     #     mem_after_optimizer = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
                     #     logger.debug(f"Step {step} - After optimizer: Mem {mem_after_optimizer:.2f} MB (+{mem_after_optimizer - mem_before_optimizer:.2f} MB)") # REMOVED

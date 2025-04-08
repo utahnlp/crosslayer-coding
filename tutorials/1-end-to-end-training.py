@@ -24,7 +24,7 @@ import logging
 # Import components from the clt library
 # (Ensure the 'clt' directory is in your Python path or installed)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-logging.basicConfig(level=logging.DEBUG)
+# logging.basicConfig(level=logging.DEBUG)
 
 try:
     from clt.config import CLTConfig, TrainingConfig
@@ -121,7 +121,7 @@ training_config = TrainingConfig(
     eval_interval=10,
     log_interval=10,
     dead_feature_window=500,
-    enable_wandb=True,
+    enable_wandb=False,
     wandb_project="clt-tutorial",
 )
 print("\nTraining Configuration:")

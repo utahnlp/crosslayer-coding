@@ -1,6 +1,5 @@
-import numpy as np
 import torch
-from typing import Dict, List, Tuple, Optional, Iterator, Callable, Union, Generator
+from typing import Dict, List, Tuple, Optional, Union, Generator
 import logging
 import time
 from tqdm import tqdm
@@ -277,17 +276,18 @@ class ActivationStore:
         tokens_added_this_fill = 0
         start_time = time.time()
 
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Fill Buffer - Start [{elapsed_str}]. Mem: {mem_before:.2f} MB. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
-            )
-        else:
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Fill Buffer - Start [{elapsed_str}]. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
-            )
+        # --- Commented out memory logging --- #
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Fill Buffer - Start [{elapsed_str}]. Mem: {mem_before:.2f} MB. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
+        #     )
+        # else:
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Fill Buffer - Start [{elapsed_str}]. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
+        #     )
 
         while tokens_added_this_fill < tokens_needed:
             try:
@@ -321,17 +321,18 @@ class ActivationStore:
             f"Total buffer size: {current_buffer_size}. Unread tokens: {final_unread}."
         )
 
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Fill Buffer - End [{elapsed_str}]. Mem: {mem_after:.2f} MB (+{mem_after - mem_before:.2f} MB). Added: {tokens_added_this_fill}"
-            )
-        else:
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.debug(
-                f"Fill Buffer - End [{elapsed_str}]. Added: {tokens_added_this_fill}"
-            )
+        # --- Commented out memory logging --- #
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Fill Buffer - End [{elapsed_str}]. Mem: {mem_after:.2f} MB (+{mem_after - mem_before:.2f} MB). Added: {tokens_added_this_fill}"
+        #     )
+        # else:
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.debug(
+        #         f"Fill Buffer - End [{elapsed_str}]. Added: {tokens_added_this_fill}"
+        #     )
 
         # Check if buffer is still empty after trying to fill
         if self.read_indices.shape[0] == 0 and self.generator_exhausted:
@@ -356,9 +357,10 @@ class ActivationStore:
         if first_unread_idx > 0:
             # Prune the buffers and the read_indices tensor
             num_to_prune = first_unread_idx
-            mem_before = 0
-            if torch.cuda.is_available() and self.device.type == "cuda":
-                mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
+            # --- Commented out memory logging --- #
+            # mem_before = 0
+            # if torch.cuda.is_available() and self.device.type == "cuda":
+            #     mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
 
             for layer_idx in self.layer_indices:
                 self.buffered_inputs[layer_idx] = self.buffered_inputs[layer_idx][
@@ -375,11 +377,12 @@ class ActivationStore:
                 gc.collect()  # Force Python GC
                 torch.cuda.empty_cache()
                 # --- Log memory AFTER cache clearing --- #
-                mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-                elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                logger.debug(
-                    f"Prune Buffer [{elapsed_str}]: Pruned {num_to_prune}. Mem Before: {mem_before:.2f} MB, After: {mem_after:.2f} MB, Diff: {mem_after - mem_before:.2f} MB"
-                )
+                # --- Commented out memory logging --- #
+                # mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
+                # elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+                # logger.debug(
+                #     f"Prune Buffer [{elapsed_str}]: Pruned {num_to_prune}. Mem Before: {mem_before:.2f} MB, After: {mem_after:.2f} MB, Diff: {mem_after - mem_before:.2f} MB"
+                # )
 
     def get_batch(self) -> ActivationBatchCLT:
         """Gets a randomly sampled batch of activations for training.
@@ -524,12 +527,13 @@ class ActivationStore:
 
         print("\nComputing normalization statistics...")
         sys.stdout.flush()  # Force output to display
-        if torch.cuda.is_available() and self.device.type == "cuda":
-            mem_before_norm = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-            elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            logger.info(
-                f"Norm Stats - Start [{elapsed_str}]. Mem: {mem_before_norm:.2f} MB"
-            )
+        # --- Commented out memory logging --- #
+        # if torch.cuda.is_available() and self.device.type == "cuda":
+        #     mem_before_norm = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
+        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+        #     logger.info(
+        #         f"Norm Stats - Start [{elapsed_str}]. Mem: {mem_before_norm:.2f} MB"
+        #     )
 
         norm_progress = tqdm(
             range(self.normalization_estimation_batches),
@@ -661,14 +665,15 @@ class ActivationStore:
             )
             sys.stdout.flush()  # Force output to display
 
-            if torch.cuda.is_available() and self.device.type == "cuda":
-                mem_after_norm_calc = torch.cuda.memory_allocated(self.device) / (
-                    1024**2
-                )  # MB
-                elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                logger.info(
-                    f"Norm Stats - Calculated [{elapsed_str}]. Mem: {mem_after_norm_calc:.2f} MB (+{mem_after_norm_calc - mem_before_norm:.2f} MB)"
-                )
+            # --- Commented out memory logging --- #
+            # if torch.cuda.is_available() and self.device.type == "cuda":
+            #     mem_after_norm_calc = torch.cuda.memory_allocated(self.device) / (
+            #         1024**2
+            #     )  # MB
+            #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+            #     logger.info(
+            #         f"Norm Stats - Calculated [{elapsed_str}]. Mem: {mem_after_norm_calc:.2f} MB (+{mem_after_norm_calc - mem_before_norm:.2f} MB)"
+            #     )
 
             # Now initialize the buffer with the stored batches to avoid wasting them
             if stored_batches and not self.buffer_initialized:
@@ -676,17 +681,18 @@ class ActivationStore:
                     f"Initializing buffer with {len(stored_batches)} stored batches from normalization phase"
                 )
                 # Log memory *before* adding stored batches back
-                mem_before_buffer_init = 0.0  # Initialize as float
-                if torch.cuda.is_available() and self.device.type == "cuda":
-                    mem_before_buffer_init = torch.cuda.memory_allocated(
-                        self.device
-                    ) / (
-                        1024**2
-                    )  # MB
-                    elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                    logger.info(
-                        f"Norm Stats - Before Buffer Init [{elapsed_str}]. Mem: {mem_before_buffer_init:.2f} MB"
-                    )
+                # --- Commented out memory logging --- #
+                # mem_before_buffer_init = 0.0  # Initialize as float
+                # if torch.cuda.is_available() and self.device.type == "cuda":
+                #     mem_before_buffer_init = torch.cuda.memory_allocated(
+                #         self.device
+                #     ) / (
+                #         1024**2
+                #     )  # MB
+                #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+                #     logger.info(
+                #         f"Norm Stats - Before Buffer Init [{elapsed_str}]. Mem: {mem_before_buffer_init:.2f} MB"
+                #     )
 
                 for batch_inputs_dict, batch_outputs_dict in stored_batches:
                     # Initialize buffer metadata if this is the first batch
@@ -702,14 +708,15 @@ class ActivationStore:
                     f"Buffer initialized with {(~self.read_indices).sum().item()} unread tokens"
                 )
 
-                if torch.cuda.is_available() and self.device.type == "cuda":
-                    mem_after_norm_store = torch.cuda.memory_allocated(self.device) / (
-                        1024**2
-                    )  # MB
-                    elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                    logger.info(
-                        f"Norm Stats - Buffer Initialized [{elapsed_str}]. Mem: {mem_after_norm_store:.2f} MB (+{mem_after_norm_store - mem_after_norm_calc:.2f} MB)"
-                    )
+                # --- Commented out memory logging --- #
+                # if torch.cuda.is_available() and self.device.type == "cuda":
+                #     mem_after_norm_store = torch.cuda.memory_allocated(self.device) / (
+                #         1024**2
+                #     )  # MB
+                #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+                #     logger.info(
+                #         f"Norm Stats - Buffer Initialized [{elapsed_str}]. Mem: {mem_after_norm_store:.2f} MB (+{mem_after_norm_store - mem_after_norm_calc:.2f} MB)"
+                #     )
 
         elif count <= 1:
             logger.warning(
