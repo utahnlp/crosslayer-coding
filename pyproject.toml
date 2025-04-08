@@ -37,6 +37,7 @@ dependencies = [
     "wandb>=0.15.0",
     "tqdm>=4.64.0",
     "numpy>=1.24.0",
+    "zstandard",
     # pytest is primarily a dev dependency
     # Add other core dependencies here as needed
 ]

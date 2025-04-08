@@ -7,9 +7,12 @@ import argparse
 import torch
 from pathlib import Path
 from typing import Literal, Optional
+import logging
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.training.trainer import CLTTrainer
+
+logging.basicConfig(level=logging.DEBUG)
 
 
 def parse_args():
