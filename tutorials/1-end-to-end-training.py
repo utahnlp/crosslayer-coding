@@ -19,10 +19,12 @@
 import torch
 import os
 import time
+import logging
 
 # Import components from the clt library
 # (Ensure the 'clt' directory is in your Python path or installed)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+logging.basicConfig(level=logging.DEBUG)
 
 try:
     from clt.config import CLTConfig, TrainingConfig
@@ -97,9 +99,9 @@ training_config = TrainingConfig(
     dataset_trust_remote_code=False,  # Standard dataset, no special code needed
     cache_path=None,  # Path to cache downloaded data (optional)
     # Activation extraction parameters
-    context_size=128,
-    store_batch_size_prompts=10,  # Extraction batch size
-    batch_size=6,  # Training batch size
+    context_size=32,
+    store_batch_size_prompts=128,  # Extraction batch size
+    batch_size=8,  # Training batch size
     exclude_special_tokens=True,  # currently not doing anything
     prepend_bos=True,
     # Buffer and normalization parameters
@@ -109,9 +111,9 @@ training_config = TrainingConfig(
     normalization_method="estimated_mean_std",
     normalization_estimation_batches=10,  # Number of batches used for statistics estimation
     # Training parameters
-    learning_rate=3e-5,
-    training_steps=1000,
-    sparsity_lambda=15,  # Default unknown
+    learning_rate=3e-4,
+    training_steps=2000,
+    sparsity_lambda=30,  # Default unknown
     sparsity_c=1.0,  # Default value from paper: 1.0
     preactivation_coef=3e-6,  # Default value: 3e-6
     optimizer="adamw",

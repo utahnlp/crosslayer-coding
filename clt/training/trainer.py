@@ -7,6 +7,7 @@ import json
 import time
 import importlib.util
 import sys
+import logging  # Add logging import
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
@@ -14,6 +15,9 @@ from clt.training.data import ActivationStore
 from clt.training.losses import LossManager
 from clt.nnsight.extractor import ActivationExtractorCLT
 from .evaluator import CLTEvaluator  # Import the new evaluator
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
 
 
 class WandBLogger:
@@ -135,9 +139,9 @@ class WandBLogger:
         for key, value in eval_metrics.items():
             if key.startswith("layerwise/"):
                 # Handle nested layerwise data (histograms and scalars)
-                layerwise_category = key.split("/")[
-                    1
-                ]  # e.g., 'l0', 'log_feature_density'
+                # layerwise_category = key.split("/")[
+                #     1
+                # ]  # e.g., 'l0', 'log_feature_density' # Removed unused variable
                 if isinstance(value, dict):
                     for layer_key, layer_value in value.items():
                         # Construct wandb key: e.g., layerwise/l0/layer_0
@@ -579,6 +583,10 @@ class CLTTrainer:
         # Training loop using ActivationStore as iterator
         print("\n>>> TRAINING PHASE <<<")
         sys.stdout.flush()
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            logger.info(
+                f"Training Start Mem: {torch.cuda.memory_allocated(self.device) / (1024**2):.2f} MB"
+            )
 
         # Use tqdm to create progress bar for training
         pbar = tqdm(
@@ -595,7 +603,22 @@ class CLTTrainer:
 
                 try:
                     # Get batch directly from the iterator
+                    mem_before_get_batch = 0
+                    if torch.cuda.is_available() and self.device.type == "cuda":
+                        mem_before_get_batch = torch.cuda.memory_allocated(
+                            self.device
+                        ) / (1024**2)
+
                     inputs, targets = next(self.activation_store)
+
+                    if torch.cuda.is_available() and self.device.type == "cuda":
+                        mem_after_get_batch = torch.cuda.memory_allocated(
+                            self.device
+                        ) / (1024**2)
+                        logger.debug(
+                            f"Step {step} - After get_batch: Mem {mem_after_get_batch:.2f} MB (+{mem_after_get_batch - mem_before_get_batch:.2f} MB)"
+                        )
+
                 except StopIteration:
                     print("Activation store exhausted. Training finished early.")
                     break  # Exit training loop if data runs out
@@ -615,6 +638,12 @@ class CLTTrainer:
                 # --- Forward pass and compute loss ---
                 self.optimizer.zero_grad()
                 # Loss manager needs the model, inputs, targets, and step info
+                mem_before_forward = 0
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    mem_before_forward = torch.cuda.memory_allocated(self.device) / (
+                        1024**2
+                    )
+
                 loss, loss_dict = self.loss_manager.compute_total_loss(
                     self.model,
                     inputs,
@@ -622,6 +651,14 @@ class CLTTrainer:
                     step,
                     self.training_config.training_steps,
                 )
+
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    mem_after_forward = torch.cuda.memory_allocated(self.device) / (
+                        1024**2
+                    )
+                    logger.debug(
+                        f"Step {step} - After forward/loss: Mem {mem_after_forward:.2f} MB (+{mem_after_forward - mem_before_forward:.2f} MB)"
+                    )
 
                 # --- Update Dead Neuron Counters ---
                 # We need feature activations *after* non-linearity
@@ -675,7 +712,22 @@ class CLTTrainer:
                     # Optionally log more details or raise an error
                 else:
                     try:
+                        mem_before_backward = 0
+                        if torch.cuda.is_available() and self.device.type == "cuda":
+                            mem_before_backward = torch.cuda.memory_allocated(
+                                self.device
+                            ) / (1024**2)
+
                         loss.backward()
+
+                        if torch.cuda.is_available() and self.device.type == "cuda":
+                            mem_after_backward = torch.cuda.memory_allocated(
+                                self.device
+                            ) / (1024**2)
+                            logger.debug(
+                                f"Step {step} - After backward: Mem {mem_after_backward:.2f} MB (+{mem_after_backward - mem_before_backward:.2f} MB)"
+                            )
+
                     except RuntimeError as e:
                         print(
                             f"\nError during backward pass at step {step}: {e}. "
@@ -685,7 +737,21 @@ class CLTTrainer:
                         continue  # Skip optimizer step if backward fails
 
                     # --- Optimizer step ---
+                    mem_before_optimizer = 0
+                    if torch.cuda.is_available() and self.device.type == "cuda":
+                        mem_before_optimizer = torch.cuda.memory_allocated(
+                            self.device
+                        ) / (1024**2)
+
                     self.optimizer.step()
+
+                    if torch.cuda.is_available() and self.device.type == "cuda":
+                        mem_after_optimizer = torch.cuda.memory_allocated(
+                            self.device
+                        ) / (1024**2)
+                        logger.debug(
+                            f"Step {step} - After optimizer: Mem {mem_after_optimizer:.2f} MB (+{mem_after_optimizer - mem_before_optimizer:.2f} MB)"
+                        )
 
                 # --- Scheduler step ---
                 if self.scheduler:

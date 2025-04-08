@@ -2,8 +2,12 @@ import torch
 from typing import Dict, Any, Optional, List
 import torch.nn.functional as F
 import numpy as np  # Import numpy for mean calculation
+import logging  # Import logging
 
 from clt.models.clt import CrossLayerTranscoder
+
+# Configure logging
+logger = logging.getLogger(__name__)
 
 
 class CLTEvaluator:
@@ -66,6 +70,11 @@ class CLTEvaluator:
             Metrics are organized into 'reconstruction', 'sparsity', 'dead_features',
             'layerwise'.
         """
+        mem_before_eval = 0
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            mem_before_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
+            logger.debug(f"Eval - Start. Mem: {mem_before_eval:.2f} MB")
+
         # Ensure data is on the correct device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         targets = {k: v.to(self.device) for k, v in targets.items()}
@@ -139,6 +148,12 @@ class CLTEvaluator:
             **density_metrics,  # Contains the layerwise density/heuristic data
             **dead_neuron_metrics,  # Contains layerwise dead features and total eval dead features
         }
+        if torch.cuda.is_available() and self.device.type == "cuda":
+            mem_after_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
+            logger.debug(
+                f"Eval - End. Mem: {mem_after_eval:.2f} MB (+{mem_after_eval - mem_before_eval:.2f} MB)"
+            )
+
         return all_metrics
 
     def _compute_sparsity(self, activations: Dict[int, torch.Tensor]) -> Dict[str, Any]:

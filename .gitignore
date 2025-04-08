@@ -180,3 +180,4 @@ ref_docs/
 clt_training_logs/
 tests/integration/data/
 clt_output_tutorial/
+.DS_Store
