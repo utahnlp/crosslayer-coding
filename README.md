@@ -1,6 +1,6 @@
 # Cross-Layer Transcoder (CLT)
 
-A PyTorch implementation of Cross-Layer Transcoder as described in "[Towards Monosemanticity: Decomposing Language Models With Dictionary Learning](https://transformer-circuits.pub/2023/monosemantic-features/)"
+A PyTorch implementation of Cross-Layer Transcoder as described in "[Circuit Tracing: Revealing Computational Graphs in Language Models](https://transformer-circuits.pub/2025/attribution-graphs/methods.html)"
 
 ## Overview
 
