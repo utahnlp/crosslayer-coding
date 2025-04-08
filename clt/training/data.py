@@ -6,6 +6,7 @@ import time
 from tqdm import tqdm
 import sys
 import datetime
+import gc  # Import Python garbage collector
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -370,7 +371,8 @@ class ActivationStore:
             # logger.debug(f"Pruned {num_to_prune} read tokens from buffer. New size: {self.read_indices.shape[0]}")
 
             if torch.cuda.is_available() and self.device.type == "cuda":
-                # --- Force cache clearing AFTER pruning tensors --- #
+                # --- Force Python GC and CUDA cache clearing AFTER pruning tensors --- #
+                gc.collect()  # Force Python GC
                 torch.cuda.empty_cache()
                 # --- Log memory AFTER cache clearing --- #
                 mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
