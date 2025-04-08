@@ -676,6 +676,19 @@ class ActivationStore:
                 logger.info(
                     f"Initializing buffer with {len(stored_batches)} stored batches from normalization phase"
                 )
+                # Log memory *before* adding stored batches back
+                mem_before_buffer_init = 0.0  # Initialize as float
+                if torch.cuda.is_available() and self.device.type == "cuda":
+                    mem_before_buffer_init = torch.cuda.memory_allocated(
+                        self.device
+                    ) / (
+                        1024**2
+                    )  # MB
+                    elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+                    logger.info(
+                        f"Norm Stats - Before Buffer Init [{elapsed_str}]. Mem: {mem_before_buffer_init:.2f} MB"
+                    )
+
                 for batch_inputs_dict, batch_outputs_dict in stored_batches:
                     # Initialize buffer metadata if this is the first batch
                     if not self.buffer_initialized:

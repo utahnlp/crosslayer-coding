@@ -787,12 +787,11 @@ class CLTTrainer:
 
                 # --- Log metrics --- # Simplified memory logging here
                 self._log_metrics(step, loss_dict)
-                if torch.cuda.is_available() and self.device.type == "cuda":
-                    mem_end_step = torch.cuda.memory_allocated(self.device) / (1024**2)
-                    elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                    logger.debug(
-                        f"Step {step} - End [{elapsed_str}]. Mem: {mem_end_step:.2f} MB"
-                    )
+                # --- Commented out per-step memory logging --- #
+                # if torch.cuda.is_available() and self.device.type == "cuda":
+                #     mem_end_step = torch.cuda.memory_allocated(self.device) / (1024**2)
+                #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
+                #     logger.debug(f"Step {step} - End [{elapsed_str}]. Mem: {mem_end_step:.2f} MB")
 
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
