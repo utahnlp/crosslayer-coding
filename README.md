@@ -1,14 +1,20 @@
-# Cross-Layer Transcoder (CLT)
+# Cross-Layer Coding
 
-A PyTorch implementation of a Cross-Layer Transcoder as described in "[Circuit Tracing: Revealing Computational Graphs in Language Models](https://transformer-circuits.pub/2025/attribution-graphs/methods.html)"
+This library is intended for the training and analysis of cross-layer sparse coding models, including the Cross-Layer Transcoder as described in "[Circuit Tracing: Revealing Computational Graphs in Language Models](https://transformer-circuits.pub/2025/attribution-graphs/methods.html)"
+
+Currently, that is the only model supported, but in the future this will support skip-transcoders and other architectures.
 
 ## Overview
 
-The Cross-Layer Transcoder (CLT) is a multi-layer dictionary learning architecture designed to extract sparse, interpretable features from transformer models, using an encoder for each layer and a decoder for each (source layer, destination layer) pair. This implementation focuses on the core functionality needed to train and use CLTs, leveraging `nnsight` for model introspection and `datasets` for data handling.
+A Cross-Layer Transcoder (CLT) is a multi-layer dictionary learning model designed to extract sparse, interpretable features from transformers, using an encoder for each layer and a decoder for each (source layer, destination layer) pair (e.g., 12 encoders and 78 decoders for `gpt2-small`). This implementation focuses on the core functionality needed to train and use CLTs, leveraging `nnsight` for model introspection and `datasets` for data handling.
 
 ## Installation
 
 ```bash
+git clone https://github.com/curt-tigges/crosslayer-coding.git
+
+cd crosslayer-coding
+
 pip install -e .
 ```
 
@@ -167,6 +173,19 @@ print(f"Training complete! Model saved in {output_dir}")
 # loaded_model = CrossLayerTranscoder(clt_config)
 # loaded_model.load(output_dir / "my_final_clt.pt", device=torch.device(device))
 # print("Model loaded manually.")
+```
+
+## Citation
+If you use Crosslayer-Coding in your research, please cite:
+
+```
+@software{probity,
+  author = {Tigges, Curt},
+  title = {Cross-Layer Coding},
+  year = {2025},
+  url = {https://github.com/curt-tigges/crosslayer-coding}
+}
+```
 
 ## License
 
