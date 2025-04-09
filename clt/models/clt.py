@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Union
+from typing import Dict, Optional, Union, Tuple
 import logging  # Import logging
 import math  # Import math for sqrt
 
@@ -16,79 +16,78 @@ class JumpReLU(torch.autograd.Function):
     """Custom JumpReLU activation function with straight-through gradient estimator."""
 
     @staticmethod
-    def forward(ctx, input, threshold=0.03, bandwidth=1.0):
+    def forward(
+        ctx, input: torch.Tensor, threshold: torch.Tensor, bandwidth: float
+    ) -> torch.Tensor:
         """Forward pass of JumpReLU activation.
 
         Args:
             input: Input tensor
-            threshold: Activation threshold
+            threshold: Activation threshold tensor (can be scalar or per-feature)
             bandwidth: Bandwidth parameter for straight-through estimator
 
         Returns:
             Output tensor with JumpReLU applied
         """
-        # Ensure threshold is on the same device and has a suitable dtype for comparison
-        # Use the input tensor's properties as reference
-        threshold_tensor = torch.tensor(threshold, device=input.device)
-        ctx.save_for_backward(input, threshold_tensor)
+        ctx.save_for_backward(input, threshold)
         ctx.bandwidth = bandwidth
 
         # JumpReLU: 0 if x < threshold, x if x >= threshold
-        # Ensure comparison happens with compatible types
-        return (input >= threshold_tensor.to(input.dtype)).float() * input
+        return (input >= threshold).float() * input
 
     @staticmethod
-    def backward(ctx, grad_output):
+    def backward(
+        ctx, *grad_outputs: torch.Tensor
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], None]:
         """Backward pass with straight-through gradient estimator.
 
-        Performs calculations in float32 for stability and casts results back.
+        Performs calculations in the original tensor dtypes.
 
         Args:
-            grad_output: Gradient from subsequent layer
+            grad_outputs: Gradient(s) from subsequent layer(s)
 
         Returns:
-            Gradients for input and log_threshold.
+            Gradients for input, threshold, and None for bandwidth.
         """
-        input_original_dtype, threshold_original_dtype = ctx.saved_tensors
+        grad_output = grad_outputs[0]  # Unpack the primary gradient
+        input, threshold = ctx.saved_tensors
         bandwidth = ctx.bandwidth
+        # Check which inputs need gradients
+        needs_input_grad, needs_threshold_grad, _ = ctx.needs_input_grad
 
-        # Store original dtypes to cast back later
-        original_input_dtype = input_original_dtype.dtype
-        original_threshold_dtype = threshold_original_dtype.dtype
-
-        # --- Perform calculations in float32 for stability --- #
-        input_fp32 = input_original_dtype.float()
-        threshold_fp32 = threshold_original_dtype.float()
-        grad_output_fp32 = grad_output.float()
-        bandwidth_fp32 = float(bandwidth)
-
-        # Mask for inputs within the STE window around the threshold
-        is_near_threshold = torch.abs(input_fp32 - threshold_fp32) <= (
-            bandwidth_fp32 / 2.0
-        )
-        is_near_threshold_float = is_near_threshold.float()
+        grad_input = None
+        grad_threshold = None
 
         # 1. Gradient for input (Straight-through estimator)
-        grad_input_fp32 = grad_output_fp32 * is_near_threshold_float
+        if needs_input_grad:
+            # Calculate grad_input in original dtype
+            # Mask for inputs within the STE window around the threshold
+            is_near_threshold = torch.abs(input - threshold) <= (bandwidth / 2.0)
+            grad_input = grad_output * is_near_threshold.type_as(grad_output)
 
         # 2. Gradient for threshold
-        local_grad_theta_fp32 = (-input_fp32 / bandwidth_fp32) * is_near_threshold_float
-        grad_threshold_per_element_fp32 = grad_output_fp32 * local_grad_theta_fp32
+        if needs_threshold_grad:
+            # Calculate grad_threshold in original dtype
+            is_near_threshold = torch.abs(input - threshold) <= (bandwidth / 2.0)
+            local_grad_theta = (-input / bandwidth) * is_near_threshold.type_as(input)
+            grad_threshold_per_element = grad_output * local_grad_theta
 
-        # Sum gradients across batch/sequence dimensions
-        if grad_threshold_per_element_fp32.dim() > 1:
-            dims_to_sum = tuple(range(grad_threshold_per_element_fp32.dim() - 1))
-            grad_threshold_fp32 = grad_threshold_per_element_fp32.sum(dim=dims_to_sum)
-        else:
-            grad_threshold_fp32 = grad_threshold_per_element_fp32
+            # Sum gradients across non-feature dimensions if threshold is per-feature
+            # This assumes threshold might be broadcasted to match input shape
+            if grad_threshold_per_element.dim() > threshold.dim():
+                dims_to_sum = tuple(
+                    range(grad_threshold_per_element.dim() - threshold.dim())
+                )
+                grad_threshold = grad_threshold_per_element.sum(dim=dims_to_sum)
+                # Ensure shape matches original threshold shape if it wasn't originally scalar
+                if threshold.shape != torch.Size([]):
+                    grad_threshold = grad_threshold.reshape(threshold.shape)
+            else:
+                # If threshold was scalar, sum everything
+                grad_threshold = grad_threshold_per_element.sum()
 
-        # --- Cast gradients back to original dtypes --- #
-        grad_input = grad_input_fp32.to(original_input_dtype)
-        grad_threshold = grad_threshold_fp32.to(original_threshold_dtype)
-
-        # Return gradients for input, threshold, and None for bandwidth
-        # Note: We return grad for threshold, not log_threshold directly here.
-        # The autograd engine handles the chain rule back to log_threshold parameter.
+        # Return gradients corresponding to the inputs of forward
+        # (input, threshold, bandwidth)
         return grad_input, grad_threshold, None
 
 
@@ -149,7 +148,8 @@ class CrossLayerTranscoder(BaseTranscoder):
             )
         else:
             logger.info(
-                f"CLT model initialized with dtype {self.dtype} (device not specified yet)"
+                f"CLT model initialized with dtype {self.dtype} "
+                f"(device not specified yet)"
             )
 
     def _resolve_dtype(
@@ -165,12 +165,14 @@ class CrossLayerTranscoder(BaseTranscoder):
                     return dtype
                 else:
                     logger.warning(
-                        f"Resolved '{dtype_input}' but it is not a torch.dtype. Defaulting to float32."
+                        f"Resolved '{dtype_input}' but it is not a torch.dtype. "
+                        f"Defaulting to float32."
                     )
                     return torch.float32
             except AttributeError:
                 logger.warning(
-                    f"Unsupported CLT dtype string: '{dtype_input}'. Defaulting to float32."
+                    f"Unsupported CLT dtype string: '{dtype_input}'. "
+                    f"Defaulting to float32."
                 )
                 return torch.float32
         return torch.float32
@@ -180,11 +182,13 @@ class CrossLayerTranscoder(BaseTranscoder):
         # Initialize encoders
         encoder_bound = 1.0 / math.sqrt(self.config.num_features)
         for encoder in self.encoders:
+            # nn.init functions expect Tensor inputs
             nn.init.uniform_(encoder.weight, -encoder_bound, encoder_bound)
 
         # Initialize decoders
         decoder_bound = 1.0 / math.sqrt(self.config.num_layers * self.config.d_model)
         for decoder in self.decoders.values():
+            # nn.init functions expect Tensor inputs
             nn.init.uniform_(decoder.weight, -decoder_bound, decoder_bound)
 
         logger.info(
@@ -196,7 +200,8 @@ class CrossLayerTranscoder(BaseTranscoder):
 
     def jumprelu(self, x: torch.Tensor) -> torch.Tensor:
         """Apply JumpReLU activation function."""
-        threshold = torch.exp(self.log_threshold)
+        # Ensure threshold is on the same device and dtype as input x
+        threshold = torch.exp(self.log_threshold).to(x.device, x.dtype)
         return JumpReLU.apply(x, threshold, self.bandwidth)
 
     def get_preactivations(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
@@ -212,7 +217,8 @@ class CrossLayerTranscoder(BaseTranscoder):
                 input_for_linear = x.reshape(-1, d_model)
             else:
                 logger.warning(
-                    f"Cannot handle input shape {x.shape} for preactivations layer {layer_idx}"
+                    f"Cannot handle input shape {x.shape} for "
+                    f"preactivations layer {layer_idx}"
                 )
                 return torch.zeros(
                     (0, self.config.num_features), device=self.device, dtype=self.dtype
@@ -220,7 +226,8 @@ class CrossLayerTranscoder(BaseTranscoder):
 
             if input_for_linear.shape[1] != self.config.d_model:
                 logger.warning(
-                    f"Input d_model {input_for_linear.shape[1]} != config {self.config.d_model} layer {layer_idx}"
+                    f"Input d_model {input_for_linear.shape[1]} != "
+                    f"config {self.config.d_model} layer {layer_idx}"
                 )
                 return torch.zeros(
                     expected_out_shape, device=self.device, dtype=self.dtype

@@ -1,389 +1,350 @@
 import pytest
 import torch
-from unittest.mock import patch, MagicMock, PropertyMock
 from datasets import Dataset
-from nnsight import LanguageModel  # Import for type hinting/mocking structure
-
-# Assuming clt is importable from the test environment
 from clt.nnsight.extractor import ActivationExtractorCLT
+from unittest.mock import patch
+import gc
+
+# Use a small standard model for testing
+TEST_MODEL_NAME = "gpt2"
+TEST_DEVICE = "cpu"  # Force CPU for easier testing
 
 
-# --- Fixtures ---
-
-
-@pytest.fixture
-def mock_tokenizer():
-    """Mocks the tokenizer."""
-    tokenizer = MagicMock()
-    tokenizer.pad_token = "<pad>"
-    tokenizer.pad_token_id = 0
-    # Mock encode/decode if needed, but nnsight handles internal tokenization
-    return tokenizer
-
-
-@pytest.fixture
-def mock_model_config():
-    """Mocks the model configuration."""
-    config = MagicMock()
-    type(config).num_hidden_layers = PropertyMock(return_value=2)  # Example: 2 layers
-    type(config).hidden_size = PropertyMock(return_value=64)  # Example: d_model = 64
-    return config
-
-
-@pytest.fixture
-def mock_language_model(mock_tokenizer, mock_model_config):
-    """Mocks the nnsight LanguageModel."""
-    model = MagicMock(spec=LanguageModel)
-    # Explicitly add attributes expected by the spec but potentially missed by MagicMock
-    model.get = MagicMock()
-    model.input = MagicMock()
-    model.output = MagicMock()
-
-    model.tokenizer = mock_tokenizer
-    model.config = mock_model_config
-    model.device = torch.device("cpu")
-
-    # --- Mocking get ---
-    # This needs to return mock modules that can be indexed and have .save()
-    def mock_get(path):
-        mock_module = MagicMock()
-
-        # Allow indexing like module[0]
-        def getitem(key):
-            # Return a mock object that has a .save() method
-            saveable_mock = MagicMock()
-            saveable_mock.save.return_value = MagicMock()  # This is the SaveProxy mock
-            return saveable_mock
-
-        mock_module.__getitem__.side_effect = getitem
-        # Make the module itself saveable (for output)
-        mock_module.save.return_value = MagicMock()  # This is the SaveProxy mock
-        return mock_module
-
-    model.get.side_effect = mock_get
-
-    # --- Mocking model.trace ---
-    # Needs to simulate the context manager and saving activations
-    mock_trace_context = MagicMock()
-    mock_save_proxies = {}  # To store proxies returned by .save()
-
-    def setup_trace_context(*args, **kwargs):
-        # Mock model.input.save()
-        mock_input_proxy = model.input.save()  # Get the proxy returned by the mock
-        mock_input_value = {
-            "input_ids": torch.randint(1, 100, (2, 5)),
-            "attention_mask": torch.tensor([[1, 1, 1, 0, 0], [1, 1, 0, 0, 0]]),
-        }
-        type(mock_input_proxy).value = PropertyMock(return_value=mock_input_value)
-
-        d_model = mock_model_config.hidden_size
-        batch_size = mock_input_value["attention_mask"].shape[0]
-        seq_len = mock_input_value["attention_mask"].shape[1]
-
-        # Mock activations saved by layers
-        for i in range(mock_model_config.num_hidden_layers):
-            # Simulate getting the module and saving input
-            input_module_mock = model.get(f"transformer.h.{i}.mlp.input")
-            input_save_proxy = input_module_mock[0].save()  # Get the proxy
-            input_value = torch.randn(batch_size, seq_len, d_model)
-            type(input_save_proxy).value = PropertyMock(return_value=input_value)
-
-            # Simulate getting the module and saving output
-            output_module_mock = model.get(f"transformer.h.{i}.mlp.output")
-            output_save_proxy = output_module_mock.save()  # Get the proxy
-            output_value = torch.randn(batch_size, seq_len, d_model)
-            type(output_save_proxy).value = PropertyMock(return_value=output_value)
-
-        # Mock model.output.shape to trigger computation
-        type(model.output).shape = PropertyMock(
-            return_value=(batch_size, seq_len, d_model)
-        )
-        return mock_trace_context  # Return self for context manager
-
-    # Configure the model.trace mock
-    model.trace = MagicMock()
-    model.trace.return_value.__enter__.side_effect = setup_trace_context
-    model.trace.return_value.__exit__ = MagicMock(
-        return_value=False
-    )  # Important for context managers
-
-    model._mock_save_proxies = mock_save_proxies  # Attach for inspection in tests
-
-    return model
+@pytest.fixture(scope="module")
+def extractor():
+    """Fixture to create an ActivationExtractorCLT instance for testing."""
+    instance = ActivationExtractorCLT(
+        model_name=TEST_MODEL_NAME,
+        device=TEST_DEVICE,
+        context_size=32,  # Keep small for testing
+        store_batch_size_prompts=4,  # Small batch size
+    )
+    yield instance
+    # Cleanup - necessary for nnsight models?
+    del instance.model
+    del instance.tokenizer
+    del instance
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
 @pytest.fixture
-def mock_dataset():
-    """Mocks a Hugging Face dataset."""
-    data = {"text": ["This is text one.", "This is text two.", "Short", ""]}
+def dummy_dataset():
+    """Fixture for a small dummy dataset."""
+    data = {
+        "text": [
+            "This is the first sentence.",
+            "Here is another sentence.",
+            "A short one.",
+            "This is the fourth piece of text.",
+            "Sentence five.",
+            "And the final sixth sentence for testing.",
+        ]
+    }
+    return Dataset.from_dict(data)
+
+
+# --- Initialization Tests ---
+
+
+def test_init_loads_model_tokenizer(extractor):
+    """Test if model and tokenizer are loaded during initialization."""
+    assert extractor.model is not None, "Model should be loaded"
+    assert extractor.tokenizer is not None, "Tokenizer should be loaded"
+    assert extractor.tokenizer.pad_token is not None, "Pad token should be set"
+
+
+def test_init_detects_layers(extractor):
+    """Test if the number of layers is detected correctly."""
+    # GPT-2 has 12 layers
+    assert (
+        extractor.num_layers == 12
+    ), f"Expected 12 layers for gpt2, found {extractor.num_layers}"
+
+
+def test_init_device(extractor):
+    """Test if the device is set correctly."""
+    assert (
+        str(extractor.device) == TEST_DEVICE
+    ), f"Expected device {TEST_DEVICE}, got {extractor.device}"
+
+
+def test_init_default_paths(extractor):
+    """Test if default MLP path templates are set."""
+    assert extractor.mlp_input_module_path_template == "transformer.h.{}.mlp.input"
+    assert extractor.mlp_output_module_path_template == "transformer.h.{}.mlp.output"
+
+
+def test_init_custom_paths():
+    """Test initialization with custom MLP path templates."""
+    custom_input = "custom.input.path.{}"
+    custom_output = "custom.output.path.{}"
+    instance = ActivationExtractorCLT(
+        model_name=TEST_MODEL_NAME,
+        device=TEST_DEVICE,
+        mlp_input_module_path_template=custom_input,
+        mlp_output_module_path_template=custom_output,
+    )
+    assert instance.mlp_input_module_path_template == custom_input
+    assert instance.mlp_output_module_path_template == custom_output
+    del instance.model, instance.tokenizer, instance
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# --- Activation Streaming Tests ---
+
+
+# Mock load_dataset to avoid actual disk/network access during tests
+@patch("clt.nnsight.extractor.load_dataset")
+def test_stream_activations_basic(mock_load_dataset, extractor, dummy_dataset):
+    """Test basic activation streaming yields correct format."""
+    mock_load_dataset.return_value = dummy_dataset
+    d_model = extractor.model.config.hidden_size  # 768 for gpt2
+
+    activation_generator = extractor.stream_activations(
+        dataset_path="dummy_path",  # Path doesn't matter due to mocking
+        dataset_split="train",
+        dataset_text_column="text",
+        streaming=False,  # Use non-streaming for predictable batching with small dataset
+    )
+
+    # Get the first yielded batch
+    first_batch_inputs, first_batch_targets = next(activation_generator)
+
+    assert isinstance(first_batch_inputs, dict), "Inputs should be a dict"
+    assert isinstance(first_batch_targets, dict), "Targets should be a dict"
+    assert (
+        len(first_batch_inputs) == extractor.num_layers
+    ), "Inputs dict should have all layers"
+    assert (
+        len(first_batch_targets) == extractor.num_layers
+    ), "Targets dict should have all layers"
+
+    # Check activations for layer 0
+    assert 0 in first_batch_inputs
+    assert 0 in first_batch_targets
+    assert isinstance(first_batch_inputs[0], torch.Tensor)
+    assert isinstance(first_batch_targets[0], torch.Tensor)
+
+    # Check shape: [n_valid_tokens, d_model]
+    # n_valid_tokens depends on tokenization and batch size
+    assert first_batch_inputs[0].ndim == 2, "Input tensor should be 2D"
+    assert (
+        first_batch_inputs[0].shape[1] == d_model
+    ), f"Input tensor dim 1 should be d_model ({d_model})"
+    assert first_batch_targets[0].ndim == 2, "Target tensor should be 2D"
+    assert (
+        first_batch_targets[0].shape[1] == d_model
+    ), f"Target tensor dim 1 should be d_model ({d_model})"
+    assert (
+        first_batch_inputs[0].shape[0] == first_batch_targets[0].shape[0]
+    ), "Input and target should have same number of tokens"
+    assert first_batch_inputs[0].shape[0] > 0, "Should have extracted some tokens"
+
+    # Check device
+    assert str(first_batch_inputs[0].device) == TEST_DEVICE
+    assert str(first_batch_targets[0].device) == TEST_DEVICE
+
+    # Consume the rest of the generator to ensure no errors
+    for _ in activation_generator:
+        pass
+
+
+@patch("clt.nnsight.extractor.load_dataset")
+def test_stream_activations_padding_exclusion(mock_load_dataset, extractor):
+    """Test that padding tokens are excluded."""
+    # Create data with varying lengths to force padding
+    data = {
+        "text": [
+            "Short.",
+            "This is a slightly longer sentence.",
+            "Medium length text.",
+            "Tiny.",
+        ]
+    }
     dataset = Dataset.from_dict(data)
-    # Also mock as IterableDataset for streaming case if needed
-    # For simplicity, we'll use the standard Dataset here
-    return dataset
+    mock_load_dataset.return_value = dataset
+    d_model = extractor.model.config.hidden_size
 
+    # Tokenize manually to find total non-pad tokens
+    tokenizer_args = {
+        "truncation": True,
+        "max_length": extractor.context_size,
+        "padding": "longest",
+        "return_tensors": "pt",
+    }
+    tokenized = extractor.tokenizer(data["text"], **tokenizer_args)
+    total_non_pad_tokens = tokenized["attention_mask"].sum().item()
 
-@pytest.fixture
-@patch("clt.nnsight.extractor.LanguageModel", autospec=True)
-@patch("clt.nnsight.extractor.load_dataset")
-def activation_extractor(
-    mock_load_dataset, mock_lang_model_cls, mock_language_model, mock_dataset
-):
-    """Fixture to create an ActivationExtractorCLT instance with mocked dependencies."""
-    # Configure the class mock to return our instance mock
-    mock_lang_model_cls.return_value = mock_language_model
-    # Configure the dataset mock
-    mock_load_dataset.return_value = mock_dataset
-
-    extractor = ActivationExtractorCLT(
-        model_name="mock_model",
-        device=torch.device("cpu"),
-        context_size=5,
-        store_batch_size_prompts=2,  # Process 2 prompts per batch
-    )
-    # Attach mocks for inspection if needed elsewhere
-    extractor.model = mock_language_model
-    extractor.tokenizer = mock_language_model.tokenizer
-    return extractor
-
-
-# --- Test Cases ---
-
-
-def test_activation_extractor_init(activation_extractor, mock_language_model):
-    """Test the initialization of ActivationExtractorCLT."""
-    assert activation_extractor.model_name == "mock_model"
-    assert activation_extractor.device == torch.device("cpu")
-    assert activation_extractor.context_size == 5
-    assert activation_extractor.store_batch_size_prompts == 2
-    assert activation_extractor.num_layers == 2  # From mock_model_config
-    assert activation_extractor.model == mock_language_model
-    assert activation_extractor.tokenizer is not None
-
-
-# Patch _get_num_layers directly for the layer detection tests
-@patch("clt.nnsight.extractor.ActivationExtractorCLT._get_num_layers")
-@patch("clt.nnsight.extractor.LanguageModel", autospec=True)
-def test_activation_extractor_init_layer_detection_fallback(
-    mock_lang_model_cls,
-    mock_get_num_layers,
-):
-    """Test layer detection fallback mechanism."""
-    # Configure the mock_get_num_layers to return 2
-    mock_get_num_layers.return_value = 2
-
-    # Mock the model instance that LanguageModel() will return
-    mock_model_instance = MagicMock(spec=LanguageModel)
-    mock_model_instance.tokenizer = MagicMock()
-    mock_model_instance.tokenizer.pad_token = "<pad>"
-    mock_config = MagicMock()
-    mock_config.configure_mock(num_hidden_layers=None, n_layer=None)
-    mock_model_instance.config = mock_config
-    mock_lang_model_cls.return_value = mock_model_instance
-
-    # Now initialize the extractor - _get_num_layers is mocked to return 2
-    extractor = ActivationExtractorCLT(
-        model_name="fallback_test",
-        mlp_input_module_path_template="transformer.h.{}.mlp.input",
-        mlp_output_module_path_template="transformer.h.{}.mlp.output",
-    )
-    # Verify that the number of layers was set by our mocked method
-    assert extractor.num_layers == 2
-    # Verify that the method was actually called
-    mock_get_num_layers.assert_called_once()
-
-
-# Patch _get_num_layers directly to raise an exception
-@patch("clt.nnsight.extractor.ActivationExtractorCLT._get_num_layers")
-@patch("clt.nnsight.extractor.LanguageModel", autospec=True)
-def test_activation_extractor_init_layer_detection_fail(
-    mock_lang_model_cls,
-    mock_get_num_layers,
-):
-    """Test layer detection fails gracefully."""
-    # Configure the mock to raise ValueError
-    mock_get_num_layers.side_effect = ValueError(
-        "Could not automatically determine the number of layers."
+    # Stream activations
+    activation_generator = extractor.stream_activations(
+        dataset_path="dummy_path",
+        dataset_split="train",
+        dataset_text_column="text",
+        streaming=False,
     )
 
-    # Mock the model instance
-    mock_model_instance = MagicMock(spec=LanguageModel)
-    mock_model_instance.tokenizer = MagicMock()
-    mock_model_instance.tokenizer.pad_token = "<pad>"
-    mock_config = MagicMock()
-    mock_config.configure_mock(num_hidden_layers=None, n_layer=None)
-    mock_model_instance.config = mock_config
-    mock_lang_model_cls.return_value = mock_model_instance
+    total_yielded_tokens = 0
+    for inputs_dict, targets_dict in activation_generator:
+        # Check layer 0 for token count
+        if 0 in inputs_dict:
+            total_yielded_tokens += inputs_dict[0].shape[0]
+            assert inputs_dict[0].shape[1] == d_model
+        if 0 in targets_dict:
+            assert targets_dict[0].shape[1] == d_model
 
-    # Now initialize - should raise error during _get_num_layers
-    with pytest.raises(ValueError, match="Could not automatically determine"):
-        ActivationExtractorCLT(
-            model_name="fail_test",
-            mlp_input_module_path_template="transformer.h.{}.mlp.input",
-            mlp_output_module_path_template="transformer.h.{}.mlp.output",
-        )
-
-
-def test_get_module(activation_extractor, mock_language_model):
-    """Test the _get_module helper method."""
-    # Reset side effect from previous tests if necessary
-    original_side_effect = mock_language_model.get.side_effect
-    mock_language_model.get.side_effect = None
-    mock_language_model.get.return_value = MagicMock()
-
-    # Test getting input module
-    module_input = activation_extractor._get_module(0, "input")
-    assert isinstance(module_input, MagicMock)
-    mock_language_model.get.assert_called_with(
-        activation_extractor.mlp_input_module_path_template.format(0)
-    )
-
-    # Test getting output module
-    module_output = activation_extractor._get_module(1, "output")
-    assert isinstance(module_output, MagicMock)
-    mock_language_model.get.assert_called_with(
-        activation_extractor.mlp_output_module_path_template.format(1)
-    )
-
-    # Test invalid module type
-    with pytest.raises(ValueError, match="module_type must be 'input' or 'output'"):
-        activation_extractor._get_module(0, "invalid")
-
-    # Test fetch failure
-    mock_language_model.get.side_effect = ValueError("Get failed")
-    with pytest.raises(ValueError, match="Could not fetch module"):
-        activation_extractor._get_module(0, "input")
-
-    # Restore original side effect if it was complex
-    mock_language_model.get.side_effect = original_side_effect
+    assert (
+        total_yielded_tokens == total_non_pad_tokens
+    ), f"Total yielded tokens ({total_yielded_tokens}) should equal total non-pad tokens ({total_non_pad_tokens})"
 
 
 @patch("clt.nnsight.extractor.load_dataset")
-def test_stream_activations_yields_correct_structure(
-    mock_load_dataset,
-    activation_extractor,
-    mock_dataset,
-    mock_language_model,
-):
-    """Test that stream_activations yields the correct data structure."""
-    # Configure the mock return value for this test
-    mock_load_dataset.return_value = mock_dataset
+def test_stream_activations_max_samples(mock_load_dataset, extractor, dummy_dataset):
+    """Test the max_samples parameter."""
+    mock_load_dataset.return_value = dummy_dataset
+    max_samples = 2
+    store_batch_size = 1  # Ensure we process one sample at a time for simplicity
 
-    # Skip detailed tensor validation to avoid MagicMock issues in tests
-    # Just patch the extractor's stream_activations method to return some test data
-    with patch.object(activation_extractor, "stream_activations") as mock_stream:
-        mock_stream.return_value = iter(
-            [
-                (
-                    {0: torch.zeros(5, 64), 1: torch.zeros(5, 64)},
-                    {0: torch.zeros(5, 64), 1: torch.zeros(5, 64)},
-                )
-            ]
-        )
-
-        # Call the method to verify it works
-        stream = activation_extractor.stream_activations(
-            dataset_path="mock_dataset_path", dataset_text_column="text"
-        )
-
-        # Verify the structure of the returned data
-        batch_inputs, batch_targets = next(stream)
-
-        # Basic checks
-        assert isinstance(batch_inputs, dict)
-        assert isinstance(batch_targets, dict)
-        assert len(batch_inputs) == 2  # Should match mock_model_config
-        assert len(batch_targets) == 2
-
-
-@patch("clt.nnsight.extractor.load_dataset")
-def test_stream_activations_padding_filtering(
-    mock_load_dataset,
-    activation_extractor,
-    mock_language_model,
-    mock_dataset,
-):
-    """Verify that padding tokens are filtered based on the attention mask."""
-    # Configure the mock return value for this test
-    mock_load_dataset.return_value = mock_dataset
-
-    # Just verify the method works without errors by mocking the return value
-    with patch.object(activation_extractor, "stream_activations") as mock_stream:
-        # Mocking expected tensor shapes after filtering (5 valid tokens from a 2x5 tensor with attention mask)
-        mock_stream.return_value = iter(
-            [
-                (
-                    {0: torch.zeros(5, 64), 1: torch.zeros(5, 64)},
-                    {0: torch.zeros(5, 64), 1: torch.zeros(5, 64)},
-                )
-            ]
-        )
-
-        # Call the method
-        stream = activation_extractor.stream_activations(
-            dataset_path="mock_dataset_path", dataset_text_column="text"
-        )
-
-        # Check the shape matches what we expect after padding filtering
-        batch_inputs, batch_targets = next(stream)
-        d_model = activation_extractor.model.config.hidden_size
-        expected_valid_tokens = 5  # Sum of 1s in attention mask
-
-        assert batch_inputs[0].shape[0] == expected_valid_tokens
-        assert batch_inputs[0].shape[1] == d_model
-
-
-def test_stream_activations_empty_dataset(activation_extractor):
-    """Test behavior with an empty dataset."""
-    # Mock load_dataset to return an empty dataset
-    with patch(
-        "clt.nnsight.extractor.load_dataset",
-        return_value=Dataset.from_dict({"text": []}),
-    ):
-        stream = activation_extractor.stream_activations(
-            dataset_path="empty_mock_dataset", dataset_text_column="text"
-        )
-        # Should not yield anything
-        with pytest.raises(StopIteration):
-            next(stream)
-        # Trace should not have been called
-        assert activation_extractor.model.trace.call_count == 0
-
-
-@patch("clt.nnsight.extractor.load_dataset")
-def test_stream_activations_invalid_text_column(
-    mock_load_dataset,
-    activation_extractor,
-    mock_dataset,
-):
-    """Test behavior with an invalid text column name."""
-    # Configure the mock return value for this test
-    mock_load_dataset.return_value = mock_dataset
-
-    # No need to mock load_dataset again if fixture already does
-    stream = activation_extractor.stream_activations(
-        dataset_path="mock_dataset_path",
-        dataset_text_column="invalid_column_name",  # Column doesn't exist
+    instance = ActivationExtractorCLT(
+        model_name=TEST_MODEL_NAME,
+        device=TEST_DEVICE,
+        context_size=32,
+        store_batch_size_prompts=store_batch_size,
     )
-    # Iterating over the dataset will raise a KeyError
-    with pytest.raises(KeyError):
-        next(stream)  # Trigger the iteration
+
+    # Tokenize the first max_samples manually to get expected token count
+    tokenizer_args = {
+        "truncation": True,
+        "max_length": instance.context_size,
+        "padding": "longest",
+        "return_tensors": "pt",
+    }
+    first_samples_text = dummy_dataset[:max_samples]["text"]
+    tokenized = instance.tokenizer(first_samples_text, **tokenizer_args)
+    expected_tokens = tokenized["attention_mask"].sum().item()
+
+    activation_generator = instance.stream_activations(
+        dataset_path="dummy_path",
+        dataset_split="train",
+        dataset_text_column="text",
+        streaming=True,  # Test with streaming
+        max_samples=max_samples,
+    )
+
+    total_yielded_tokens = 0
+    batches_yielded = 0
+    for inputs_dict, _ in activation_generator:
+        if 0 in inputs_dict:
+            total_yielded_tokens += inputs_dict[0].shape[0]
+        batches_yielded += 1
+
+    # Since batch size is 1, we expect 'max_samples' batches.
+    # assert batches_yielded <= max_samples # Might yield fewer if samples are empty etc.
+    # The crucial check is the total number of tokens processed corresponds to the first max_samples
+    assert (
+        total_yielded_tokens == expected_tokens
+    ), f"Expected {expected_tokens} tokens for {max_samples} samples, got {total_yielded_tokens}"
+
+    del instance.model, instance.tokenizer, instance
+    gc.collect()
+    torch.cuda.empty_cache()
 
 
-def test_close_method(activation_extractor):
-    """Test that the close method runs without errors."""
-    # Primarily for coverage and future use if cleanup is needed
-    try:
-        activation_extractor.close()
-    except Exception as e:
-        pytest.fail(f"activation_extractor.close() raised an exception: {e}")
+@patch("clt.nnsight.extractor.load_dataset")
+def test_stream_activations_final_batch(mock_load_dataset, extractor, dummy_dataset):
+    """Test processing of the final, potentially smaller, batch."""
+    mock_load_dataset.return_value = dummy_dataset
+    num_samples = len(dummy_dataset)  # 6
+    batch_size = extractor.store_batch_size_prompts  # 4
+    num_full_batches = num_samples // batch_size  # 6 // 4 = 1
+    final_batch_size = num_samples % batch_size  # 6 % 4 = 2
+    assert final_batch_size > 0, "Test setup assumes a non-empty final batch"
+
+    # Tokenize the last few samples manually
+    tokenizer_args = {
+        "truncation": True,
+        "max_length": extractor.context_size,
+        "padding": "longest",
+        "return_tensors": "pt",
+    }
+    final_samples_text = dummy_dataset[num_full_batches * batch_size :]["text"]
+    tokenized = extractor.tokenizer(final_samples_text, **tokenizer_args)
+    expected_final_batch_tokens = tokenized["attention_mask"].sum().item()
+
+    activation_generator = extractor.stream_activations(
+        dataset_path="dummy_path",
+        dataset_split="train",
+        dataset_text_column="text",
+        streaming=False,  # Easier to track batches
+    )
+
+    batches = list(activation_generator)
+    assert (
+        len(batches) == num_full_batches + 1
+    ), f"Expected {num_full_batches + 1} batches, got {len(batches)}"
+
+    # Check the last batch
+    final_inputs_dict, final_targets_dict = batches[-1]
+    final_yielded_tokens = 0
+    if 0 in final_inputs_dict:
+        final_yielded_tokens = final_inputs_dict[0].shape[0]
+        assert final_inputs_dict[0].ndim == 2
+        assert final_inputs_dict[0].shape[1] == extractor.model.config.hidden_size
+    if 0 in final_targets_dict:
+        assert final_targets_dict[0].ndim == 2
+        assert final_targets_dict[0].shape[1] == extractor.model.config.hidden_size
+
+    assert (
+        final_yielded_tokens == expected_final_batch_tokens
+    ), f"Expected {expected_final_batch_tokens} tokens in final batch, got {final_yielded_tokens}"
 
 
-# TODO: Add tests for:
-# - exclude_special_tokens=True (requires mocking input_ids and tokenizer special ids)
-# - prepend_bos=True (requires mocking tokenizer and verifying input_ids)
-# - Different dataset types (streaming=True with IterableDataset mock)
-# - Error handling during model.trace execution (e.g., OOM) - might be harder
-#   to mock reliably
-# - Handling of tuples returned by mocked save proxies (already implicitly
-#   handled by mock design, but could be explicit)
-# - Correct handling of cache_path argument in load_dataset call
+@patch("clt.nnsight.extractor.load_dataset")
+def test_preprocess_text(mock_load_dataset, extractor):
+    """Test the internal _preprocess_text method for chunking."""
+    # Access the protected method for testing (common in Python testing)
+    preprocess_func = extractor._preprocess_text
+
+    short_text = "This is short."
+    chunks = preprocess_func(short_text)
+    assert chunks == [short_text], "Short text shouldn't be chunked"
+
+    # Create text slightly longer than context_size requires chunking
+    # context_size is 32. Tokens are roughly <= chars.
+    # Need > context_size tokens. Add padding for special tokens.
+    long_text = "word " * (extractor.context_size) + "extra words"
+    long_text_tokens = extractor.tokenizer.encode(long_text, add_special_tokens=False)
+    assert (
+        len(long_text_tokens) > extractor.context_size - 2
+    )  # Ensure it needs chunking
+
+    chunks = preprocess_func(long_text)
+    assert len(chunks) > 1, "Long text should be chunked into multiple parts"
+
+    # Check if chunks reconstruct roughly the original (minus tokenization artifacts)
+    reconstructed = "".join(chunks)
+    tokenized_reconstructed = extractor.tokenizer.encode(
+        reconstructed, add_special_tokens=False
+    )
+
+    # Check token IDs match, allowing for minor differences due to chunk boundaries
+    assert len(tokenized_reconstructed) >= len(long_text_tokens) - len(
+        chunks
+    )  # Allow for boundary effects
+    assert all(
+        t_orig == t_recon
+        for t_orig, t_recon in zip(long_text_tokens, tokenized_reconstructed)
+    ), "Reconstructed text tokens should largely match original"
+
+
+def test_resolve_dtype(extractor):
+    """Test the _resolve_dtype utility method."""
+    assert extractor._resolve_dtype(None) is None
+    assert extractor._resolve_dtype(torch.float32) == torch.float32
+    assert extractor._resolve_dtype("float16") == torch.float16
+    assert extractor._resolve_dtype("bfloat16") == torch.bfloat16
+    # Check warning for invalid string (requires capturing logs or mocking logger)
+    with patch("clt.nnsight.extractor.logger.warning") as mock_warning:
+        assert extractor._resolve_dtype("invalid_dtype_string") is None
+        mock_warning.assert_called_once()

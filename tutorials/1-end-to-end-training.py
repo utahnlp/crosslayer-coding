@@ -113,7 +113,7 @@ training_config = TrainingConfig(
     # Training parameters
     learning_rate=3e-4,
     training_steps=2000,
-    sparsity_lambda=30,  # Default unknown
+    sparsity_lambda=0.01,  # Default unknown
     sparsity_c=1.0,  # Default value from paper: 1.0
     preactivation_coef=3e-6,  # Default value: 3e-6
     optimizer="adamw",
@@ -121,7 +121,7 @@ training_config = TrainingConfig(
     eval_interval=10,
     log_interval=10,
     dead_feature_window=500,
-    enable_wandb=False,
+    enable_wandb=True,
     wandb_project="clt-tutorial",
 )
 print("\nTraining Configuration:")

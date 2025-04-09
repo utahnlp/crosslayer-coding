@@ -2,7 +2,7 @@
 
 This library is intended for the training and analysis of cross-layer sparse coding models, including the Cross-Layer Transcoder as described in "[Circuit Tracing: Revealing Computational Graphs in Language Models](https://transformer-circuits.pub/2025/attribution-graphs/methods.html)"
 
-Currently, that is the only model supported, but in the future this will support skip-transcoders and other architectures.
+Currently, that is the only type of architecture supported, but in the future this will support skip-transcoders and other variants.
 
 ## Overview
 

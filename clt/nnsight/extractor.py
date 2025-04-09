@@ -146,6 +146,46 @@ class ActivationExtractorCLT:
         else:  # output
             return self.model.transformer.h[layer_idx].mlp.output
 
+    def _preprocess_text(self, text: str) -> List[str]:
+        """Preprocess and chunk long text into manageable segments."""
+        if not isinstance(text, str) or not text.strip():
+            return []
+
+        # If text is already short, return it as is
+        # Rough check based on characters; tokenization might vary
+        # A more robust check would tokenize first, but adds overhead
+        if len(text) < self.context_size * 3:
+            return [text]
+
+        # For long texts, tokenize and chunk to avoid sequence length issues
+        # Ensure add_special_tokens is False for chunking logic
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+
+        # If token length fits within context size (allowing for potential BOS/EOS later)
+        if (
+            len(tokens) <= self.context_size - (1 if self.prepend_bos else 0) - 1
+        ):  # -1 for potential EOS
+            return [text]
+
+        # Split into chunks, leaving room for special tokens if needed
+        # The exact room needed depends on tokenizer and prepend_bos
+        # Conservatively leave space for BOS and EOS if necessary
+        room_for_specials = (1 if self.prepend_bos else 0) + 1  # BOS + EOS
+        chunk_size = self.context_size - room_for_specials
+        if chunk_size <= 0:
+            logger.warning(
+                f"Context size {self.context_size} too small for chunking with special tokens. Skipping text."
+            )
+            return []
+
+        token_chunks = [
+            tokens[i : i + chunk_size] for i in range(0, len(tokens), chunk_size)
+        ]
+
+        # Convert token chunks back to strings
+        text_chunks = [self.tokenizer.decode(chunk) for chunk in token_chunks]
+        return text_chunks
+
     def stream_activations(
         self,
         dataset_path: str,
@@ -197,36 +237,10 @@ class ActivationExtractorCLT:
 
         batch_texts: List[str] = []
 
-        def preprocess_text(text: str) -> List[str]:
-            """Preprocess and chunk long text into manageable segments."""
-            if not isinstance(text, str) or not text.strip():
-                return []
-
-            # If text is already short, return it as is
-            if len(text) < self.context_size * 3:
-                return [text]
-
-            # For long texts, tokenize and chunk to avoid sequence length issues
-            tokens = self.tokenizer.encode(text, add_special_tokens=False)
-
-            # If text fits within context size, return as is
-            if len(tokens) <= self.context_size:
-                return [text]
-
-            # Split into chunks
-            chunk_size = self.context_size - 2  # Leave room for special tokens
-            token_chunks = [
-                tokens[i : i + chunk_size] for i in range(0, len(tokens), chunk_size)
-            ]
-
-            # Convert token chunks back to strings
-            text_chunks = [self.tokenizer.decode(chunk) for chunk in token_chunks]
-            return text_chunks
-
         for item in tqdm(dataset, desc="Processing dataset"):
             text = item[dataset_text_column]
             # Process potentially long texts into manageable chunks
-            text_chunks = preprocess_text(text)
+            text_chunks = self._preprocess_text(text)
             # Add each chunk to batch_texts
             batch_texts.extend(text_chunks)
 

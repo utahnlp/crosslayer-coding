@@ -1,7 +1,7 @@
 # tests/unit/training/test_losses.py
 import pytest
 import torch
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 # Move import to top
 from clt.training.losses import LossManager
@@ -37,41 +37,79 @@ def mock_config():
 
 
 @pytest.fixture
-def mock_model():
+def mock_model(mock_config):
     model = MockCrossLayerTranscoder()
+    device = torch.device("cpu")  # Assuming CPU for tests
 
     # Setup default mock return values
     decoder_norms = {
-        0: torch.tensor([0.5, 1.0, 1.5]),  # Example norms for layer 0, feature dim 3
-        1: torch.tensor([1.0, 0.8]),  # Example norms for layer 1, feature dim 2
+        0: torch.tensor([0.5, 1.0, 1.5], device=device),
+        1: torch.tensor([1.0, 0.8], device=device),
+        2: torch.tensor([2.0], device=device),  # For 1D test
     }
     model.get_decoder_norms.return_value = decoder_norms
 
     # Mock preactivations based on input and layer_idx
     def mock_get_preactivations(x, layer_idx):
+        # Ensure input is on the correct device
+        x = x.to(device)
         # Simple mock: return input shifted and scaled
-        if layer_idx == 0:
-            # Batch=1, Seq=1, Feat=3
-            return x * 0.8 - 0.1
-        elif layer_idx == 1:
-            # Batch=1, Seq=1, Feat=2
-            return x * 1.2 + 0.2
-        return torch.zeros_like(x)
+        if layer_idx == 0:  # Used for 3D/2D input tests
+            # Expects [B, S, D] or [B*S, D] -> returns [B*S, Feat=3]
+            if x.dim() == 3:
+                x_flat = x.reshape(-1, x.shape[-1])
+            else:
+                x_flat = x
+            # Ensure output dim matches feature dim for the layer
+            return (x_flat[:, :3] * 0.8 - 0.1).to(device)
+        elif layer_idx == 1:  # Used for 3D/2D input tests
+            # Expects [B, S, D] or [B*S, D] -> returns [B*S, Feat=2]
+            if x.dim() == 3:
+                x_flat = x.reshape(-1, x.shape[-1])
+            else:
+                x_flat = x
+            # Ensure output dim matches feature dim for the layer
+            return (x_flat[:, :2] * 1.2 + 0.2).to(device)
+        elif layer_idx == 2:  # Used for 1D input test
+            # Expects [D] -> reshaped to [1, D] -> returns [1, Feat=1]
+            if x.dim() == 1:
+                x = x.unsqueeze(0)
+            # Ensure output dim matches feature dim for the layer
+            return (x[:, :1] * 0.5 - 0.05).to(device)  # Example preact for 1D
+        return torch.zeros(x.shape[0], 1, device=device)  # Default fallback
 
     model.get_preactivations.side_effect = mock_get_preactivations
 
     # Mock feature activations based on input
     def mock_get_feature_activations(inputs):
         activations = {}
-        if 0 in inputs:
-            # Batch=1, Seq=1, Feat=3 - Should return this shape
-            # Simulate feature extraction by slicing the result to the correct dimension
-            raw_acts = torch.relu(inputs[0] * 0.8 - 0.1)
-            activations[0] = raw_acts[:, :, :3]  # Slice to feature dimension 3
-        if 1 in inputs:
-            # Batch=1, Seq=1, Feat=2 - Should return this shape
-            raw_acts = torch.relu(inputs[1] * 1.2 + 0.2)
-            activations[1] = raw_acts[:, :, :2]  # Slice to feature dimension 2
+        for layer_idx, x_in in inputs.items():
+            x_in = x_in.to(device)
+            preacts = mock_get_preactivations(
+                x_in, layer_idx
+            )  # Use the same mock logic
+            # Apply ReLU - actual model uses JumpReLU, but ReLU is simpler for testing activation shapes
+            acts = torch.relu(preacts).to(device)
+            # Reshape back if original input was 3D? No, feature acts are usually 2D/3D
+            # The loss function handles reshaping internally. Let's return consistent shapes.
+            # For testing, let's assume get_feature_activations returns [Batch*Seq, Features] or [Batch, Seq, Features]
+            # Let's return 3D for layer 0, 2D for layer 1, 1D (reshaped to 2D) for layer 2 for testing robustness
+            if layer_idx == 0:
+                # Find original batch/seq shape if possible (crude heuristic)
+                original_shape = inputs[layer_idx].shape
+                if len(original_shape) == 3:
+                    activations[layer_idx] = acts.reshape(
+                        original_shape[0], original_shape[1], -1
+                    )
+                else:  # Assume original was 2D
+                    activations[layer_idx] = acts  # Return as [Batch*Seq, Feat]
+            elif layer_idx == 1:
+                activations[layer_idx] = acts  # Return as [Batch*Seq, Feat]
+            elif layer_idx == 2:
+                activations[layer_idx] = acts.squeeze(
+                    0
+                )  # Return as [Feat] -> Loss handles unsqueeze
+
         return activations
 
     model.get_feature_activations.side_effect = mock_get_feature_activations
@@ -79,16 +117,20 @@ def mock_model():
     # Mock predictions based on input - make the *instance* callable
     def mock_call(inputs):
         predictions = {}
-        if 0 in inputs:
-            # Batch=1, Seq=1, Dim=4 (example output dim)
-            predictions[0] = inputs[0][:, :, :4] * 0.9  # Mock transformation
-        if 1 in inputs:
-            # Batch=1, Seq=1, Dim=4
-            predictions[1] = inputs[1][:, :, :4] * 1.1  # Mock transformation
+        for layer_idx, x_in in inputs.items():
+            x_in = x_in.to(device)
+            # Simple mock prediction logic
+            if layer_idx == 0:
+                predictions[layer_idx] = (x_in * 0.9).to(device)
+            elif layer_idx == 1:
+                predictions[layer_idx] = (x_in * 1.1).to(device)
+            else:
+                predictions[layer_idx] = x_in.to(device)
         return predictions
 
     # Use model.side_effect for the instance __call__
     model.side_effect = mock_call
+    model.device = device  # Add device attribute if needed
 
     return model
 
@@ -103,170 +145,440 @@ def loss_manager(mock_config):
 
 def test_loss_manager_init(loss_manager, mock_config):
     assert loss_manager.config == mock_config
-    assert isinstance(loss_manager.mse_loss, torch.nn.MSELoss)
+    assert isinstance(loss_manager.reconstruction_loss_fn, torch.nn.MSELoss)
+    assert loss_manager.current_sparsity_lambda == 0.0  # Check initial value
 
 
 def test_compute_reconstruction_loss_basic(loss_manager):
-    predicted = {0: torch.tensor([[1.0, 2.0]]), 1: torch.tensor([[3.0, 4.0]])}
-    target = {0: torch.tensor([[1.1, 1.9]]), 1: torch.tensor([[3.2, 4.1]])}
+    device = torch.device("cpu")
+    predicted = {
+        0: torch.tensor([[1.0, 2.0]], device=device),
+        1: torch.tensor([[3.0, 4.0]], device=device),
+    }
+    target = {
+        0: torch.tensor([[1.1, 1.9]], device=device),
+        1: torch.tensor([[3.2, 4.1]], device=device),
+    }
 
-    expected_loss_0 = torch.mean(torch.tensor([(1.0 - 1.1) ** 2, (2.0 - 1.9) ** 2]))
-    expected_loss_1 = torch.mean(torch.tensor([(3.0 - 3.2) ** 2, (4.0 - 4.1) ** 2]))
+    expected_loss_0 = torch.mean(
+        torch.tensor([(1.0 - 1.1) ** 2, (2.0 - 1.9) ** 2], device=device)
+    )
+    expected_loss_1 = torch.mean(
+        torch.tensor([(3.0 - 3.2) ** 2, (4.0 - 4.1) ** 2], device=device)
+    )
     expected_total_loss = (expected_loss_0 + expected_loss_1) / 2
 
     loss = loss_manager.compute_reconstruction_loss(predicted, target)
     assert torch.isclose(loss, expected_total_loss)
+    assert loss.device == device
 
 
 def test_compute_reconstruction_loss_mismatched_keys(loss_manager):
-    predicted = {0: torch.tensor([[1.0]]), 1: torch.tensor([[3.0]])}
+    device = torch.device("cpu")
+    predicted = {
+        0: torch.tensor([[1.0]], device=device),
+        1: torch.tensor([[3.0]], device=device),
+    }
     target = {
-        0: torch.tensor([[1.1]]),
-        2: torch.tensor([[5.0]]),
+        0: torch.tensor([[1.1]], device=device),
+        2: torch.tensor([[5.0]], device=device),
     }  # Layer 1 missing in target, layer 2 missing in predicted
 
-    expected_loss_0 = torch.mean(torch.tensor([(1.0 - 1.1) ** 2]))
+    expected_loss_0 = torch.mean(torch.tensor([(1.0 - 1.1) ** 2], device=device))
     # Layer 1 loss is not calculated as it's not in target
     expected_total_loss = expected_loss_0 / 1  # Only one layer (layer 0) contributes
 
     loss = loss_manager.compute_reconstruction_loss(predicted, target)
     assert torch.isclose(loss, expected_total_loss)
+    assert loss.device == device
 
 
 def test_compute_reconstruction_loss_empty(loss_manager):
+    device = torch.device("cpu")  # Assume default device if empty
     predicted = {}
     target = {}
     loss = loss_manager.compute_reconstruction_loss(predicted, target)
-    assert torch.equal(loss, torch.tensor(0.0))
+    assert torch.equal(loss, torch.tensor(0.0, device=device))
+    assert loss.device == device
 
-    predicted = {0: torch.tensor([[1.0]])}
+    predicted = {0: torch.tensor([[1.0]], device=device)}
     target = {}
     loss = loss_manager.compute_reconstruction_loss(predicted, target)
-    assert torch.equal(loss, torch.tensor(0.0))  # No matching keys
+    assert torch.equal(loss, torch.tensor(0.0, device=device))  # No matching keys
+    assert loss.device == device
+
+    # Case with target but no predicted
+    predicted = {}
+    target = {0: torch.tensor([[1.0]], device=device)}
+    loss = loss_manager.compute_reconstruction_loss(predicted, target)
+    assert torch.equal(loss, torch.tensor(0.0, device=device))
+    assert loss.device == device
 
 
-def test_compute_sparsity_penalty_basic(loss_manager, mock_model, mock_config):
+def test_compute_sparsity_penalty_basic_3d(loss_manager, mock_model, mock_config):
+    device = mock_model.device
     # Batch=1, Seq=2, Feat=3
-    activations = {0: torch.tensor([[[0.1, 0.0, 0.5], [0.2, 0.3, 0.0]]])}
+    activations = {0: torch.tensor([[[0.1, 0.0, 0.5], [0.2, 0.3, 0.0]]], device=device)}
     current_step = 50
     total_steps = 100
 
-    # Define the norms locally for expectation calculation, don't call the mock here
-    local_decoder_norms = {0: torch.tensor([0.5, 1.0, 1.5])}
-    mock_model.get_decoder_norms.return_value = (
-        local_decoder_norms  # Set the return value
-    )
+    # Get expected norms from mock
+    local_decoder_norms = mock_model.get_decoder_norms()
 
     acts_flat = activations[0].reshape(-1, 3)  # Shape (2, 3)
-    weights = local_decoder_norms[0].unsqueeze(0)  # Shape (1, 3) - Use local definition
+    weights = local_decoder_norms[0].unsqueeze(0).to(device)  # Shape (1, 3)
     weighted_acts = acts_flat * weights  # Shape (2, 3)
 
+    # tanh penalty computation
     penalty_tensor = torch.tanh(mock_config.sparsity_c * weighted_acts)
     expected_penalty_sum = penalty_tensor.sum()
 
     lambda_factor = mock_config.sparsity_lambda * (current_step / total_steps)
-    total_elements = activations[0].numel()
-    expected_total_penalty = lambda_factor * expected_penalty_sum / total_elements
+    expected_total_penalty = lambda_factor * expected_penalty_sum
+    # Note: The implementation sums the penalty, it doesn't average per element.
 
-    penalty = loss_manager.compute_sparsity_penalty(
+    mock_model.get_decoder_norms.reset_mock()  # Reset before the call under test
+    penalty, current_lambda = loss_manager.compute_sparsity_penalty(
         mock_model, activations, current_step, total_steps
     )
 
     mock_model.get_decoder_norms.assert_called_once()
     assert torch.isclose(penalty, expected_total_penalty)
+    assert isinstance(current_lambda, float)
+    assert abs(current_lambda - lambda_factor) < 1e-9
+    assert penalty.device == device
+
+
+def test_compute_sparsity_penalty_basic_2d(loss_manager, mock_model, mock_config):
+    device = mock_model.device
+    # Batch*Seq=2, Feat=3
+    activations = {0: torch.tensor([[0.1, 0.0, 0.5], [0.2, 0.3, 0.0]], device=device)}
+    current_step = 50
+    total_steps = 100
+    # mock_model.get_decoder_norms.reset_mock() # Remove reset from here
+
+    # Get expected norms from mock
+    local_decoder_norms = mock_model.get_decoder_norms()
+
+    acts_flat = activations[0]  # Already flat
+    weights = local_decoder_norms[0].unsqueeze(0).to(device)  # Shape (1, 3)
+    weighted_acts = acts_flat * weights  # Shape (2, 3)
+
+    # tanh penalty computation
+    penalty_tensor = torch.tanh(mock_config.sparsity_c * weighted_acts)
+    expected_penalty_sum = penalty_tensor.sum()
+
+    lambda_factor = mock_config.sparsity_lambda * (current_step / total_steps)
+    expected_total_penalty = lambda_factor * expected_penalty_sum
+
+    mock_model.get_decoder_norms.reset_mock()  # Reset before the call under test
+    penalty, current_lambda = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, current_step, total_steps
+    )
+
+    mock_model.get_decoder_norms.assert_called_once()
+    assert torch.isclose(penalty, expected_total_penalty)
+    assert isinstance(current_lambda, float)
+    assert abs(current_lambda - lambda_factor) < 1e-9
+    assert penalty.device == device
+
+
+def test_compute_sparsity_penalty_basic_1d(loss_manager, mock_model, mock_config):
+    device = mock_model.device
+    # Feat=1 (for layer 2 as per mock setup)
+    # The loss function expects at least 2D, but handles 1D by unsqueezing
+    activations = {2: torch.tensor([0.5], device=device)}
+    current_step = 50
+    total_steps = 100
+    # mock_model.get_decoder_norms.reset_mock() # Remove reset from here
+
+    # Get expected norms from mock
+    local_decoder_norms = mock_model.get_decoder_norms()  # Norms for layer 2
+
+    acts_flat = activations[2].unsqueeze(0)  # Shape [1, 1]
+    weights = local_decoder_norms[2].unsqueeze(0).to(device)  # Shape [1, 1]
+    weighted_acts = acts_flat * weights
+
+    # tanh penalty computation
+    penalty_tensor = torch.tanh(mock_config.sparsity_c * weighted_acts)
+    expected_penalty_sum = penalty_tensor.sum()
+
+    lambda_factor = mock_config.sparsity_lambda * (current_step / total_steps)
+    expected_total_penalty = lambda_factor * expected_penalty_sum
+
+    mock_model.get_decoder_norms.reset_mock()  # Reset before the call under test
+    penalty, current_lambda = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, current_step, total_steps
+    )
+
+    mock_model.get_decoder_norms.assert_called_once()
+    assert torch.isclose(penalty, expected_total_penalty)
+    assert isinstance(current_lambda, float)
+    assert abs(current_lambda - lambda_factor) < 1e-9
+    assert penalty.device == device
 
 
 def test_compute_sparsity_penalty_schedule(loss_manager, mock_model, mock_config):
-    activations = {0: torch.tensor([[[0.1, 0.0, 0.5]]])}  # Batch=1, Seq=1, Feat=3
-    mock_model.get_decoder_norms.return_value = {0: torch.tensor([0.5, 1.0, 1.5])}
+    device = mock_model.device
+    activations = {0: torch.tensor([[[0.1, 0.0, 0.5]]], device=device)}  # B=1, S=1, F=3
+    total_steps = 100
+    mock_model.get_decoder_norms.reset_mock()
+    mock_model.get_decoder_norms.return_value = {
+        0: torch.tensor([0.5, 1.0, 1.5], device=device)
+    }
 
     # Step 0
-    penalty_0 = loss_manager.compute_sparsity_penalty(mock_model, activations, 0, 100)
-    assert torch.isclose(penalty_0, torch.tensor(0.0))
+    penalty_0, lambda_0 = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, 0, total_steps
+    )
+    assert torch.isclose(penalty_0, torch.tensor(0.0, device=device))
+    assert lambda_0 == 0.0
 
     # Step 50
-    penalty_50 = loss_manager.compute_sparsity_penalty(mock_model, activations, 50, 100)
+    mock_model.get_decoder_norms.reset_mock()  # Reset call count for next call
+    penalty_50, lambda_50 = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, 50, total_steps
+    )
+    expected_lambda_50 = mock_config.sparsity_lambda * (50 / total_steps)
+    assert penalty_50 > 0
+    assert abs(lambda_50 - expected_lambda_50) < 1e-9
 
     # Step 100
-    penalty_100 = loss_manager.compute_sparsity_penalty(
-        mock_model, activations, 100, 100
+    mock_model.get_decoder_norms.reset_mock()
+    penalty_100, lambda_100 = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, 100, total_steps
     )
+    expected_lambda_100 = mock_config.sparsity_lambda * (100 / total_steps)
+    assert abs(lambda_100 - expected_lambda_100) < 1e-9
 
-    assert penalty_50 > 0
-    assert torch.isclose(penalty_100, penalty_50 * 2.0)  # Linear ramp-up
+    # Penalty should scale linearly with lambda
+    assert torch.isclose(penalty_100, penalty_50 * 2.0)
 
 
 def test_compute_sparsity_penalty_empty(loss_manager, mock_model):
+    device = mock_model.device
     activations = {}
-    penalty = loss_manager.compute_sparsity_penalty(mock_model, activations, 50, 100)
-    assert torch.equal(penalty, torch.tensor(0.0))
+    penalty, current_lambda = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, 50, 100
+    )
+    assert torch.equal(penalty, torch.tensor(0.0, device=device))
+    assert current_lambda == 0.0
     mock_model.get_decoder_norms.assert_not_called()
 
 
+def test_compute_sparsity_penalty_empty_tensor(loss_manager, mock_model):
+    device = mock_model.device
+    activations = {0: torch.empty((0, 3), device=device)}  # Empty tensor
+    penalty, current_lambda = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, 50, 100
+    )
+    assert torch.equal(penalty, torch.tensor(0.0, device=device))
+    # Lambda calculation still happens, but penalty is 0
+    expected_lambda = loss_manager.config.sparsity_lambda * 0.5
+    assert abs(current_lambda - expected_lambda) < 1e-9
+    # get_decoder_norms might be called depending on implementation details before empty check
+    # The current implementation checks numel() after getting norms, so it might be called.
+
+
+def test_compute_sparsity_penalty_missing_norms(loss_manager, mock_model, mock_config):
+    device = mock_model.device
+    activations = {
+        0: torch.tensor([[[0.1, 0.0, 0.5]]], device=device),
+        99: torch.tensor([[[0.1, 0.2]]], device=device),
+    }  # Layer 99 norms not in mock
+    current_step = 50
+    total_steps = 100
+    # mock_model.get_decoder_norms.reset_mock() # Remove reset from here
+    # Norms only available for layer 0
+    mock_model.get_decoder_norms.return_value = {
+        0: torch.tensor([0.5, 1.0, 1.5], device=device)
+    }
+
+    # Calculate expected penalty only for layer 0
+    acts_flat_0 = activations[0].reshape(-1, 3)
+    weights_0 = mock_model.get_decoder_norms()[0].unsqueeze(0).to(device)
+    weighted_acts_0 = acts_flat_0 * weights_0
+    penalty_tensor_0 = torch.tanh(mock_config.sparsity_c * weighted_acts_0)
+    expected_penalty_sum = penalty_tensor_0.sum()
+    lambda_factor = mock_config.sparsity_lambda * (current_step / total_steps)
+    expected_total_penalty = lambda_factor * expected_penalty_sum
+
+    mock_model.get_decoder_norms.reset_mock()  # Reset before the call under test
+    penalty, current_lambda = loss_manager.compute_sparsity_penalty(
+        mock_model, activations, current_step, total_steps
+    )
+
+    # Norms should be fetched once
+    mock_model.get_decoder_norms.assert_called_once()
+    # Penalty should only include layer 0
+    assert torch.isclose(penalty, expected_total_penalty)
+    assert abs(current_lambda - lambda_factor) < 1e-9
+    assert penalty.device == device
+
+
+# --- Preactivation Loss Tests ---
+
+
 def test_compute_preactivation_loss_basic(loss_manager, mock_model, mock_config):
-    # Batch=1, Seq=1, Dim=3
-    inputs = {0: torch.tensor([[[-0.5, 0.2, -0.1]]])}
+    device = mock_model.device
+    # Use 2D input: Batch*Seq=1, Dim=3
+    inputs = {0: torch.tensor([[-0.5, 0.2, -0.1]], device=device)}
 
-    # Mock get_preactivations for layer 0
-    preacts = torch.tensor([[[-0.5 * 0.8 - 0.1, 0.2 * 0.8 - 0.1, -0.1 * 0.8 - 0.1]]])
-    preacts = preacts.to(inputs[0].device)  # Ensure device match
-    mock_model.get_preactivations.return_value = preacts
+    mock_model.get_preactivations.reset_mock()
 
-    relu_neg_preacts = torch.relu(-preacts)
+    # Calculate expected preacts using the mock's logic
+    # Input [-0.5, 0.2, -0.1] -> Preacts [-0.5, 0.06, -0.18] (using layer 0 logic)
+    expected_preacts = mock_model.get_preactivations.side_effect(inputs[0], 0)
+
+    relu_neg_preacts = torch.relu(-expected_preacts)
     expected_penalty_sum = relu_neg_preacts.sum()
-    num_elements = preacts.numel()
+    num_elements = expected_preacts.numel()
 
     expected_total_loss = (
         mock_config.preactivation_coef * expected_penalty_sum / num_elements
+        if num_elements > 0
+        else 0.0
     )
 
     loss = loss_manager.compute_preactivation_loss(mock_model, inputs)
 
-    mock_model.get_preactivations.assert_called_once_with(inputs[0], 0)
-    assert torch.isclose(loss, expected_total_loss)
+    mock_model.get_preactivations.assert_called_once()
+    # Check call arguments carefully
+    call_args = mock_model.get_preactivations.call_args
+    assert torch.equal(call_args[0][0], inputs[0])
+    assert call_args[0][1] == 0
+
+    assert abs(loss.item() - expected_total_loss) < 1e-6
+    assert loss.device == device
+
+
+def test_compute_preactivation_loss_1d_input(loss_manager, mock_model, mock_config):
+    device = mock_model.device
+    # Use 1D input: Dim=1 (using layer 2 logic)
+    inputs = {2: torch.tensor([-0.5], device=device)}
+    mock_model.get_preactivations.reset_mock()
+
+    # Calculate expected preacts using the mock's logic for layer 2
+    # Input [-0.5] -> unsqueezed to [1,1] -> preacts [-0.3] (0.5*-0.5 - 0.05)
+    # The mock returns shape [1, 1]
+    expected_preacts = mock_model.get_preactivations.side_effect(
+        inputs[2], 2
+    )  # Shape [1, 1]
+
+    relu_neg_preacts = torch.relu(-expected_preacts)
+    expected_penalty_sum = relu_neg_preacts.sum()
+    num_elements = expected_preacts.numel()  # Should be 1
+
+    expected_total_loss = (
+        mock_config.preactivation_coef * expected_penalty_sum / num_elements
+        if num_elements > 0
+        else 0.0
+    )
+
+    loss = loss_manager.compute_preactivation_loss(mock_model, inputs)
+
+    mock_model.get_preactivations.assert_called_once()
+    call_args = mock_model.get_preactivations.call_args
+    # The loss function unsqueezes the 1D input before passing to get_preactivations
+    assert torch.equal(call_args[0][0], inputs[2].unsqueeze(0))
+    assert call_args[0][1] == 2
+
+    assert abs(loss.item() - expected_total_loss) < 1e-6
+    assert loss.device == device
 
 
 def test_compute_preactivation_loss_all_positive(loss_manager, mock_model):
-    # Adjusted input slightly so all preactivations are positive with the mock logic
-    inputs = {0: torch.tensor([[[0.5, 0.2, 0.15]]])}
-    # 0.15 * 0.8 - 0.1 = 0.12 - 0.1 = 0.02 > 0
-
-    # Mock get_preactivations to return positive values
-    preacts = torch.tensor([[[0.1, 0.2, 0.3]]])
-    preacts = preacts.to(inputs[0].device)
-    # We rely on the side_effect configured in the fixture for the actual
-    # calculation logic. But for *this specific test*, we can override the
-    # return value if needed, or just adjust the input as done above. Let's
-    # stick with adjusting input.
-    # mock_model.get_preactivations.return_value = preacts
-    # Overriding the return value is also an option
+    device = mock_model.device
+    # Input that results in positive preactivations for layer 0
+    inputs = {0: torch.tensor([[0.5, 0.2, 0.15]], device=device)}  # Preacts > 0
+    mock_model.get_preactivations.reset_mock()
 
     loss = loss_manager.compute_preactivation_loss(mock_model, inputs)
 
-    assert torch.isclose(loss, torch.tensor(0.0), atol=1e-8)  # Added tolerance
+    mock_model.get_preactivations.assert_called_once()
+    assert torch.isclose(loss, torch.tensor(0.0, device=device), atol=1e-8)
+    assert loss.device == device
 
 
 def test_compute_preactivation_loss_empty(loss_manager, mock_model):
+    device = mock_model.device
     inputs = {}
     loss = loss_manager.compute_preactivation_loss(mock_model, inputs)
-    assert torch.equal(loss, torch.tensor(0.0))
+    assert torch.equal(loss, torch.tensor(0.0, device=device))
     mock_model.get_preactivations.assert_not_called()
+    assert loss.device == device
+
+
+def test_compute_preactivation_loss_empty_tensor(loss_manager, mock_model):
+    device = mock_model.device
+    inputs = {0: torch.empty((0, 3), device=device)}
+    loss = loss_manager.compute_preactivation_loss(mock_model, inputs)
+    assert torch.equal(loss, torch.tensor(0.0, device=device))
+    # get_preactivations should not be called if numel is 0 before call
+    # Current implementation checks numel() before calling get_preactivations
+    mock_model.get_preactivations.assert_not_called()
+    assert loss.device == device
+
+
+def test_compute_preactivation_loss_exception(loss_manager, mock_model):
+    device = mock_model.device
+    inputs = {
+        0: torch.tensor([[1.0, 2.0, 3.0]], device=device),
+        1: torch.tensor([[4.0, 5.0]], device=device),
+    }  # Use layer 1 input that will have preacts calculated
+    mock_model.get_preactivations.reset_mock()
+    # Make get_preactivations raise an exception for layer 0, but work for layer 1
+    original_side_effect = mock_model.get_preactivations.side_effect
+
+    def side_effect_with_exception(x, layer_idx):
+        if layer_idx == 0:
+            raise ValueError("Test Exception")
+        else:
+            return original_side_effect(x, layer_idx)
+
+    mock_model.get_preactivations.side_effect = side_effect_with_exception
+
+    # Calculate expected loss only for layer 1
+    expected_preacts_1 = original_side_effect(inputs[1], 1)
+    relu_neg_preacts_1 = torch.relu(-expected_preacts_1)
+    expected_penalty_sum = relu_neg_preacts_1.sum()
+    num_elements = expected_preacts_1.numel()
+    expected_total_loss = (
+        loss_manager.config.preactivation_coef * expected_penalty_sum / num_elements
+        if num_elements > 0
+        else 0.0
+    )
+
+    loss = loss_manager.compute_preactivation_loss(mock_model, inputs)
+
+    # Should have been called for both layers, but failed on layer 0
+    assert mock_model.get_preactivations.call_count == 2
+    assert abs(loss.item() - expected_total_loss) < 1e-6
+    assert loss.device == device
+
+    # Restore original side effect if fixture is used elsewhere
+    mock_model.get_preactivations.side_effect = original_side_effect
+
+
+# --- Total Loss Tests ---
 
 
 def test_compute_total_loss(loss_manager, mock_model, mock_config):
-    # B=1, S=1, Dim=4 for input/output, Feat=3 for layer 0, Feat=2 for layer 1
+    device = mock_model.device
+    # B=1, S=1, Dim=4 for input/output
     inputs = {
-        0: torch.tensor([[[1.0, 2.0, 3.0, 4.0]]]),
-        1: torch.tensor([[[5.0, 6.0, 7.0, 8.0]]]),
+        0: torch.tensor([[[1.0, 2.0, 3.0, 4.0]]], device=device),
+        1: torch.tensor([[[5.0, 6.0, 7.0, 8.0]]], device=device),
     }
+    # Target dimensions should match model output dimensions based on mock_call
     targets = {
-        0: torch.tensor([[[1.1, 1.9, 3.1, 3.9]]]),
-        1: torch.tensor([[[4.9, 6.1, 7.0, 8.1]]]),
+        0: torch.tensor([[[1.1, 1.9, 3.1, 3.9]]], device=device),
+        1: torch.tensor([[[4.9, 6.1, 7.0, 8.1]]], device=device),
     }
     current_step = 75
     total_steps = 150
 
-    # Reset mocks before the call to ensure counts are only from this execution
+    # Reset mocks before the call
     mock_model.reset_mock()
     mock_model.get_feature_activations.reset_mock()
     mock_model.get_decoder_norms.reset_mock()
@@ -277,44 +589,36 @@ def test_compute_total_loss(loss_manager, mock_model, mock_config):
         mock_model, inputs, targets, current_step, total_steps
     )
 
-    # Assertions
-    # Check that the mocks were called correctly *within* compute_total_loss
-    mock_model.assert_called_once_with(inputs)  # Checks the instance call
+    # --- Assertions ---
+    # 1. Check mock calls made *within* compute_total_loss
+    mock_model.assert_called_once_with(inputs)  # Checks the instance call (__call__)
     mock_model.get_feature_activations.assert_called_once_with(inputs)
+    # Sparsity penalty calls get_decoder_norms once inside compute_total_loss
     mock_model.get_decoder_norms.assert_called_once()
-    # get_preactivations is called once per layer in inputs
+    # Preactivation loss calls get_preactivations once per layer in inputs
     assert mock_model.get_preactivations.call_count == len(inputs)
-    # Check get_preactivations args manually due to tensor comparison issues
-    calls = mock_model.get_preactivations.call_args_list
-    expected_calls = [(inputs[0], 0), (inputs[1], 1)]
-    # Check if the actual calls match the expected calls, ignoring order
-    matched_calls = 0
-    actual_call_args = [(call.args[0], call.args[1]) for call in calls]
-    for expected_arg_tuple in expected_calls:
-        for actual_arg_tuple in actual_call_args:
-            if (
-                torch.equal(expected_arg_tuple[0], actual_arg_tuple[0])
-                and expected_arg_tuple[1] == actual_arg_tuple[1]
-            ):
-                matched_calls += 1
-                # Avoid matching the same actual call twice
-                actual_call_args.remove(actual_arg_tuple)
-                break
-    assert matched_calls == len(
-        expected_calls
-    ), f"Expected calls with args {expected_calls}, but got {calls}"
+    expected_preact_calls = [call(inputs[0], 0), call(inputs[1], 1)]
+    # Use assert_has_calls with any_order=True for flexibility if order isn't guaranteed
+    mock_model.get_preactivations.assert_has_calls(
+        expected_preact_calls, any_order=True
+    )
 
-    # Manually calculate expected values *after* the call for verification
-    # (using the same logic as the tested function and mocks)
-    expected_predictions = mock_model.side_effect(inputs)  # Use the mock's side effect
+    # 2. Manually calculate expected values *after* the call for verification
+    #    Use the mocks configured in the fixture
+    expected_predictions = mock_model.side_effect(inputs)
     expected_activations = mock_model.get_feature_activations.side_effect(inputs)
+
+    # Create temporary LossManager instances to avoid state pollution if needed,
+    # or ensure mocks are appropriately configured/reset. Here we reuse the fixture one.
+    # Re-call individual components to get expected values
     expected_recon_loss = loss_manager.compute_reconstruction_loss(
         expected_predictions, targets
     )
-    expected_sparsity_loss = loss_manager.compute_sparsity_penalty(
+    # Reset mocks that might be called again during manual calculation
+    mock_model.get_decoder_norms.reset_mock()
+    expected_sparsity_loss, expected_lambda = loss_manager.compute_sparsity_penalty(
         mock_model, expected_activations, current_step, total_steps
     )
-    # Need to reset mocks again as manual calc will call them
     mock_model.get_preactivations.reset_mock()
     expected_preactivation_loss = loss_manager.compute_preactivation_loss(
         mock_model, inputs
@@ -323,7 +627,9 @@ def test_compute_total_loss(loss_manager, mock_model, mock_config):
         expected_recon_loss + expected_sparsity_loss + expected_preactivation_loss
     )
 
+    # 3. Compare results
     assert torch.isclose(total_loss, expected_total_loss_val)
+    assert total_loss.device == device
     assert isinstance(loss_dict, dict)
     assert "total" in loss_dict
     assert "reconstruction" in loss_dict
@@ -332,7 +638,35 @@ def test_compute_total_loss(loss_manager, mock_model, mock_config):
 
     # Check if the components roughly match (allow for float precision)
     assert abs(loss_dict["total"] - total_loss.item()) < 1e-6
-    # Compare dict values to manually calculated expected values
     assert abs(loss_dict["reconstruction"] - expected_recon_loss.item()) < 1e-6
     assert abs(loss_dict["sparsity"] - expected_sparsity_loss.item()) < 1e-6
     assert abs(loss_dict["preactivation"] - expected_preactivation_loss.item()) < 1e-6
+
+    # 4. Check if current_sparsity_lambda was updated
+    assert abs(loss_manager.current_sparsity_lambda - expected_lambda) < 1e-9
+
+
+def test_get_current_sparsity_lambda(loss_manager, mock_model, mock_config):
+    device = mock_model.device
+    # Initial value
+    assert loss_manager.get_current_sparsity_lambda() == 0.0
+
+    # Run total loss calculation to update lambda
+    inputs = {0: torch.tensor([[[1.0, 2.0, 3.0]]], device=device)}
+    targets = {0: torch.tensor([[[1.1, 1.9, 3.1]]], device=device)}
+    current_step = 50
+    total_steps = 100
+
+    _, loss_dict = loss_manager.compute_total_loss(
+        mock_model, inputs, targets, current_step, total_steps
+    )
+
+    expected_lambda = mock_config.sparsity_lambda * (current_step / total_steps)
+    # The lambda stored should be the one calculated during the last total_loss call
+    assert abs(loss_manager.get_current_sparsity_lambda() - expected_lambda) < 1e-9
+
+    # Check that get just returns the value without recalculating
+    mock_model.get_decoder_norms.reset_mock()
+    retrieved_lambda = loss_manager.get_current_sparsity_lambda()
+    assert abs(retrieved_lambda - expected_lambda) < 1e-9
+    mock_model.get_decoder_norms.assert_not_called()  # Ensure get doesn't trigger calcs

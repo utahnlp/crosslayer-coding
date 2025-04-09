@@ -3,15 +3,11 @@ import torch
 import torch.nn as nn
 from typing import Dict
 import os
-from torch.serialization import safe_globals
+
+# Import the actual config
+from clt.config import CLTConfig
 
 from clt.models.base import BaseTranscoder
-
-
-# Mock CLTConfig as it's not available directly in this context
-class MockCLTConfig:
-    def __init__(self, **kwargs):
-        self.__dict__.update(kwargs)
 
 
 # Assume BaseTranscoder exists in clt.models.base
@@ -51,7 +47,8 @@ class DummyTranscoder(BaseTranscoder):
 
 @pytest.fixture
 def dummy_config():
-    return MockCLTConfig(d_model=16, num_layers=2, some_other_param="test")
+    # Use the actual CLTConfig
+    return CLTConfig(d_model=16, num_layers=2, num_features=32, activation_fn="relu")
 
 
 @pytest.fixture
@@ -73,15 +70,15 @@ def test_base_transcoder_save_load(dummy_transcoder, dummy_config, tmp_path):
     dummy_transcoder.save(str(save_path))
     assert os.path.exists(save_path)
 
-    # Load the model within safe_globals context
-    with safe_globals([MockCLTConfig]):
-        loaded_transcoder = DummyTranscoder.load(str(save_path))
+    # Load the model (safe_globals not needed for dataclass config)
+    loaded_transcoder = DummyTranscoder.load(str(save_path))
 
     # Check loaded model
     assert isinstance(loaded_transcoder, DummyTranscoder)
+    assert isinstance(loaded_transcoder.config, CLTConfig)
     assert loaded_transcoder.config.d_model == dummy_config.d_model
     assert loaded_transcoder.config.num_layers == dummy_config.num_layers
-    # assert loaded_transcoder.config.some_other_param == dummy_config.some_other_param # Removed: Mock-specific
+    # Removed check for mock-specific param
 
     # Check state dicts match
     assert dummy_transcoder.state_dict().keys() == loaded_transcoder.state_dict().keys()
@@ -97,19 +94,17 @@ def test_base_transcoder_load_device(dummy_transcoder, tmp_path):
     dummy_transcoder.save(str(save_path))
 
     # Try loading to CPU (assuming tests run on CPU by default)
-    with safe_globals([MockCLTConfig]):
-        loaded_transcoder_cpu = DummyTranscoder.load(
-            str(save_path), device=torch.device("cpu")
-        )
+    loaded_transcoder_cpu = DummyTranscoder.load(
+        str(save_path), device=torch.device("cpu")
+    )
     assert next(loaded_transcoder_cpu.parameters()).device.type == "cpu"
 
     # If CUDA is available, test loading to CUDA
     if torch.cuda.is_available():
         cuda_device = torch.device("cuda")
-        with safe_globals([MockCLTConfig]):
-            loaded_transcoder_cuda = DummyTranscoder.load(
-                path=str(save_path), device=cuda_device
-            )
+        loaded_transcoder_cuda = DummyTranscoder.load(
+            path=str(save_path), device=cuda_device
+        )
         assert next(loaded_transcoder_cuda.parameters()).device.type == "cuda"
 
 
