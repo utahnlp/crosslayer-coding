@@ -83,8 +83,6 @@ class LossManager:
 
         device = next(iter(activations.values())).device
         total_penalty = torch.tensor(0.0, device=device)
-        total_elements = 0
-
         for layer_idx, layer_activations in activations.items():
             try:
                 # Get effective weight for each feature based on decoder norms
@@ -120,18 +118,12 @@ class LossManager:
                 # Compute tanh penalty
                 penalty = torch.tanh(self.config.sparsity_c * weighted_acts)
                 total_penalty += penalty.sum()
-                total_elements += layer_activations.numel()
             except Exception:
                 # Skip this layer if there are issues
                 continue
 
-        # Normalize by number of elements and apply lambda
-        if total_elements > 0:
-            penalty = lambda_factor * total_penalty / total_elements
-            return penalty, lambda_factor
-        else:
-            penalty = torch.tensor(0.0, device=device)
-            return penalty, lambda_factor
+        penalty = lambda_factor * total_penalty
+        return penalty, lambda_factor
 
     def compute_preactivation_loss(
         self, model: CrossLayerTranscoder, inputs: Dict[int, torch.Tensor]
