@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Optional, Union
 import logging  # Import logging
+import math  # Import math for sqrt
 
 from clt.config import CLTConfig
 from clt.models.base import BaseTranscoder
@@ -140,6 +141,8 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
 
+        self._init_parameters()  # Call initialization method
+
         if self.device:
             logger.info(
                 f"CLT model initialized on {self.device} with dtype {self.dtype}"
@@ -173,8 +176,23 @@ class CrossLayerTranscoder(BaseTranscoder):
         return torch.float32
 
     def _init_parameters(self):
-        """Initialize encoder and decoder parameters."""
-        pass  # Default init is handled by nn.Linear with device/dtype
+        """Initialize encoder and decoder parameters according to spec."""
+        # Initialize encoders
+        encoder_bound = 1.0 / math.sqrt(self.config.num_features)
+        for encoder in self.encoders:
+            nn.init.uniform_(encoder.weight, -encoder_bound, encoder_bound)
+
+        # Initialize decoders
+        decoder_bound = 1.0 / math.sqrt(self.config.num_layers * self.config.d_model)
+        for decoder in self.decoders.values():
+            nn.init.uniform_(decoder.weight, -decoder_bound, decoder_bound)
+
+        logger.info(
+            f"Initialized encoder weights U(-{encoder_bound:.4f}, {encoder_bound:.4f})"
+        )
+        logger.info(
+            f"Initialized decoder weights U(-{decoder_bound:.4f}, {decoder_bound:.4f})"
+        )
 
     def jumprelu(self, x: torch.Tensor) -> torch.Tensor:
         """Apply JumpReLU activation function."""
