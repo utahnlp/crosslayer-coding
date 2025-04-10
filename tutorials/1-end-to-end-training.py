@@ -113,7 +113,7 @@ training_config = TrainingConfig(
     # Training parameters
     learning_rate=3e-4,
     training_steps=2000,
-    sparsity_lambda=0.01,  # Default unknown
+    sparsity_lambda=0.0001,  # Default unknown
     sparsity_c=1.0,  # Default value from paper: 1.0
     preactivation_coef=3e-6,  # Default value: 3e-6
     optimizer="adamw",
@@ -285,7 +285,5 @@ print(f"Loaded model is on device: {next(loaded_clt_model.parameters()).device}"
 
 # %%
 print("\nTutorial Complete!")
-print(
-    "You have trained a Cross-Layer Transcoder using streaming data from HuggingFace."
-)
+print("You have trained a Cross-Layer Transcoder!")
 print(f"The trained model and logs are saved in: {log_dir}")

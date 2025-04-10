@@ -326,7 +326,7 @@ class ActivationStore:
         #     mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
         #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
         #     logger.debug(
-        #         f"Fill Buffer - End [{elapsed_str}]. Mem: {mem_after:.2f} MB (+{mem_after - mem_before:.2f} MB). Added: {tokens_added_this_fill}"
+        #         f"Fill Buffer - End [{elapsed_str}]: Mem: {mem_after:.2f} MB (+{mem_after - mem_before:.2f} MB). Added: {tokens_added_this_fill}"
         #     )
         # else:
         #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
@@ -485,271 +485,133 @@ class ActivationStore:
         return batch_inputs, batch_targets
 
     def _estimate_normalization_stats(self):
-        """Estimates normalization statistics from the generator."""
+        """
+        Simplified estimation of normalization stats by collecting up to
+        'normalization_estimation_batches' from the generator and computing
+        mean/std for each layer in a single pass.
+        """
         if self.normalization_method != "estimated_mean_std":
-            logger.info(
-                "Normalization estimation skipped as method is not 'estimated_mean_std'."
-            )
             return
 
-        if self.generator_exhausted:
-            logger.warning(
-                "Cannot estimate normalization stats: generator is already exhausted."
-            )
-            return
-        if self.buffer_initialized:
-            logger.warning(
-                "Estimating normalization stats after buffer initialization. This uses new data, not buffered data."
-            )
+        # Reset or initialize stats containers
+        self.input_means = {}
+        self.input_stds = {}
+        self.output_means = {}
+        self.output_stds = {}
 
-        logger.info(
-            f">>> NORMALIZATION PHASE: Estimating statistics from {self.normalization_estimation_batches} batches <<<"
-        )
+        # Prepare placeholders to accumulate activations
+        all_inputs = {}
+        all_outputs = {}
 
-        # Use Welford's algorithm for numerical stability
-        M2_inputs: Dict[int, torch.Tensor] = {}
-        M2_outputs: Dict[int, torch.Tensor] = {}
-        mean_inputs: Dict[int, torch.Tensor] = {}
-        mean_outputs: Dict[int, torch.Tensor] = {}
-        count: int = 0
-        temp_layer_indices = []
-        temp_d_model = -1
-        temp_dtype = torch.float32
+        # We'll initialize buffer metadata after the first actual batch
+        # so that layer_indices/dtype/device are set properly.
+        first_batch_seen = False
 
-        processed_batches = 0
-        start_time = time.time()
-
-        # Store the original batches to reuse them later and not waste them
-        stored_batches = []
-        max_store_batches = min(
-            self.normalization_estimation_batches, 5
-        )  # Store at most 5 batches to save memory
-
+        # Print status and force display
         print("\nComputing normalization statistics...")
         sys.stdout.flush()  # Force output to display
-        # --- Commented out memory logging --- #
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     mem_before_norm = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.info(
-        #         f"Norm Stats - Start [{elapsed_str}]. Mem: {mem_before_norm:.2f} MB"
-        #     )
 
+        # Create progress bar
         norm_progress = tqdm(
             range(self.normalization_estimation_batches),
             desc="Normalization Progress",
             leave=True,  # Keep the progress bar after completion
         )
 
-        try:
-            for batch_idx in norm_progress:
-                try:
-                    # Get next batch
-                    batch_inputs_dict, batch_outputs_dict = next(
-                        self.activation_generator
-                    )
-                    processed_batches += 1
+        for batch_idx in norm_progress:
+            try:
+                batch_inputs, batch_targets = next(self.activation_generator)
 
-                    # Update progress bar description
-                    norm_progress.set_description(
-                        f"Processed batch {processed_batches}/{self.normalization_estimation_batches}"
-                    )
+                # Update progress description
+                norm_progress.set_description(
+                    f"Processed batch {batch_idx+1}/{self.normalization_estimation_batches}"
+                )
 
-                    # Store batch for later use in training (to avoid wasting data)
-                    if len(stored_batches) < max_store_batches:
-                        stored_batches.append(
-                            (batch_inputs_dict.copy(), batch_outputs_dict.copy())
-                        )
+                if not first_batch_seen:
+                    self._initialize_buffer_metadata((batch_inputs, batch_targets))
+                    first_batch_seen = True
+                    # Build empty lists for each layer
+                    for layer_idx in self.layer_indices:
+                        all_inputs[layer_idx] = []
+                        all_outputs[layer_idx] = []
 
-                    # Initialize stats dicts on first batch
-                    if batch_idx == 0:
-                        temp_layer_indices = sorted(batch_inputs_dict.keys())
-                        if not temp_layer_indices:
-                            continue  # Skip empty batch
+                for layer_idx in self.layer_indices:
+                    in_tensor = batch_inputs[layer_idx].to(self.device).to(self.dtype)
+                    out_tensor = batch_targets[layer_idx].to(self.device).to(self.dtype)
+                    all_inputs[layer_idx].append(in_tensor)
+                    all_outputs[layer_idx].append(out_tensor)
 
-                        first_layer_idx = temp_layer_indices[0]
-                        first_input = batch_inputs_dict[first_layer_idx]
-                        if first_input.numel() == 0:
-                            continue  # Skip if first tensor is empty
+            except StopIteration:
+                self.generator_exhausted = True
+                break
 
-                        temp_d_model = first_input.shape[-1]
-                        temp_dtype = first_input.dtype
-
-                        for layer_idx in temp_layer_indices:
-                            # Validate shapes/types
-                            if (
-                                batch_inputs_dict[layer_idx].shape[-1] != temp_d_model
-                                or batch_outputs_dict[layer_idx].shape[-1]
-                                != temp_d_model
-                            ):
-                                raise ValueError(
-                                    f"Inconsistent d_model during norm estimation at layer {layer_idx}."
-                                )
-                            if (
-                                batch_inputs_dict[layer_idx].dtype != temp_dtype
-                                or batch_outputs_dict[layer_idx].dtype != temp_dtype
-                            ):
-                                logger.warning(
-                                    f"Inconsistent dtype during norm estimation at layer {layer_idx}. Using {temp_dtype}."
-                                )
-
-                            # Initialize Welford stats
-                            zero_tensor = torch.zeros(
-                                temp_d_model, device=self.device, dtype=temp_dtype
-                            )
-                            M2_inputs[layer_idx] = zero_tensor.clone()
-                            M2_outputs[layer_idx] = zero_tensor.clone()
-                            mean_inputs[layer_idx] = zero_tensor.clone()
-                            mean_outputs[layer_idx] = zero_tensor.clone()
-
-                    # Update stats using Welford's algorithm for each layer
-                    for layer_idx in temp_layer_indices:
-                        inputs = (
-                            batch_inputs_dict[layer_idx].to(self.device).to(temp_dtype)
-                        )  # Ensure correct device/dtype
-                        outputs = (
-                            batch_outputs_dict[layer_idx].to(self.device).to(temp_dtype)
-                        )
-
-                        # Process inputs
-                        for x in inputs:  # Iterate through tokens in the batch
-                            count += 1
-                            delta = x - mean_inputs[layer_idx]
-                            mean_inputs[layer_idx] += delta / count
-                            delta2 = x - mean_inputs[layer_idx]
-                            M2_inputs[layer_idx] += delta * delta2
-
-                        # Process outputs (need separate loop as count increases)
-                        temp_count_outputs = 0  # Need separate counter for output updates within the same batch
-                        for y in outputs:
-                            temp_count_outputs += 1
-                            effective_count = (
-                                count - inputs.shape[0] + temp_count_outputs
-                            )  # Overall count for this token
-                            delta = y - mean_outputs[layer_idx]
-                            mean_outputs[layer_idx] += delta / effective_count
-                            delta2 = y - mean_outputs[layer_idx]
-                            M2_outputs[layer_idx] += delta * delta2
-
-                except StopIteration:
-                    logger.info(
-                        f"Generator exhausted during normalization estimation after {processed_batches} batches."
-                    )
-                    self.generator_exhausted = True  # Mark generator as exhausted
-                    break  # Exit the loop
-        except Exception as e:
-            logger.error(f"Error during normalization estimation: {e}", exc_info=True)
-            # Decide if we should proceed without stats or raise
-            return  # Exit estimation if error occurs
-
-        # Finalize statistics (compute variance/std)
-        if count > 1:
-            self.layer_indices = temp_layer_indices  # Set actual layer indices
-            self.d_model = temp_d_model
-            self.dtype = temp_dtype
-
+        # Compute mean and std for each layer
+        if first_batch_seen:
             for layer_idx in self.layer_indices:
-                var_inputs = M2_inputs[layer_idx] / (count - 1)
-                var_outputs = M2_outputs[layer_idx] / (count - 1)  # Use same count
-
-                self.input_means[layer_idx] = mean_inputs[layer_idx].unsqueeze(0)
-                self.output_means[layer_idx] = mean_outputs[layer_idx].unsqueeze(0)
-                self.input_stds[layer_idx] = torch.sqrt(var_inputs + 1e-6).unsqueeze(0)
-                self.output_stds[layer_idx] = torch.sqrt(var_outputs + 1e-6).unsqueeze(
-                    0
+                # Concatenate all data for layer_idx
+                in_cat = (
+                    torch.cat(all_inputs[layer_idx], dim=0)
+                    if len(all_inputs[layer_idx]) > 0
+                    else None
+                )
+                out_cat = (
+                    torch.cat(all_outputs[layer_idx], dim=0)
+                    if len(all_outputs[layer_idx]) > 0
+                    else None
                 )
 
-            end_time = time.time()
-            print(
-                f"\n>>> NORMALIZATION COMPLETE: Estimated from {count} tokens in {end_time - start_time:.2f}s <<<"
-            )
-            sys.stdout.flush()  # Force output to display
+                if in_cat is None or out_cat is None:
+                    continue
 
-            # --- Commented out memory logging --- #
-            # if torch.cuda.is_available() and self.device.type == "cuda":
-            #     mem_after_norm_calc = torch.cuda.memory_allocated(self.device) / (
-            #         1024**2
-            #     )  # MB
-            #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-            #     logger.info(
-            #         f"Norm Stats - Calculated [{elapsed_str}]. Mem: {mem_after_norm_calc:.2f} MB (+{mem_after_norm_calc - mem_before_norm:.2f} MB)"
-            #     )
+                self.input_means[layer_idx] = in_cat.mean(dim=0, keepdim=True)
+                self.input_stds[layer_idx] = in_cat.std(dim=0, keepdim=True) + 1e-6
 
-            # Now initialize the buffer with the stored batches to avoid wasting them
-            if stored_batches and not self.buffer_initialized:
-                logger.info(
-                    f"Initializing buffer with {len(stored_batches)} stored batches from normalization phase"
-                )
-                # Log memory *before* adding stored batches back
-                # --- Commented out memory logging --- #
-                # mem_before_buffer_init = 0.0  # Initialize as float
-                # if torch.cuda.is_available() and self.device.type == "cuda":
-                #     mem_before_buffer_init = torch.cuda.memory_allocated(
-                #         self.device
-                #     ) / (
-                #         1024**2
-                #     )  # MB
-                #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                #     logger.info(
-                #         f"Norm Stats - Before Buffer Init [{elapsed_str}]. Mem: {mem_before_buffer_init:.2f} MB"
-                #     )
+                self.output_means[layer_idx] = out_cat.mean(dim=0, keepdim=True)
+                self.output_stds[layer_idx] = out_cat.std(dim=0, keepdim=True) + 1e-6
 
-                for batch_inputs_dict, batch_outputs_dict in stored_batches:
-                    # Initialize buffer metadata if this is the first batch
+            # Store initial batches in buffer for training
+            for in_dict, out_dict in zip(all_inputs.values(), all_outputs.values()):
+                for batch_in, batch_out in zip(in_dict, out_dict):
                     if not self.buffer_initialized:
-                        self._initialize_buffer_metadata(
-                            (batch_inputs_dict, batch_outputs_dict)
-                        )
+                        self._initialize_buffer_metadata((batch_in, batch_out))
+                    self._add_batch_to_buffer((batch_in, batch_out))
 
-                    # Now add the batch to our buffer
-                    self._add_batch_to_buffer((batch_inputs_dict, batch_outputs_dict))
+            total_batches = sum(len(tensors) for tensors in all_inputs.values())
+            logger.info(f"Normalization complete using {total_batches} batches")
 
-                logger.info(
-                    f"Buffer initialized with {(~self.read_indices).sum().item()} unread tokens"
-                )
-
-                # --- Commented out memory logging --- #
-                # if torch.cuda.is_available() and self.device.type == "cuda":
-                #     mem_after_norm_store = torch.cuda.memory_allocated(self.device) / (
-                #         1024**2
-                #     )  # MB
-                #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                #     logger.info(
-                #         f"Norm Stats - Buffer Initialized [{elapsed_str}]. Mem: {mem_after_norm_store:.2f} MB (+{mem_after_norm_store - mem_after_norm_calc:.2f} MB)"
-                #     )
-
-        elif count <= 1:
+            # Signal completion
+            print("\n>>> NORMALIZATION PHASE COMPLETE - STARTING TRAINING <<<\n")
+            sys.stdout.flush()  # Force output to display
+        else:
             logger.warning(
-                f">>> NORMALIZATION FAILED: Not enough data ({count} tokens) available <<<"
+                "No data processed for normalization. Using identity normalization."
             )
             self.normalization_method = "none"  # Fall back to no normalization
-        else:  # count == 0
-            logger.warning(">>> NORMALIZATION FAILED: No data processed <<<")
-            self.normalization_method = "none"  # Fall back
-
-        print("\n>>> NORMALIZATION PHASE COMPLETE - STARTING TRAINING <<<\n")
-        sys.stdout.flush()  # Force output to display
 
     def _normalize_batch(
         self,
         inputs_dict: Dict[int, torch.Tensor],
         targets_dict: Dict[int, torch.Tensor],
     ) -> ActivationBatchCLT:
-        """Applies normalization using stored statistics."""
-        if not self.input_means:  # Check if stats are available
-            return inputs_dict, targets_dict
-
+        """
+        Applies the estimated mean/std to each layer's inputs and targets.
+        If no stats exist for a layer, returns the tensors unchanged.
+        """
         normalized_inputs = {}
         normalized_targets = {}
+
         for layer_idx in self.layer_indices:
             inp = inputs_dict[layer_idx].to(self.device)
             tgt = targets_dict[layer_idx].to(self.device)
-            normalized_inputs[layer_idx] = (
-                inp - self.input_means[layer_idx]
-            ) / self.input_stds[layer_idx]
-            normalized_targets[layer_idx] = (
-                tgt - self.output_means[layer_idx]
-            ) / self.output_stds[layer_idx]
+
+            if layer_idx in self.input_means and layer_idx in self.input_stds:
+                inp = (inp - self.input_means[layer_idx]) / self.input_stds[layer_idx]
+            if layer_idx in self.output_means and layer_idx in self.output_stds:
+                tgt = (tgt - self.output_means[layer_idx]) / self.output_stds[layer_idx]
+
+            normalized_inputs[layer_idx] = inp
+            normalized_targets[layer_idx] = tgt
+
         return normalized_inputs, normalized_targets
 
     def denormalize_outputs(

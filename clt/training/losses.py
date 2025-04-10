@@ -49,8 +49,8 @@ class LossManager:
                 total_loss += layer_loss
                 num_layers += 1
 
-        # Average over layers
-        return total_loss / num_layers if num_layers > 0 else total_loss
+        # Summed over layers as in the paper
+        return total_loss
 
     def compute_sparsity_penalty(
         self,
@@ -117,10 +117,16 @@ class LossManager:
 
                 # Compute tanh penalty
                 penalty = torch.tanh(self.config.sparsity_c * weighted_acts)
+
+                # Summed over features as in the paper, then added to the layer total so far
                 total_penalty += penalty.sum()
             except Exception:
-                # Skip this layer if there are issues
-                continue
+                # raise an error
+                raise ValueError(
+                    f"Error computing sparsity penalty for layer {layer_idx}. "
+                    f"Activations shape: {layer_activations.shape}. "
+                    f"Feature weights shape: {feature_weights.shape}."
+                )
 
         penalty = lambda_factor * total_penalty
         return penalty, lambda_factor
