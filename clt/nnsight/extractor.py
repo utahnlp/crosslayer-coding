@@ -19,12 +19,12 @@ class ActivationExtractorCLT:
     def __init__(
         self,
         model_name: str,
+        mlp_input_module_path_template: str,
+        mlp_output_module_path_template: str,
         device: Optional[Union[str, torch.device]] = None,
         model_dtype: Optional[Union[str, torch.dtype]] = None,
         context_size: int = 128,
         store_batch_size_prompts: int = 512,
-        mlp_input_module_path_template: str = "transformer.h.{}.mlp.input",
-        mlp_output_module_path_template: str = "transformer.h.{}.mlp.output",
         exclude_special_tokens: bool = True,
         prepend_bos: bool = False,
         nnsight_tracer_kwargs: Optional[Dict] = None,
@@ -35,15 +35,21 @@ class ActivationExtractorCLT:
 
         Args:
             model_name: Name or path of the Hugging Face transformer model.
-            device: Device to run the model on ('cuda', 'cpu', etc.). Auto-detects if None.
-            model_dtype: Optional data type for model weights (e.g., torch.float16, "bfloat16").
+            mlp_input_module_path_template: String template for the NNsight path
+                                             to MLP input modules. Must contain '{}'
+                                             for layer index.
+            mlp_output_module_path_template: String template for the NNsight path
+                                              to MLP output modules. Must contain '{}'
+                                              for layer index.
+            device: Device to run the model on ('cuda', 'cpu', etc.).
+                    Auto-detects if None.
+            model_dtype: Optional data type for model weights
+                         (e.g., torch.float16, "bfloat16").
             context_size: Maximum sequence length for tokenization.
-            store_batch_size_prompts: Number of text prompts to process in each model forward pass.
-            mlp_input_module_path_template: String template for the NNsight path to MLP input modules.
-                                             Must contain '{}' for layer index.
-            mlp_output_module_path_template: String template for the NNsight path to MLP output modules.
-                                              Must contain '{}' for layer index.
-            exclude_special_tokens: Whether to exclude activations corresponding to special tokens.
+            store_batch_size_prompts: Number of text prompts to process in each
+                                      model forward pass.
+            exclude_special_tokens: Whether to exclude activations corresponding
+                                    to special tokens.
             prepend_bos: Whether to prepend the BOS token (required by some models).
             nnsight_tracer_kwargs: Additional kwargs for nnsight model.trace().
             nnsight_invoker_args: Additional invoker_args for nnsight model.trace().
@@ -139,12 +145,29 @@ class ActivationExtractorCLT:
     def _get_module_proxy(self, layer_idx: int, module_type: str):
         """
         Gets the nnsight module proxy for a given layer and type.
-        Simplified version based on the notebook approach.
+        Uses the path templates defined in the instance.
+        Navigates the model structure using getattr and indexing.
         """
         if module_type == "input":
-            return self.model.transformer.h[layer_idx].mlp.input
-        else:  # output
-            return self.model.transformer.h[layer_idx].mlp.output
+            path_str = self.mlp_input_module_path_template.format(layer_idx)
+        elif module_type == "output":
+            path_str = self.mlp_output_module_path_template.format(layer_idx)
+        else:
+            raise ValueError(f"Invalid module_type: {module_type}")
+
+        # Navigate the model structure using the path string
+        proxy = self.model  # Start with the root model proxy
+        try:
+            parts = path_str.split(".")
+            for part in parts:
+                if part.isdigit():  # Handle numerical indices like in transformer.h[0]
+                    proxy = proxy[int(part)]
+                else:  # Handle attribute access
+                    proxy = getattr(proxy, part)
+            return proxy
+        except (AttributeError, KeyError, IndexError, TypeError) as e:
+            # Catch potential errors during navigation
+            raise AttributeError(f"Could not find module at path '{path_str}': {e}")
 
     def _preprocess_text(self, text: str) -> List[str]:
         """Preprocess and chunk long text into manageable segments."""

@@ -287,3 +287,5 @@ print(f"Loaded model is on device: {next(loaded_clt_model.parameters()).device}"
 print("\nTutorial Complete!")
 print("You have trained a Cross-Layer Transcoder!")
 print(f"The trained model and logs are saved in: {log_dir}")
+
+# %%

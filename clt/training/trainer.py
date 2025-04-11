@@ -358,6 +358,8 @@ class CLTTrainer:
         """
         return ActivationExtractorCLT(
             model_name=self.training_config.model_name,
+            mlp_input_module_path_template=self.training_config.mlp_input_module_path_template,
+            mlp_output_module_path_template=self.training_config.mlp_output_module_path_template,
             device=self.device,
             model_dtype=self.training_config.model_dtype,
             context_size=self.training_config.context_size,

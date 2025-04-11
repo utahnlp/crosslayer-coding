@@ -36,6 +36,12 @@ class TrainingConfig:
     model_dtype: Optional[str] = (
         None  # Optional dtype for the model (e.g., "float16", "bfloat16")
     )
+    mlp_input_module_path_template: str = (
+        "transformer.h.{}.ln_2.input"  # NNsight path for MLP input
+    )
+    mlp_output_module_path_template: str = (
+        "transformer.h.{}.mlp.output"  # NNsight path for MLP output
+    )
 
     # Dataset parameters
     dataset_path: str = "NeelNanda/pile-10k"  # Path or name of the HuggingFace dataset
