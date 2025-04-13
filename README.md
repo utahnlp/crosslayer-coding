@@ -179,7 +179,7 @@ print(f"Training complete! Model saved in {output_dir}")
 If you use Crosslayer-Coding in your research, please cite:
 
 ```
-@software{probity,
+@software{crosslayer-coding,
   author = {Tigges, Curt},
   title = {Cross-Layer Coding},
   year = {2025},
