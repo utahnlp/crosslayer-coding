@@ -304,9 +304,13 @@ class CLTEvaluator:
         # Clamp EV between 0 and 1 for robustness
         avg_explained_variance = max(0.0, min(1.0, avg_explained_variance))
 
+        # Calculate Normalized Mean Reconstruction Error (as a fraction)
+        normalized_error_fraction = np.sqrt(avg_mse) if avg_mse >= 0 else 0.0
+
         return {
             "reconstruction/explained_variance": avg_explained_variance,
             "reconstruction/total_mse": avg_mse,
+            "reconstruction/normalized_mean_reconstruction_error": normalized_error_fraction,
         }
 
     def _compute_feature_density(
