@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import Literal, Optional, Dict, Any
 
 
 @dataclass
@@ -31,42 +31,36 @@ class TrainingConfig:
     learning_rate: float  # Learning rate for optimizer
     training_steps: int  # Total number of training steps
 
-    # Model parameters
-    model_name: str = "gpt2"  # Name of the model to extract activations from
-    model_dtype: Optional[str] = (
-        None  # Optional dtype for the model (e.g., "float16", "bfloat16")
-    )
-    mlp_input_module_path_template: str = (
-        "transformer.h.{}.ln_2.input"  # NNsight path for MLP input
-    )
-    mlp_output_module_path_template: str = (
-        "transformer.h.{}.mlp.output"  # NNsight path for MLP output
-    )
-
-    # Dataset parameters
-    dataset_path: str = "NeelNanda/pile-10k"  # Path or name of the HuggingFace dataset
-    dataset_split: str = "train"  # Dataset split to use
-    dataset_text_column: str = "text"  # Name of the column containing text data
-    streaming: bool = True  # Whether to use streaming mode for the dataset
-    dataset_trust_remote_code: Optional[bool] = None  # Argument for load_dataset
-    max_samples: Optional[int] = None  # Maximum number of samples to use from dataset
-
-    # Tokenization parameters
-    context_size: int = 1024  # Context window size for processing
-    prepend_bos: bool = True  # Whether to prepend BOS token to texts
-    exclude_special_tokens: bool = False  # Whether to filter out special tokens
-
-    # Batch size parameters
-    store_batch_size_prompts: int = 4  # Number of prompts per extraction batch
-    batch_size: int = 64  # Number of sequences per training batch
+    # Training batch size (tokens)
+    train_batch_size_tokens: int = 4096  # Number of tokens per training step batch
+    # Buffer size for streaming store
     n_batches_in_buffer: int = 16  # Number of extraction batches in buffer
 
     # Normalization parameters
-    normalization_method: Literal["mean_std", "estimated_mean_std", "none"] = "mean_std"
+    normalization_method: Literal["auto", "estimated_mean_std", "none"] = "auto"
+    # 'auto': Use pre-calculated from mapped store, or estimate for streaming store.
+    # 'estimated_mean_std': Always estimate for streaming store (ignored for mapped).
+    # 'none': Disable normalization.
     normalization_estimation_batches: int = 50  # Batches for normalization estimation
 
-    # Activation caching parameters
-    cache_path: Optional[str] = None  # Path to save/load extracted activations
+    # --- Activation Store Source --- #
+    activation_source: Literal["generate", "local", "remote"] = "generate"
+    # Config for "generate" source (on-the-fly)
+    generation_config: Optional[Dict[str, Any]] = (
+        None  # Dict matching ActivationConfig fields needed for extractor
+    )
+    dataset_params: Optional[Dict[str, Any]] = (
+        None  # Dict matching dataset fields for stream_activations
+    )
+    # Config for "local" source (pre-generated)
+    activation_path: Optional[str] = (
+        None  # Path to pre-generated activation dataset directory
+    )
+    # Config for "remote" source (STUBBED)
+    remote_config: Optional[Dict[str, Any]] = (
+        None  # Dict with server_url, dataset_id, etc.
+    )
+    # --- End Activation Store Source --- #
 
     # Loss function coefficients
     sparsity_lambda: float = 1e-3  # Coefficient for sparsity penalty
@@ -94,25 +88,41 @@ class TrainingConfig:
     )
     wandb_tags: Optional[list] = None  # Tags for the WandB run
 
-    @property
-    def train_batch_size_tokens(self) -> int:
-        """Calculate the number of tokens per training batch.
-
-        Returns:
-            The product of batch_size and context_size
-        """
-        return self.batch_size * self.context_size
-
     def __post_init__(self):
         """Validate training parameters."""
         assert self.learning_rate > 0, "Learning rate must be positive"
         assert self.training_steps > 0, "Training steps must be positive"
         assert (
-            self.store_batch_size_prompts > 0
-        ), "Extraction batch size must be positive"
-        assert self.batch_size > 0, "Batch size must be positive"
+            self.train_batch_size_tokens > 0
+        ), "Training batch size (tokens) must be positive"
         assert self.n_batches_in_buffer > 0, "Buffer size must be positive"
-        assert self.context_size > 0, "Context size must be positive"
         assert self.sparsity_lambda >= 0, "Sparsity lambda must be non-negative"
-        assert isinstance(self.streaming, bool), "Streaming must be boolean"
         assert self.dead_feature_window > 0, "Dead feature window must be positive"
+
+        # Validate activation source configuration
+        if self.activation_source == "generate":
+            assert (
+                self.generation_config is not None
+            ), "generation_config dict must be provided when activation_source is 'generate'"
+            assert (
+                self.dataset_params is not None
+            ), "dataset_params dict must be provided when activation_source is 'generate'"
+            # Basic check for essential keys in the dicts (can be expanded)
+            assert (
+                "model_name" in self.generation_config
+            ), "generation_config missing 'model_name'"
+            assert (
+                "dataset_path" in self.dataset_params
+            ), "dataset_params missing 'dataset_path'"
+        elif self.activation_source == "local":
+            assert (
+                self.activation_path is not None
+            ), "activation_path must be specified when activation_source is 'local'"
+        elif self.activation_source == "remote":
+            assert (
+                self.remote_config is not None
+            ), "remote_config dict must be provided when activation_source is 'remote'"
+            assert (
+                "server_url" in self.remote_config
+                and "dataset_id" in self.remote_config
+            ), "remote_config must contain 'server_url' and 'dataset_id'"

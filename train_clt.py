@@ -323,7 +323,7 @@ def main():
         exclude_special_tokens=args.exclude_special_tokens,
         # Batch size parameters
         batch_size=args.batch_size,
-        store_batch_size_prompts=args.store_batch_size_prompts,
+        inference_batch_size=args.inference_batch_size,
         n_batches_in_buffer=args.n_batches_in_buffer,
         # Normalization parameters
         normalization_method=args.normalization_method,

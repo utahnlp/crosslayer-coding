@@ -43,7 +43,7 @@ def training_config():
         n_batches_in_buffer=5,
         batch_size=2,  # Reduced batch size for easier testing
         # train_batch_size_tokens will be calculated
-        store_batch_size_prompts=1,
+        inference_batch_size=1,
         context_size=32,  # Reduced context size
         normalization_method="none",
         normalization_estimation_batches=2,
@@ -258,7 +258,7 @@ def test_create_activation_extractor(training_config):  # Pass training_config
             device=trainer.device,
             model_dtype=training_config.model_dtype,  # Added model_dtype
             context_size=training_config.context_size,
-            store_batch_size_prompts=training_config.store_batch_size_prompts,
+            inference_batch_size=training_config.inference_batch_size,
             exclude_special_tokens=training_config.exclude_special_tokens,
             prepend_bos=training_config.prepend_bos,
         )

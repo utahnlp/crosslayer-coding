@@ -182,3 +182,4 @@ tests/integration/data/
 clt_output_tutorial/
 .DS_Store
 mock_log_dir/
+tutorials/tutorial_activations/
