@@ -117,13 +117,12 @@ activation_config = ActivationConfig(
     dataset_trust_remote_code=False,
     cache_path=None,
     # Generation Output Control
-    target_total_tokens=1_000_000,  # Generate 1M tokens for the tutorial
-    max_samples=None,  # Limit samples instead if needed
+    target_total_tokens=2_000_000,  # Generate 2M tokens for the tutorial (~100GB)
     # Storage Parameters
     activation_dir=activation_dir,
     output_format="hdf5",
     compression="gzip",
-    chunk_size_tokens=10_000,
+    chunk_token_threshold=10_000,
     # Normalization
     compute_norm_stats=True,
     # NNsight args (defaults are usually fine)
@@ -154,7 +153,7 @@ training_config = TrainingConfig(
     # Normalization for training (use stored stats)
     normalization_method="auto",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
-    sparsity_lambda=0.0001,
+    sparsity_lambda=0.00003,
     sparsity_c=1.0,
     preactivation_coef=3e-6,
     # Optimizer & Scheduler
