@@ -17,7 +17,7 @@ def extractor():
         model_name=TEST_MODEL_NAME,
         device=TEST_DEVICE,
         context_size=32,  # Keep small for testing
-        store_batch_size_prompts=4,  # Small batch size
+        inference_batch_size=4,  # Small batch size
     )
     yield instance
     # Cleanup - necessary for nnsight models?
@@ -210,7 +210,7 @@ def test_stream_activations_max_samples(mock_load_dataset, extractor, dummy_data
         model_name=TEST_MODEL_NAME,
         device=TEST_DEVICE,
         context_size=32,
-        store_batch_size_prompts=store_batch_size,
+        inference_batch_size=store_batch_size,
     )
 
     # Tokenize the first max_samples manually to get expected token count
@@ -256,7 +256,7 @@ def test_stream_activations_final_batch(mock_load_dataset, extractor, dummy_data
     """Test processing of the final, potentially smaller, batch."""
     mock_load_dataset.return_value = dummy_dataset
     num_samples = len(dummy_dataset)  # 6
-    batch_size = extractor.store_batch_size_prompts  # 4
+    batch_size = extractor.inference_batch_size  # 4
     num_full_batches = num_samples // batch_size  # 6 // 4 = 1
     final_batch_size = num_samples % batch_size  # 6 % 4 = 2
     assert final_batch_size > 0, "Test setup assumes a non-empty final batch"

@@ -24,7 +24,7 @@ class ActivationExtractorCLT:
         device: Optional[Union[str, torch.device]] = None,
         model_dtype: Optional[Union[str, torch.dtype]] = None,
         context_size: int = 128,
-        store_batch_size_prompts: int = 512,
+        inference_batch_size: int = 512,
         exclude_special_tokens: bool = True,
         prepend_bos: bool = False,
         nnsight_tracer_kwargs: Optional[Dict] = None,
@@ -46,7 +46,7 @@ class ActivationExtractorCLT:
             model_dtype: Optional data type for model weights
                          (e.g., torch.float16, "bfloat16").
             context_size: Maximum sequence length for tokenization.
-            store_batch_size_prompts: Number of text prompts to process in each
+            inference_batch_size: Number of text prompts to process in each
                                       model forward pass.
             exclude_special_tokens: Whether to exclude activations corresponding
                                     to special tokens.
@@ -60,7 +60,7 @@ class ActivationExtractorCLT:
         )
         self.model_dtype = self._resolve_dtype(model_dtype)
         self.context_size = context_size
-        self.store_batch_size_prompts = store_batch_size_prompts
+        self.inference_batch_size = inference_batch_size
         self.mlp_input_module_path_template = mlp_input_module_path_template
         self.mlp_output_module_path_template = mlp_output_module_path_template
         self.exclude_special_tokens = exclude_special_tokens
@@ -217,7 +217,6 @@ class ActivationExtractorCLT:
         streaming: bool = True,
         dataset_trust_remote_code: Optional[bool] = False,
         cache_path: Optional[str] = None,
-        max_samples: Optional[int] = None,
     ) -> Generator[Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]], None, None]:
         """
         Streams paired MLP input and output activations from the model for a given dataset.
@@ -229,7 +228,6 @@ class ActivationExtractorCLT:
             streaming: Whether to use dataset streaming.
             dataset_trust_remote_code: Whether to trust remote code for the dataset.
             cache_path: Optional path to cache downloaded data (relevant if not streaming).
-            max_samples: Optional maximum number of samples to process (for small tests).
 
         Yields:
             Tuples of (inputs_dict, targets_dict), where each dict maps layer_idx
@@ -254,10 +252,6 @@ class ActivationExtractorCLT:
                 "Loaded dataset is not a Hugging Face Dataset or IterableDataset."
             )
 
-        # If max_samples is set, take only that many samples
-        if max_samples is not None and streaming:
-            dataset = dataset.take(max_samples)
-
         batch_texts: List[str] = []
 
         for item in tqdm(dataset, desc="Processing dataset"):
@@ -268,9 +262,9 @@ class ActivationExtractorCLT:
             batch_texts.extend(text_chunks)
 
             # Process complete batches
-            while len(batch_texts) >= self.store_batch_size_prompts:
-                current_batch = batch_texts[: self.store_batch_size_prompts]
-                batch_texts = batch_texts[self.store_batch_size_prompts :]
+            while len(batch_texts) >= self.inference_batch_size:
+                current_batch = batch_texts[: self.inference_batch_size]
+                batch_texts = batch_texts[self.inference_batch_size :]
 
                 try:
                     # Pre-tokenize the batch of text (key change from notebook)

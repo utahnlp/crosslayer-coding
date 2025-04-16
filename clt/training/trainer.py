@@ -12,9 +12,16 @@ import datetime  # Import datetime for formatting
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
-from clt.training.data import ActivationStore
+from clt.training.data import (
+    BaseActivationStore,
+    StreamingActivationStore,
+    MappedActivationStore,
+    RemoteActivationStore,
+)
 from clt.training.losses import LossManager
-from clt.nnsight.extractor import ActivationExtractorCLT
+from clt.nnsight.extractor import (
+    ActivationExtractorCLT,
+)  # Keep for StreamingStore usage
 from .evaluator import CLTEvaluator  # Import the new evaluator
 
 # Get logger for this module
@@ -242,6 +249,9 @@ class WandBLogger:
 class CLTTrainer:
     """Trainer for Cross-Layer Transcoder models."""
 
+    # Add type hint for the activation store attribute
+    activation_store: BaseActivationStore
+
     def __init__(
         self,
         clt_config: CLTConfig,
@@ -304,8 +314,8 @@ class CLTTrainer:
                 self.optimizer, T_max=training_config.training_steps
             )
 
-        # Initialize activation extractor and store
-        self.activation_extractor = self._create_activation_extractor()
+        # Initialize activation store based on config
+        # Note: The extractor is now created inside the StreamingActivationStore if needed
         self.activation_store = self._create_activation_store(self.start_time)
 
         # Initialize loss manager
@@ -350,56 +360,118 @@ class CLTTrainer:
             self.n_forward_passes_since_fired > self.training_config.dead_feature_window
         )
 
-    def _create_activation_extractor(self) -> ActivationExtractorCLT:
-        """Create an activation extractor based on training config.
-
-        Returns:
-            Configured ActivationExtractorCLT instance
-        """
-        return ActivationExtractorCLT(
-            model_name=self.training_config.model_name,
-            mlp_input_module_path_template=self.training_config.mlp_input_module_path_template,
-            mlp_output_module_path_template=self.training_config.mlp_output_module_path_template,
-            device=self.device,
-            model_dtype=self.training_config.model_dtype,
-            context_size=self.training_config.context_size,
-            store_batch_size_prompts=self.training_config.store_batch_size_prompts,
-            exclude_special_tokens=self.training_config.exclude_special_tokens,
-            prepend_bos=self.training_config.prepend_bos,
-        )
-
-    def _create_activation_store(self, start_time: float) -> ActivationStore:
-        """Create an activation store based on training config using the new extractor.
+    def _create_activation_store(self, start_time: float) -> BaseActivationStore:
+        """Create the appropriate activation store based on training config.
 
         Args:
             start_time: The training start time for elapsed time logging.
 
         Returns:
-            Configured ActivationStore instance
+            Configured instance of a BaseActivationStore subclass.
         """
-        # Create generator from the extractor
-        activation_generator = self.activation_extractor.stream_activations(
-            dataset_path=self.training_config.dataset_path,
-            dataset_split=self.training_config.dataset_split,
-            dataset_text_column=self.training_config.dataset_text_column,
-            streaming=self.training_config.streaming,
-            dataset_trust_remote_code=self.training_config.dataset_trust_remote_code,
-            cache_path=self.training_config.cache_path,
-            max_samples=getattr(self.training_config, "max_samples", None),
-        )
+        activation_source = self.training_config.activation_source
 
-        # Create the store with the generator
-        store = ActivationStore(
-            activation_generator=activation_generator,
-            n_batches_in_buffer=self.training_config.n_batches_in_buffer,
-            train_batch_size_tokens=self.training_config.train_batch_size_tokens,
-            normalization_method=self.training_config.normalization_method,
-            normalization_estimation_batches=(
-                self.training_config.normalization_estimation_batches
-            ),
-            device=self.device,
-            start_time=start_time,  # Pass start_time here
-        )
+        if activation_source == "generate":
+            logger.info("Using StreamingActivationStore (generating on-the-fly).")
+            # --- Validate required config dicts --- #
+            gen_cfg = self.training_config.generation_config
+            ds_params = self.training_config.dataset_params
+            if gen_cfg is None or ds_params is None:
+                raise ValueError(
+                    "generation_config and dataset_params must be provided in TrainingConfig for on-the-fly generation."
+                )
+
+            # --- Create Extractor from generation_config --- #
+            # Use .get() for optional extractor args
+            extractor = ActivationExtractorCLT(
+                model_name=gen_cfg["model_name"],  # Required
+                mlp_input_module_path_template=gen_cfg[
+                    "mlp_input_template"
+                ],  # Required
+                mlp_output_module_path_template=gen_cfg[
+                    "mlp_output_template"
+                ],  # Required
+                device=self.device,  # Trainer manages device
+                model_dtype=gen_cfg.get("model_dtype"),
+                context_size=gen_cfg.get("context_size", 128),
+                inference_batch_size=gen_cfg.get("inference_batch_size", 512),
+                exclude_special_tokens=gen_cfg.get("exclude_special_tokens", True),
+                prepend_bos=gen_cfg.get("prepend_bos", False),
+                nnsight_tracer_kwargs=gen_cfg.get("nnsight_tracer_kwargs"),
+                nnsight_invoker_args=gen_cfg.get("nnsight_invoker_args"),
+            )
+
+            # --- Create Generator from dataset_params --- #
+            activation_generator = extractor.stream_activations(
+                dataset_path=ds_params["dataset_path"],  # Required
+                dataset_split=ds_params.get("dataset_split", "train"),
+                dataset_text_column=ds_params.get("dataset_text_column", "text"),
+                streaming=ds_params.get("streaming", True),
+                dataset_trust_remote_code=ds_params.get(
+                    "dataset_trust_remote_code", False
+                ),
+                cache_path=ds_params.get("cache_path"),
+                # max_samples=ds_params.get("max_samples"), # max_samples is not a valid arg for stream_activations
+            )
+
+            # --- Create Streaming Store --- #
+            # Determine normalization method for streaming
+            stream_norm_method = self.training_config.normalization_method
+            if stream_norm_method == "auto":
+                # 'auto' for streaming means estimate on the fly
+                stream_norm_method = "estimated_mean_std"
+
+            store = StreamingActivationStore(
+                activation_generator=activation_generator,
+                train_batch_size_tokens=self.training_config.train_batch_size_tokens,
+                n_batches_in_buffer=self.training_config.n_batches_in_buffer,
+                normalization_method=stream_norm_method,
+                normalization_estimation_batches=(
+                    self.training_config.normalization_estimation_batches
+                ),
+                device=self.device,
+                start_time=start_time,
+            )
+        elif activation_source == "local":
+            logger.info("Using MappedActivationStore (reading local files).")
+            if not self.training_config.activation_path:
+                raise ValueError(
+                    "activation_path must be set in TrainingConfig when activation_source is 'local'."
+                )
+            store = MappedActivationStore(
+                activation_path=self.training_config.activation_path,
+                train_batch_size_tokens=self.training_config.train_batch_size_tokens,
+                # Pass normalization config - Mapped store handles loading/disabling/'auto' logic
+                normalization=self.training_config.normalization_method,
+                device=self.device,
+            )
+        elif activation_source == "remote":
+            logger.info(
+                "Using RemoteActivationStore (reading remote server - STUBBED)."
+            )
+            remote_cfg = self.training_config.remote_config
+            if remote_cfg is None:
+                raise ValueError(
+                    "remote_config dict must be set in TrainingConfig when activation_source is 'remote'."
+                )
+            server_url = remote_cfg.get("server_url")
+            dataset_id = remote_cfg.get("dataset_id")
+            if not server_url or not dataset_id:
+                raise ValueError(
+                    "remote_config must contain 'server_url' and 'dataset_id'."
+                )
+
+            store = RemoteActivationStore(
+                server_url=server_url,
+                dataset_id=dataset_id,
+                train_batch_size_tokens=self.training_config.train_batch_size_tokens,
+                # Pass normalization config - Remote store handles its own logic/'auto' interpretation
+                normalization=self.training_config.normalization_method,
+                device=self.device,
+                # Potentially add other remote-specific params like prefetch_batches, timeout from config
+            )
+        else:
+            raise ValueError(f"Unknown activation_source: {activation_source}")
 
         return store
 
@@ -551,6 +623,12 @@ class CLTTrainer:
                 if basename == "clt_checkpoint_latest.pt":
                     store_checkpoint_path = os.path.join(
                         dirname, "activation_store_checkpoint_latest.pt"
+                    )
+                else:
+                    # Fallback if naming convention doesn't match
+                    store_checkpoint_path = None
+                    print(
+                        f"Warning: Could not determine activation store checkpoint path from model path: {checkpoint_path}"
                     )
 
         # Load activation store checkpoint if available

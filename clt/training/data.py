@@ -1,17 +1,25 @@
 import torch
-from typing import Dict, List, Tuple, Optional, Union, Generator
+from typing import Dict, List, Tuple, Optional, Union, Generator, Any
 import logging
 import time
 from tqdm import tqdm
 import sys
 import datetime
 import gc  # Import Python garbage collector
+from abc import ABC, abstractmethod
+import os
+import json
+import numpy as np
+import h5py  # Requires pip install h5py
+import requests  # Requires pip install requests
+from threading import Thread
+from queue import Queue, Empty
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Type hint for the generator output
+# Type hint for the generator output & batch format
 ActivationBatchCLT = Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]
 
 
@@ -27,24 +35,76 @@ def _format_elapsed_time(seconds: float) -> str:
         return f"{minutes:02d}:{seconds:02d}"
 
 
-class ActivationStore:
-    """Manages model activations for CLT training using a streaming generator.
+# --------------------
+# Base Class
+# --------------------
 
-    Buffers activations efficiently, yields batches for training, and handles
-    optional normalization.
-    """
 
-    # Type hints for instance variables
-    activation_generator: Generator[ActivationBatchCLT, None, None]
-    n_batches_in_buffer: int
-    train_batch_size_tokens: int
-    normalization_method: str
-    normalization_estimation_batches: int
-    device: torch.device
+class BaseActivationStore(ABC):
+    """Abstract base class for activation stores."""
 
+    # Common attributes (to be set by subclasses)
     layer_indices: List[int]
     d_model: int
     dtype: torch.dtype
+    device: torch.device
+    train_batch_size_tokens: int
+    total_tokens: int  # Total tokens available in the store (if known)
+
+    @abstractmethod
+    def get_batch(self) -> ActivationBatchCLT:
+        """Yields the next batch of activations."""
+        pass
+
+    @abstractmethod
+    def state_dict(self) -> Dict[str, Any]:
+        """Return a dictionary containing the state for saving/resumption."""
+        pass
+
+    @abstractmethod
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """Load state from a dictionary."""
+        pass
+
+    def __iter__(self):
+        """Make the store iterable."""
+        return self
+
+    def __next__(self):
+        """Allows the store to be used as an iterator yielding batches."""
+        return self.get_batch()
+
+    def __len__(self):
+        """Estimate the number of batches in the dataset."""
+        if (
+            not hasattr(self, "total_tokens")
+            or self.total_tokens <= 0
+            or self.train_batch_size_tokens <= 0
+        ):
+            return 0
+        return (
+            self.total_tokens + self.train_batch_size_tokens - 1
+        ) // self.train_batch_size_tokens
+
+
+# --------------------------
+# Streaming Implementation
+# --------------------------
+
+
+class StreamingActivationStore(BaseActivationStore):
+    """Manages model activations for CLT training using a live streaming generator.
+
+    Buffers activations efficiently, yields batches for training, and handles
+    optional normalization estimation on-the-fly.
+    Inherits buffer management, batching, and normalization logic from the original ActivationStore.
+    """
+
+    # Type hints for instance variables specific to streaming
+    activation_generator: Generator[ActivationBatchCLT, None, None]
+    n_batches_in_buffer: int
+    normalization_method: str  # 'none' or 'estimated_mean_std'
+    normalization_estimation_batches: int
 
     # Buffers store activations per layer
     buffered_inputs: Dict[int, torch.Tensor]
@@ -53,7 +113,7 @@ class ActivationStore:
     # Read mask tracks yielded tokens across the unified buffer length
     read_indices: torch.Tensor
 
-    # Normalization statistics (per layer)
+    # Normalization statistics (per layer) - estimated live
     input_means: Dict[int, torch.Tensor]
     input_stds: Dict[int, torch.Tensor]
     output_means: Dict[int, torch.Tensor]
@@ -69,9 +129,9 @@ class ActivationStore:
     def __init__(
         self,
         activation_generator: Generator[ActivationBatchCLT, None, None],
-        n_batches_in_buffer: int = 16,
         train_batch_size_tokens: int = 4096,
-        normalization_method: str = "none",  # Default to no normalization
+        n_batches_in_buffer: int = 16,
+        normalization_method: str = "none",
         normalization_estimation_batches: int = 50,
         device: Optional[Union[str, torch.device]] = None,
         start_time: Optional[float] = None,
@@ -79,26 +139,22 @@ class ActivationStore:
         """Initialize the streaming activation store for CLT.
 
         Args:
-            activation_generator: Generator yielding tuples of
-                                  (inputs_dict, targets_dict). Dictionaries map layer_idx
-                                  to tensors of shape [n_valid_tokens, d_model].
-            n_batches_in_buffer: Number of training batches worth of tokens to aim for
-                                 in the buffer.
-            train_batch_size_tokens: Number of tokens per training batch yielded by get_batch().
-            normalization_method: Normalization method ('none', 'estimated_mean_std').
-            normalization_estimation_batches: Number of generator batches to use for estimating
-                                             normalization statistics if method is 'estimated_mean_std'.
-            device: Device to store activations on ('cuda', 'cpu', etc.). Auto-detects if None.
-            start_time: The initial time.time() from the trainer for elapsed time logging.
+            activation_generator: Generator yielding (inputs_dict, targets_dict).
+            train_batch_size_tokens: Number of tokens per training batch.
+            n_batches_in_buffer: Number of training batches worth of tokens to buffer.
+            normalization_method: 'none' or 'estimated_mean_std'.
+            normalization_estimation_batches: Batches used for estimating stats.
+            device: Device to store activations on.
+            start_time: Optional start time for logging.
         """
         self.activation_generator = activation_generator
         self.n_batches_in_buffer = n_batches_in_buffer
-        self.train_batch_size_tokens = train_batch_size_tokens
+        self.train_batch_size_tokens = train_batch_size_tokens  # From Base
         self.normalization_method = normalization_method
         self.normalization_estimation_batches = normalization_estimation_batches
         self.start_time = start_time or time.time()
 
-        # Set device
+        # Set device (Common logic, could be in Base if needed)
         _device_input = device or (
             torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         )
@@ -116,9 +172,9 @@ class ActivationStore:
         # Initialize state (buffers etc. will be initialized lazily)
         self.buffer_initialized = False
         self.generator_exhausted = False
-        self.layer_indices = []
-        self.d_model = -1
-        self.dtype = torch.float32  # Default, will be updated
+        self.layer_indices = []  # From Base
+        self.d_model = -1  # From Base
+        self.dtype = torch.float32  # From Base
 
         self.buffered_inputs = {}
         self.buffered_targets = {}
@@ -130,7 +186,10 @@ class ActivationStore:
         self.output_means = {}
         self.output_stds = {}
 
-        logger.info(f"ActivationStore initialized on {self.device}.")
+        # total_tokens is unknown in streaming mode until exhaustion
+        self.total_tokens = -1  # Indicates unknown
+
+        logger.info(f"StreamingActivationStore initialized on {self.device}.")
         logger.info(f"Target buffer size: {self.target_buffer_size_tokens} tokens.")
         logger.info(f"Normalization method: {self.normalization_method}")
 
@@ -276,19 +335,6 @@ class ActivationStore:
         tokens_added_this_fill = 0
         start_time = time.time()
 
-        # --- Commented out memory logging --- #
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Fill Buffer - Start [{elapsed_str}]. Mem: {mem_before:.2f} MB. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
-        #     )
-        # else:
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Fill Buffer - Start [{elapsed_str}]. Unread: {num_unread}, Needed: {max(0, tokens_needed)}"
-        #     )
-
         while tokens_added_this_fill < tokens_needed:
             try:
                 batch = next(self.activation_generator)
@@ -304,13 +350,15 @@ class ActivationStore:
             except StopIteration:
                 logger.info("Activation generator exhausted.")
                 self.generator_exhausted = True
+                # Update total_tokens if previously unknown
+                if self.total_tokens == -1:
+                    self.total_tokens = self.total_tokens_yielded_by_generator
                 break  # Exit loop if generator is done
             except Exception as e:
                 logger.error(
                     f"Error fetching or processing batch from generator: {e}",
                     exc_info=True,
                 )
-                # Decide whether to re-raise or try to continue
                 raise e  # Re-raise by default
 
         end_time = time.time()
@@ -321,20 +369,6 @@ class ActivationStore:
             f"Total buffer size: {current_buffer_size}. Unread tokens: {final_unread}."
         )
 
-        # --- Commented out memory logging --- #
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Fill Buffer - End [{elapsed_str}]: Mem: {mem_after:.2f} MB (+{mem_after - mem_before:.2f} MB). Added: {tokens_added_this_fill}"
-        #     )
-        # else:
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Fill Buffer - End [{elapsed_str}]. Added: {tokens_added_this_fill}"
-        #     )
-
-        # Check if buffer is still empty after trying to fill
         if self.read_indices.shape[0] == 0 and self.generator_exhausted:
             logger.warning(
                 "Buffer is empty and generator is exhausted. No data available."
@@ -356,71 +390,41 @@ class ActivationStore:
 
         if first_unread_idx > 0:
             # Prune the buffers and the read_indices tensor
-            num_to_prune = first_unread_idx
-            # --- Commented out memory logging --- #
-            # mem_before = 0
-            # if torch.cuda.is_available() and self.device.type == "cuda":
-            #     mem_before = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-
             for layer_idx in self.layer_indices:
                 self.buffered_inputs[layer_idx] = self.buffered_inputs[layer_idx][
-                    num_to_prune:
+                    first_unread_idx:
                 ]
                 self.buffered_targets[layer_idx] = self.buffered_targets[layer_idx][
-                    num_to_prune:
+                    first_unread_idx:
                 ]
-            self.read_indices = self.read_indices[num_to_prune:]
-            # logger.debug(f"Pruned {num_to_prune} read tokens from buffer. New size: {self.read_indices.shape[0]}")
+            self.read_indices = self.read_indices[first_unread_idx:]
 
             if torch.cuda.is_available() and self.device.type == "cuda":
-                # --- Force Python GC and CUDA cache clearing AFTER pruning tensors --- #
-                gc.collect()  # Force Python GC
+                gc.collect()
                 torch.cuda.empty_cache()
-                # --- Log memory AFTER cache clearing --- #
-                # --- Commented out memory logging --- #
-                # mem_after = torch.cuda.memory_allocated(self.device) / (1024**2)  # MB
-                # elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                # logger.debug(
-                #     f"Prune Buffer [{elapsed_str}]: Pruned {num_to_prune}. Mem Before: {mem_before:.2f} MB, After: {mem_after:.2f} MB, Diff: {mem_after - mem_before:.2f} MB"
-                # )
 
     def get_batch(self) -> ActivationBatchCLT:
-        """Gets a randomly sampled batch of activations for training.
-
-        Refills the buffer from the generator if it falls below half capacity.
-        Prunes read tokens from the start of the buffer periodically.
-
-        Returns:
-            Tuple of (inputs_dict, targets_dict) dictionaries, where each maps
-            layer_idx to a tensor of shape [train_batch_size_tokens, d_model].
-
-        Raises:
-            StopIteration: If the generator is exhausted and the buffer becomes empty.
-            RuntimeError: If unable to provide a batch after attempting to refill.
-        """
-        # --- Commented out per-batch memory logging --- #
-        # mem_start_get_batch = 0.0 # Type hint was fixed previously
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     mem_start_get_batch = torch.cuda.memory_allocated(self.device) / (
-        #         1024**2
-        #     )  # MB
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Get Batch - Start [{elapsed_str}]. Mem: {mem_start_get_batch:.2f} MB"
-        #     )
-
+        """Gets a randomly sampled batch of activations for training."""
         # Initialize and fill buffer on first call or if needed
         num_unread = (~self.read_indices).sum().item()
-        if (
-            not self.buffer_initialized
-            or num_unread < self.target_buffer_size_tokens // 2
-        ):
-            if not self.generator_exhausted:
-                self._fill_buffer()
+        # Refill needed if buffer not initialized OR less than half full
+        # OR exactly full but not exhausted (avoids getting stuck if buffer = target size exactly)
+        needs_refill = (
+            (not self.buffer_initialized)
+            or (num_unread < self.target_buffer_size_tokens // 2)
+            or (
+                num_unread == self.read_indices.shape[0]
+                and not self.generator_exhausted
+                and self.read_indices.shape[0] < self.target_buffer_size_tokens
+            )
+        )
+
+        if needs_refill and not self.generator_exhausted:
+            self._fill_buffer()
             # Re-check unread count after trying to fill
             num_unread = (~self.read_indices).sum().item()
 
-        # If still no unread tokens after trying to fill (generator might be exhausted)
+        # If still no unread tokens after trying to fill
         if num_unread == 0:
             if self.generator_exhausted:
                 logger.info(
@@ -428,7 +432,6 @@ class ActivationStore:
                 )
                 raise StopIteration
             else:
-                # This case should ideally be rare if _fill_buffer works correctly
                 logger.error(
                     "Buffer has no unread tokens despite generator not being marked as exhausted."
                 )
@@ -436,17 +439,12 @@ class ActivationStore:
 
         # --- Sample indices ---
         unread_token_indices = (~self.read_indices).nonzero().squeeze(-1)
-
-        # Determine how many tokens to sample for the batch
         num_to_sample = min(self.train_batch_size_tokens, len(unread_token_indices))
-        if (
-            num_to_sample == 0
-        ):  # Should not happen if checks above passed, but safeguard
+        if num_to_sample == 0:
             raise RuntimeError(
                 "No unread indices available for sampling, despite earlier checks."
             )
 
-        # Randomly sample from the unread indices
         perm = torch.randperm(len(unread_token_indices), device=self.device)[
             :num_to_sample
         ]
@@ -455,7 +453,6 @@ class ActivationStore:
         # --- Create batch dictionaries ---
         batch_inputs: Dict[int, torch.Tensor] = {}
         batch_targets: Dict[int, torch.Tensor] = {}
-
         for layer_idx in self.layer_indices:
             batch_inputs[layer_idx] = self.buffered_inputs[layer_idx][
                 sampled_buffer_indices
@@ -467,142 +464,145 @@ class ActivationStore:
         # --- Mark indices as read ---
         self.read_indices[sampled_buffer_indices] = True
 
-        # --- Prune buffer ---
-        # Pruning can be done less frequently for efficiency, e.g., every N batches
-        # Or based on the number of read tokens at the start.
-        self._prune_buffer()  # Prune every time for simplicity here
-
-        # --- Commented out per-batch memory logging --- #
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     mem_end_get_batch = torch.cuda.memory_allocated(self.device) / (
-        #         1024**2
-        #     )  # MB
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Get Batch - End [{elapsed_str}]. Mem: {mem_end_get_batch:.2f} MB (+{mem_end_get_batch - mem_start_get_batch:.2f} MB)"
-        #     )
+        # --- Prune buffer --- (Prune every time for simplicity here)
+        self._prune_buffer()
 
         return batch_inputs, batch_targets
 
     def _estimate_normalization_stats(self):
-        """
-        Simplified estimation of normalization stats by collecting up to
-        'normalization_estimation_batches' from the generator and computing
-        mean/std for each layer in a single pass.
-        """
+        """Estimates normalization stats using the generator."""
         if self.normalization_method != "estimated_mean_std":
             return
 
-        # Reset or initialize stats containers
-        self.input_means = {}
-        self.input_stds = {}
-        self.output_means = {}
-        self.output_stds = {}
-
-        # Prepare placeholders to accumulate activations
-        all_inputs = {}
-        all_outputs = {}
-
-        # We'll initialize buffer metadata after the first actual batch
-        # so that layer_indices/dtype/device are set properly.
-        first_batch_seen = False
-
-        # Print status and force display
-        print("\nComputing normalization statistics...")
-        sys.stdout.flush()  # Force output to display
-
-        # Create progress bar
-        norm_progress = tqdm(
-            range(self.normalization_estimation_batches),
-            desc="Normalization Progress",
-            leave=True,  # Keep the progress bar after completion
+        logger.info(
+            f"Starting normalization statistics estimation using {self.normalization_estimation_batches} generator batches..."
         )
+        self.input_means, self.input_stds = {}, {}
+        self.output_means, self.output_stds = {}, {}
+        all_inputs_for_norm: Dict[int, List[torch.Tensor]] = {}
+        all_outputs_for_norm: Dict[int, List[torch.Tensor]] = {}
+        first_batch_seen = False
+        batches_processed = 0
 
-        for batch_idx in norm_progress:
-            try:
+        pbar_norm = tqdm(
+            range(self.normalization_estimation_batches), desc="Estimating Norm Stats"
+        )
+        try:
+            for _ in pbar_norm:
                 batch_inputs, batch_targets = next(self.activation_generator)
-
-                # Update progress description
-                norm_progress.set_description(
-                    f"Processed batch {batch_idx+1}/{self.normalization_estimation_batches}"
-                )
+                batches_processed += 1
 
                 if not first_batch_seen:
                     self._initialize_buffer_metadata((batch_inputs, batch_targets))
-                    first_batch_seen = True
-                    # Build empty lists for each layer
                     for layer_idx in self.layer_indices:
-                        all_inputs[layer_idx] = []
-                        all_outputs[layer_idx] = []
+                        all_inputs_for_norm[layer_idx] = []
+                        all_outputs_for_norm[layer_idx] = []
+                    first_batch_seen = True
 
                 for layer_idx in self.layer_indices:
-                    in_tensor = batch_inputs[layer_idx].to(self.device).to(self.dtype)
-                    out_tensor = batch_targets[layer_idx].to(self.device).to(self.dtype)
-                    all_inputs[layer_idx].append(in_tensor)
-                    all_outputs[layer_idx].append(out_tensor)
-
-            except StopIteration:
-                self.generator_exhausted = True
-                break
-
-        # Compute mean and std for each layer
-        if first_batch_seen:
-            for layer_idx in self.layer_indices:
-                # Concatenate all data for layer_idx
-                in_cat = (
-                    torch.cat(all_inputs[layer_idx], dim=0)
-                    if len(all_inputs[layer_idx]) > 0
-                    else None
-                )
-                out_cat = (
-                    torch.cat(all_outputs[layer_idx], dim=0)
-                    if len(all_outputs[layer_idx]) > 0
-                    else None
-                )
-
-                if in_cat is None or out_cat is None:
-                    continue
-
-                self.input_means[layer_idx] = in_cat.mean(dim=0, keepdim=True)
-                self.input_stds[layer_idx] = in_cat.std(dim=0, keepdim=True) + 1e-6
-
-                self.output_means[layer_idx] = out_cat.mean(dim=0, keepdim=True)
-                self.output_stds[layer_idx] = out_cat.std(dim=0, keepdim=True) + 1e-6
-
-            # Store initial batches in buffer for training
-            for in_dict, out_dict in zip(all_inputs.values(), all_outputs.values()):
-                for batch_in, batch_out in zip(in_dict, out_dict):
-                    if not self.buffer_initialized:
-                        self._initialize_buffer_metadata((batch_in, batch_out))
-                    self._add_batch_to_buffer((batch_in, batch_out))
-
-            total_batches = sum(len(tensors) for tensors in all_inputs.values())
-            logger.info(f"Normalization complete using {total_batches} batches")
-
-            # Signal completion
-            print("\n>>> NORMALIZATION PHASE COMPLETE - STARTING TRAINING <<<\n")
-            sys.stdout.flush()  # Force output to display
-        else:
+                    # Collect tensors (move to CPU to avoid GPU OOM during estimation)
+                    all_inputs_for_norm[layer_idx].append(batch_inputs[layer_idx].cpu())
+                    all_outputs_for_norm[layer_idx].append(
+                        batch_targets[layer_idx].cpu()
+                    )
+        except StopIteration:
+            self.generator_exhausted = True
             logger.warning(
-                "No data processed for normalization. Using identity normalization."
+                f"Generator exhausted after {batches_processed} batches during norm estimation."
             )
-            self.normalization_method = "none"  # Fall back to no normalization
+        finally:
+            pbar_norm.close()
+
+        if not first_batch_seen:
+            logger.error(
+                "No batches received from generator during normalization estimation. Cannot compute stats."
+            )
+            self.normalization_method = "none"  # Fallback
+            return
+
+        logger.info("Calculating mean and std from collected tensors...")
+        for layer_idx in tqdm(self.layer_indices, desc="Calculating Stats"):
+            if not all_inputs_for_norm[layer_idx]:
+                logger.warning(
+                    f"No data collected for layer {layer_idx} during norm estimation."
+                )
+                continue
+
+            try:
+                # Concatenate on CPU, compute stats, then move results to target device
+                in_cat = torch.cat(
+                    all_inputs_for_norm[layer_idx], dim=0
+                ).float()  # Ensure float32 for stable stats
+                out_cat = torch.cat(all_outputs_for_norm[layer_idx], dim=0).float()
+
+                # Calculate stats and move to target device
+                self.input_means[layer_idx] = in_cat.mean(dim=0, keepdim=True).to(
+                    self.device, dtype=self.dtype
+                )
+                self.input_stds[layer_idx] = (
+                    in_cat.std(dim=0, keepdim=True) + 1e-6
+                ).to(self.device, dtype=self.dtype)
+                self.output_means[layer_idx] = out_cat.mean(dim=0, keepdim=True).to(
+                    self.device, dtype=self.dtype
+                )
+                self.output_stds[layer_idx] = (
+                    out_cat.std(dim=0, keepdim=True) + 1e-6
+                ).to(self.device, dtype=self.dtype)
+
+                # --- Crucially, add the collected batches back to the buffer --- #
+                # We iterate through the original CPU tensors we collected
+                logger.debug(
+                    f"Adding {len(all_inputs_for_norm[layer_idx])} norm batches back to buffer..."
+                )
+                temp_rebuild_batches = []
+                num_batches = len(all_inputs_for_norm[layer_idx])
+                for i in range(num_batches):
+                    batch_input_dict = {
+                        l: all_inputs_for_norm[l][i]
+                        for l in self.layer_indices
+                        if i < len(all_inputs_for_norm[l])
+                    }
+                    batch_output_dict = {
+                        l: all_outputs_for_norm[l][i]
+                        for l in self.layer_indices
+                        if i < len(all_outputs_for_norm[l])
+                    }
+                    temp_rebuild_batches.append((batch_input_dict, batch_output_dict))
+
+                for batch_in_dict, batch_out_dict in temp_rebuild_batches:
+                    # Ensure metadata is initialized (should be already)
+                    if not self.buffer_initialized:
+                        self._initialize_buffer_metadata(
+                            (batch_in_dict, batch_out_dict)
+                        )
+                    # Add batch (this handles moving to device and normalization)
+                    self._add_batch_to_buffer((batch_in_dict, batch_out_dict))
+                logger.debug("Finished adding norm batches back.")
+
+            except Exception as e:
+                logger.error(
+                    f"Error calculating norm stats for layer {layer_idx}: {e}",
+                    exc_info=True,
+                )
+                # Decide how to handle: skip layer? fallback? For now, just log.
+
+        del all_inputs_for_norm, all_outputs_for_norm  # Free memory
+        gc.collect()
+        logger.info(
+            f"Normalization estimation complete using {batches_processed} batches."
+        )
 
     def _normalize_batch(
         self,
         inputs_dict: Dict[int, torch.Tensor],
         targets_dict: Dict[int, torch.Tensor],
     ) -> ActivationBatchCLT:
-        """
-        Applies the estimated mean/std to each layer's inputs and targets.
-        If no stats exist for a layer, returns the tensors unchanged.
-        """
+        """Applies the estimated mean/std to each layer's inputs and targets."""
         normalized_inputs = {}
         normalized_targets = {}
-
         for layer_idx in self.layer_indices:
-            inp = inputs_dict[layer_idx].to(self.device)
-            tgt = targets_dict[layer_idx].to(self.device)
+            inp = inputs_dict[layer_idx].to(self.device, dtype=self.dtype)
+            tgt = targets_dict[layer_idx].to(self.device, dtype=self.dtype)
 
             if layer_idx in self.input_means and layer_idx in self.input_stds:
                 inp = (inp - self.input_means[layer_idx]) / self.input_stds[layer_idx]
@@ -611,7 +611,6 @@ class ActivationStore:
 
             normalized_inputs[layer_idx] = inp
             normalized_targets[layer_idx] = tgt
-
         return normalized_inputs, normalized_targets
 
     def denormalize_outputs(
@@ -619,60 +618,60 @@ class ActivationStore:
     ) -> Dict[int, torch.Tensor]:
         """Denormalizes output activations to their original scale."""
         if self.normalization_method == "none" or not self.output_means:
-            return outputs  # No-op if not normalized or no stats
+            return outputs
 
         denormalized = {}
         for layer_idx, output in outputs.items():
-            if layer_idx in self.output_means:
+            if layer_idx in self.output_means and layer_idx in self.output_stds:
                 mean = self.output_means[layer_idx]
                 std = self.output_stds[layer_idx]
-                # Ensure mean/std are on the same device as the output tensor
                 denormalized[layer_idx] = (output * std.to(output.device)) + mean.to(
                     output.device
                 )
             else:
                 logger.warning(
-                    f"Attempting to denormalize layer {layer_idx} but no statistics found."
+                    f"Attempting denormalize layer {layer_idx} but no stats found."
                 )
-                denormalized[layer_idx] = output  # Return as is if no stats
+                denormalized[layer_idx] = output
         return denormalized
 
+    # Overrides BaseActivationStore.state_dict
     def state_dict(self) -> Dict:
-        """Return a dictionary containing the state for saving/resumption."""
-        # Convert tensors to CPU before saving to ensure compatibility
+        """Return state (incl. estimated normalization stats) for saving."""
         cpu_input_means = {k: v.cpu() for k, v in self.input_means.items()}
         cpu_input_stds = {k: v.cpu() for k, v in self.input_stds.items()}
         cpu_output_means = {k: v.cpu() for k, v in self.output_means.items()}
         cpu_output_stds = {k: v.cpu() for k, v in self.output_stds.items()}
 
         return {
+            "store_type": "StreamingActivationStore",
             "layer_indices": self.layer_indices,
             "d_model": self.d_model,
-            "dtype": str(self.dtype),  # Save dtype as string
+            "dtype": str(self.dtype),
             "input_means": cpu_input_means,
             "input_stds": cpu_input_stds,
             "output_means": cpu_output_means,
             "output_stds": cpu_output_stds,
             "total_tokens_yielded_by_generator": self.total_tokens_yielded_by_generator,
             "target_buffer_size_tokens": self.target_buffer_size_tokens,
+            "train_batch_size_tokens": self.train_batch_size_tokens,
             "normalization_method": self.normalization_method,
-            # Note: We don't save buffer data, read indices, or generator state.
-            # Resumption requires a fresh generator.
+            "normalization_estimation_batches": self.normalization_estimation_batches,
+            # Note: Buffer/generator state not saved.
         }
 
+    # Overrides BaseActivationStore.load_state_dict
     def load_state_dict(self, state_dict: Dict):
-        """Load state from a dictionary."""
+        """Load state. Requires a new generator to be provided externally."""
+        if state_dict.get("store_type") != "StreamingActivationStore":
+            logger.warning("Attempting to load state from incompatible store type.")
         self.layer_indices = state_dict["layer_indices"]
         self.d_model = state_dict["d_model"]
-        # Convert dtype string back to torch.dtype
         try:
             self.dtype = getattr(torch, state_dict["dtype"].split(".")[-1])
         except AttributeError:
-            logger.warning(
-                f"Could not parse dtype string '{state_dict['dtype']}'. Defaulting to {self.dtype}."
-            )
+            logger.warning(f"Could parse dtype '{state_dict['dtype']}', defaulting.")
 
-        # Load normalization stats and move to the correct device
         self.input_means = {
             k: v.to(self.device) for k, v in state_dict["input_means"].items()
         }
@@ -690,24 +689,743 @@ class ActivationStore:
             "total_tokens_yielded_by_generator"
         ]
         self.target_buffer_size_tokens = state_dict["target_buffer_size_tokens"]
+        self.train_batch_size_tokens = state_dict["train_batch_size_tokens"]
         self.normalization_method = state_dict["normalization_method"]
+        self.normalization_estimation_batches = state_dict[
+            "normalization_estimation_batches"
+        ]
+        self.total_tokens = (
+            -1
+        )  # Reset total tokens, will update on generator exhaustion
 
-        # Reset buffer state as it's not saved
-        self.buffered_inputs = {}
-        self.buffered_targets = {}
+        # Reset buffer state
+        self.buffered_inputs, self.buffered_targets = {}, {}
         self.read_indices = torch.empty(0, dtype=torch.bool, device=self.device)
-        self.buffer_initialized = False  # Re-initialize on first get_batch
-        self.generator_exhausted = False  # Assume new generator is not exhausted
+        self.buffer_initialized = False
+        self.generator_exhausted = False
+        logger.info("StreamingActivationStore state loaded. Requires a new generator.")
+
+
+# --------------------------
+# Mapped File Implementation
+# --------------------------
+
+
+class MappedActivationStore(BaseActivationStore):
+    """Reads pre-generated activation chunks from local disk (HDF5 or NPZ)."""
+
+    # Type hints for instance variables
+    activation_path: str
+    metadata: Dict[str, Any]
+    num_chunks: int
+    format: str
+    apply_normalization: bool
+    input_means: Dict[int, torch.Tensor]
+    input_stds: Dict[int, torch.Tensor]
+    output_means: Dict[int, torch.Tensor]
+    output_stds: Dict[int, torch.Tensor]
+
+    # Chunk management
+    current_chunk_idx: int
+    current_chunk_data: Optional[Dict[int, Dict[str, torch.Tensor]]]
+    read_indices: Optional[torch.Tensor]  # Tracks read tokens within the current chunk
+    chunk_tokens_remaining: int
+
+    def __init__(
+        self,
+        activation_path: str,
+        train_batch_size_tokens: int = 4096,
+        normalization: Union[
+            str, bool
+        ] = "auto",  # 'auto', 'none', False, or path/to/stats.json
+        device: Optional[Union[str, torch.device]] = None,
+    ):
+        """Initialize store using pre-generated activations on disk.
+
+        Args:
+            activation_path: Path to the activation dataset directory (created by ActivationGenerator).
+            train_batch_size_tokens: Number of tokens per training batch.
+            normalization: How to handle normalization. 'auto': use norm_stats.json if exists,
+                           'none'/False: disable, 'path/to/stats.json': use specific file.
+            device: Device to place loaded tensors on.
+        """
+        self.activation_path = activation_path
+        self.train_batch_size_tokens = train_batch_size_tokens  # From Base
+
+        # Set device
+        _device_input = device or (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        self.device = (
+            torch.device(_device_input)
+            if isinstance(_device_input, str)
+            else _device_input
+        )  # From Base
+
+        # --- Load metadata --- #
+        metadata_path = os.path.join(activation_path, "metadata.json")
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found: {metadata_path}")
+        with open(metadata_path, "r") as f:
+            self.metadata = json.load(f)
+
+        # --- Set attributes from metadata --- #
+        try:
+            dataset_stats = self.metadata["dataset_stats"]
+            activation_config = self.metadata.get(
+                "activation_config", {}
+            )  # Get config if saved
+
+            self.layer_indices = dataset_stats["layer_indices"]  # From Base
+            self.num_chunks = dataset_stats["num_chunks"]
+            # Use total_tokens_generated if available, else try old key
+            self.total_tokens = dataset_stats.get(
+                "total_tokens_generated", dataset_stats.get("total_tokens", 0)
+            )  # From Base
+            self.d_model = dataset_stats["d_model"]  # From Base
+            # Get dtype string from dataset_stats (saved by new generator) or fallback
+            dtype_str = dataset_stats.get(
+                "dtype", activation_config.get("model_dtype", str(torch.float32))
+            )
+            self.dtype = getattr(
+                torch, dtype_str.split(".")[-1], torch.float32
+            )  # From Base
+            # Get format from activation_config if present, else fallback to old storage_params
+            storage_params = self.metadata.get(
+                "storage_params", activation_config
+            )  # Fallback to activation_config itself
+            self.format = storage_params.get("output_format", "hdf5")
+
+        except KeyError as e:
+            raise ValueError(
+                f"Metadata file {metadata_path} is missing required key: {e}"
+            )
+
+        # --- Format Validation ---
+        if self.format not in ["hdf5", "npz"]:
+            raise ValueError(
+                f"Unsupported data format specified in metadata: {self.format}"
+            )
+        if self.format == "hdf5" and h5py is None:
+            raise ImportError(
+                "Metadata indicates HDF5 format, but h5py is not installed."
+            )
 
         logger.info(
-            f"ActivationStore state loaded. Resuming from {self.total_tokens_yielded_by_generator} generator tokens."
+            f"MappedActivationStore initialized for path: {self.activation_path}"
         )
-        # It's crucial that the provided activation_generator on __init__
-        # can correctly resume or start fresh as needed.
+        logger.info(
+            f"Format: {self.format}, Chunks: {self.num_chunks}, Total Tokens: {self.total_tokens:,}"
+        )
+        logger.info(
+            f"Layers: {self.layer_indices}, d_model: {self.d_model}, dtype: {self.dtype}"
+        )
 
-    def __iter__(self):
-        return self
+        # --- Load normalization statistics if needed --- #
+        self.input_means, self.input_stds = {}, {}
+        self.output_means, self.output_stds = {}, {}
+        self.apply_normalization = False
+        self._load_normalization_stats(normalization, dataset_stats)
 
-    def __next__(self):
-        """Allows the store to be used as an iterator yielding batches."""
-        return self.get_batch()
+        # --- Initialize chunk tracking --- #
+        self.current_chunk_idx = -1
+        self.current_chunk_data = None
+        self.read_indices = None
+        self.chunk_tokens_remaining = 0
+        # Load the first chunk lazily on first get_batch()
+
+    def _load_normalization_stats(
+        self, normalization: Union[str, bool], dataset_stats: Dict
+    ):
+        """Loads normalization stats based on the normalization argument and metadata."""
+        norm_stats_path = None
+        stats_were_computed = dataset_stats.get("computed_norm_stats", False)
+
+        if normalization == "auto":
+            potential_path = os.path.join(self.activation_path, "norm_stats.json")
+            if os.path.exists(potential_path):
+                if stats_were_computed:
+                    norm_stats_path = potential_path
+                    logger.info(
+                        "'auto' normalization: Found norm_stats.json and metadata confirms computation."
+                    )
+                else:
+                    logger.warning(
+                        "'auto' normalization: Found norm_stats.json, but metadata indicates stats were NOT computed during generation. Disabling normalization."
+                    )
+            else:
+                if stats_were_computed:
+                    logger.warning(
+                        "'auto' normalization: Metadata indicates stats computed, but norm_stats.json not found. Disabling normalization."
+                    )
+                else:
+                    logger.info(
+                        "'auto' normalization: No statistics file found and none computed. Disabling normalization."
+                    )
+        elif normalization == "none" or normalization is False:
+            logger.info("Normalization explicitly disabled.")
+        elif isinstance(normalization, str):
+            if os.path.exists(normalization):
+                norm_stats_path = normalization
+                logger.info(f"Using specified normalization file: {norm_stats_path}")
+            else:
+                logger.warning(
+                    f"Specified normalization file not found: {normalization}. Disabling normalization."
+                )
+
+        if norm_stats_path:
+            try:
+                with open(norm_stats_path, "r") as f:
+                    norm_stats_data = json.load(f)
+
+                # Ensure stats are loaded as tensors onto the correct device
+                for layer_idx_str, stats in norm_stats_data.items():
+                    layer_idx = int(layer_idx_str)
+                    if layer_idx in self.layer_indices:
+                        # Convert list back to tensor, add batch dim, move to device, set dtype
+                        if (
+                            stats.get("input_mean") is not None
+                            and stats.get("input_std") is not None
+                        ):
+                            self.input_means[layer_idx] = torch.tensor(
+                                stats["input_mean"],
+                                device=self.device,
+                                dtype=self.dtype,
+                            ).unsqueeze(0)
+                            self.input_stds[layer_idx] = (
+                                torch.tensor(
+                                    stats["input_std"],
+                                    device=self.device,
+                                    dtype=self.dtype,
+                                ).unsqueeze(0)
+                                + 1e-6
+                            )
+                        if (
+                            stats.get("output_mean") is not None
+                            and stats.get("output_std") is not None
+                        ):
+                            self.output_means[layer_idx] = torch.tensor(
+                                stats["output_mean"],
+                                device=self.device,
+                                dtype=self.dtype,
+                            ).unsqueeze(0)
+                            self.output_stds[layer_idx] = (
+                                torch.tensor(
+                                    stats["output_std"],
+                                    device=self.device,
+                                    dtype=self.dtype,
+                                ).unsqueeze(0)
+                                + 1e-6
+                            )
+                self.apply_normalization = True
+                logger.info("Normalization statistics loaded and ready.")
+            except Exception as e:
+                logger.error(
+                    f"Error loading or processing normalization stats from {norm_stats_path}: {e}. Disabling normalization."
+                )
+                self.apply_normalization = False
+        else:
+            logger.info("Normalization is disabled.")
+            self.apply_normalization = False
+
+    def _load_chunk(self, chunk_idx: int):
+        """Loads a specific chunk into memory."""
+        if chunk_idx >= self.num_chunks or chunk_idx < 0:
+            # This indicates we've cycled through all chunks
+            raise StopIteration(
+                f"Requested chunk {chunk_idx} is out of bounds (0 to {self.num_chunks - 1})."
+            )
+
+        self.current_chunk_idx = chunk_idx
+        chunk_path = os.path.join(
+            self.activation_path, f"chunk_{chunk_idx}.{self.format}"
+        )
+        logger.info(f"Loading chunk {chunk_idx} from {chunk_path}...")
+        load_start_time = time.time()
+
+        self.current_chunk_data = {}  # Reset buffer
+        num_tokens_in_chunk = 0
+
+        try:
+            if self.format == "hdf5":
+                with h5py.File(chunk_path, "r") as f:
+                    # Get num_tokens from attribute if available, otherwise infer
+                    num_tokens_in_chunk = f.attrs.get("num_tokens", -1)
+
+                    for layer_idx in self.layer_indices:
+                        layer_group = f[f"layer_{layer_idx}"]
+                        # Load directly to the target device and dtype
+                        inputs = torch.from_numpy(layer_group["inputs"][:]).to(
+                            self.device, dtype=self.dtype
+                        )
+                        targets = torch.from_numpy(layer_group["targets"][:]).to(
+                            self.device, dtype=self.dtype
+                        )
+                        self.current_chunk_data[layer_idx] = {
+                            "inputs": inputs,
+                            "targets": targets,
+                        }
+                        if (
+                            layer_idx == self.layer_indices[0]
+                            and num_tokens_in_chunk == -1
+                        ):
+                            num_tokens_in_chunk = inputs.shape[0]
+            elif self.format == "npz":
+                data = np.load(chunk_path)
+                num_tokens_in_chunk_arr = data.get("num_tokens", np.array(-1))
+                # Ensure we extract the scalar item if it's a 0-dim array
+                num_tokens_in_chunk = (
+                    num_tokens_in_chunk_arr.item()
+                    if num_tokens_in_chunk_arr.size == 1
+                    else -1
+                )
+                if num_tokens_in_chunk == -1 and len(self.layer_indices) > 0:
+                    # Infer from first layer if 'num_tokens' not saved
+                    first_layer_key = f"layer_{self.layer_indices[0]}_inputs"
+                    if first_layer_key in data:
+                        num_tokens_in_chunk = data[first_layer_key].shape[0]
+                    else:
+                        raise ValueError(
+                            f"Cannot determine token count in NPZ chunk {chunk_idx}"
+                        )
+
+                for layer_idx in self.layer_indices:
+                    inputs = torch.from_numpy(data[f"layer_{layer_idx}_inputs"]).to(
+                        self.device, dtype=self.dtype
+                    )
+                    targets = torch.from_numpy(data[f"layer_{layer_idx}_targets"]).to(
+                        self.device, dtype=self.dtype
+                    )
+                    self.current_chunk_data[layer_idx] = {
+                        "inputs": inputs,
+                        "targets": targets,
+                    }
+                del data  # Free numpy memory
+
+            if num_tokens_in_chunk <= 0:
+                logger.warning(
+                    f"Chunk {chunk_idx} loaded but contains {num_tokens_in_chunk} tokens. Skipping."
+                )
+                self.chunk_tokens_remaining = 0
+                self.read_indices = torch.empty(0, dtype=torch.bool, device=self.device)
+                return  # Skip this chunk
+
+            # Initialize read tracking for the newly loaded chunk
+            self.read_indices = torch.zeros(
+                num_tokens_in_chunk, dtype=torch.bool, device=self.device
+            )
+            self.chunk_tokens_remaining = num_tokens_in_chunk
+            logger.info(
+                f"Chunk {chunk_idx} ({num_tokens_in_chunk} tokens) loaded in {time.time() - load_start_time:.2f}s."
+            )
+
+        except FileNotFoundError:
+            logger.error(f"Chunk file not found: {chunk_path}")
+            raise  # Re-raise error
+        except Exception as e:
+            logger.error(
+                f"Error loading chunk {chunk_idx} from {chunk_path}: {e}", exc_info=True
+            )
+            raise  # Re-raise error
+
+    def get_batch(self):
+        """Return a random batch of unread tokens from the current or next chunk."""
+        if self.num_chunks == 0:
+            logger.error("No chunks found in the activation directory.")
+            raise StopIteration("No activation data chunks available.")
+
+        # Loop to find the next available chunk with unread tokens
+        while self.chunk_tokens_remaining <= 0 or (
+            self.read_indices is not None and (~self.read_indices).sum() == 0
+        ):
+            # If read_indices exist and all are read, mark chunk as depleted
+            if self.read_indices is not None and (~self.read_indices).sum() == 0:
+                logger.debug(f"Chunk {self.current_chunk_idx} fully read, advancing...")
+                self.chunk_tokens_remaining = 0  # Ensure we load the next one
+
+            # Try loading next chunk (cycling back to 0 if needed)
+            next_chunk_idx = (self.current_chunk_idx + 1) % self.num_chunks
+            is_new_epoch = next_chunk_idx == 0 and self.current_chunk_idx != -1
+
+            if is_new_epoch:
+                logger.info("Completed full pass through activation chunks.")
+                # Optional: Uncomment below to stop after one epoch
+                # raise StopIteration("Completed one epoch through chunks.")
+
+            try:
+                self._load_chunk(next_chunk_idx)
+                # If _load_chunk returned because the chunk was empty,
+                # self.chunk_tokens_remaining will still be 0, and the loop continues.
+            except (
+                StopIteration
+            ):  # Propagate if _load_chunk signals end of available chunks
+                logger.info("StopIteration received from _load_chunk, signaling end.")
+                raise
+            except (IndexError, FileNotFoundError, ValueError) as e:
+                logger.error(f"Failed to load chunk {next_chunk_idx}: {e}")
+                raise StopIteration(
+                    f"Could not load chunk {next_chunk_idx} or no chunks available."
+                )
+
+            # Sanity check after load attempt: if still no tokens, something is wrong or dataset is empty
+            if (
+                self.chunk_tokens_remaining <= 0
+                and next_chunk_idx == self.current_chunk_idx
+            ):
+                # This could happen if the only chunk is empty or fails to load repeatedly
+                logger.error(
+                    f"Failed to find a non-empty chunk after attempting index {next_chunk_idx}."
+                )
+                raise StopIteration("Could not find any valid data chunks.")
+
+        # --- At this point, we have a chunk loaded with chunk_tokens_remaining > 0 ---
+
+        if self.read_indices is None or self.current_chunk_data is None:
+            # This should ideally not happen if _load_chunk succeeded
+            raise RuntimeError(
+                "Chunk data or read_indices are unexpectedly None after load loop."
+            )
+
+        unread_indices_in_chunk = (~self.read_indices).nonzero().squeeze(-1)
+
+        # If, despite checks, there are no unread indices (shouldn't happen here)
+        if unread_indices_in_chunk.numel() == 0:
+            logger.error(
+                f"Logic error: Chunk {self.current_chunk_idx} has {self.chunk_tokens_remaining} remaining tokens but no unread indices found."
+            )
+            # Attempt to recover by forcing reload on next call
+            self.chunk_tokens_remaining = 0
+            raise StopIteration(
+                "Internal error: Failed to find unread indices in loaded chunk."
+            )
+
+        batch_size = min(self.train_batch_size_tokens, unread_indices_in_chunk.numel())
+
+        perm = torch.randperm(unread_indices_in_chunk.numel(), device=self.device)[
+            :batch_size
+        ]
+        sampled_chunk_indices = unread_indices_in_chunk[perm]
+
+        # --- Prepare batch dictionaries --- #
+        batch_inputs = {}
+        batch_targets = {}
+
+        for layer_idx in self.layer_indices:
+            # Ensure layer exists in the current chunk data
+            if layer_idx not in self.current_chunk_data:
+                logger.warning(
+                    f"Layer {layer_idx} not found in loaded chunk {self.current_chunk_idx}. Skipping layer for this batch."
+                )
+                continue
+
+            inputs = self.current_chunk_data[layer_idx]["inputs"][sampled_chunk_indices]
+            targets = self.current_chunk_data[layer_idx]["targets"][
+                sampled_chunk_indices
+            ]
+
+            # Apply normalization if enabled
+            if self.apply_normalization:
+                if layer_idx in self.input_means and layer_idx in self.input_stds:
+                    inputs = (inputs - self.input_means[layer_idx]) / self.input_stds[
+                        layer_idx
+                    ]
+                if layer_idx in self.output_means and layer_idx in self.output_stds:
+                    targets = (
+                        targets - self.output_means[layer_idx]
+                    ) / self.output_stds[layer_idx]
+
+            batch_inputs[layer_idx] = inputs
+            batch_targets[layer_idx] = targets
+
+        # Mark tokens as read within the current chunk
+        self.read_indices[sampled_chunk_indices] = True
+        self.chunk_tokens_remaining -= batch_size
+
+        return batch_inputs, batch_targets
+
+    def state_dict(self) -> Dict[str, Any]:
+        """Return state for saving/resumption."""
+        # Convert stats to CPU for saving
+        cpu_input_means = {k: v.cpu().tolist() for k, v in self.input_means.items()}
+        cpu_input_stds = {k: v.cpu().tolist() for k, v in self.input_stds.items()}
+        cpu_output_means = {k: v.cpu().tolist() for k, v in self.output_means.items()}
+        cpu_output_stds = {k: v.cpu().tolist() for k, v in self.output_stds.items()}
+
+        return {
+            "store_type": "MappedActivationStore",
+            "activation_path": self.activation_path,
+            "train_batch_size_tokens": self.train_batch_size_tokens,
+            "normalization_applied": self.apply_normalization,  # Record if norm was used
+            "input_means": cpu_input_means,
+            "input_stds": cpu_input_stds,
+            "output_means": cpu_output_means,
+            "output_stds": cpu_output_stds,
+            "current_chunk_idx": self.current_chunk_idx,
+            # We don't save the actual chunk data or read_indices, just the position
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """Load state from a dictionary."""
+        if state_dict.get("store_type") != "MappedActivationStore":
+            logger.warning("Attempting to load state from incompatible store type.")
+
+        # Configuration params should match if loading into the same object instance
+        # self.activation_path = state_dict["activation_path"]
+        # self.train_batch_size_tokens = state_dict["train_batch_size_tokens"]
+
+        # Load normalization stats and move to the correct device
+        self.apply_normalization = state_dict.get("normalization_applied", False)
+        # Convert lists back to tensors
+        self.input_means = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["input_means"].items()
+        }
+        self.input_stds = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["input_stds"].items()
+        }
+        self.output_means = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["output_means"].items()
+        }
+        self.output_stds = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["output_stds"].items()
+        }
+
+        # Restore position, but don't load data yet
+        self.current_chunk_idx = state_dict.get("current_chunk_idx", -1)
+        self.current_chunk_data = None
+        self.read_indices = None
+        self.chunk_tokens_remaining = 0
+
+        logger.info(
+            f"MappedActivationStore state loaded. Resuming from chunk {self.current_chunk_idx}."
+        )
+        # The next call to get_batch() will load the required chunk
+
+
+# --------------------------
+# Remote Implementation (STUB)
+# --------------------------
+
+
+class RemoteActivationStore(BaseActivationStore):
+    """(STUB) Client for retrieving pre-generated activations from a remote server."""
+
+    # Type hints for instance variables
+    server_url: str
+    dataset_id: str
+    prefetch_batches: int
+    requested_layer_indices: Optional[List[int]]
+    normalization_mode: Union[str, bool]
+    timeout: int
+    apply_normalization: bool
+    input_means: Dict[int, torch.Tensor]
+    input_stds: Dict[int, torch.Tensor]
+    output_means: Dict[int, torch.Tensor]
+    output_stds: Dict[int, torch.Tensor]
+    prefetch_queue: Queue
+    prefetch_thread: Thread
+
+    def __init__(
+        self,
+        server_url: str,
+        dataset_id: str,  # e.g., "gpt2/openwebtext_train"
+        train_batch_size_tokens: int = 4096,
+        prefetch_batches: int = 2,
+        layer_indices_to_fetch: Optional[List[int]] = None,
+        normalization: Union[
+            str, bool
+        ] = "auto",  # 'auto', 'none', False, or path to local JSON stats
+        device: Optional[Union[str, torch.device]] = None,
+        timeout: int = 30,
+    ):
+        """Initialize the remote activation store client (stubbed)."""
+        self.server_url = server_url.rstrip("/")
+        self.dataset_id = dataset_id
+        self.train_batch_size_tokens = train_batch_size_tokens  # From Base
+        self.prefetch_batches = prefetch_batches
+        self.requested_layer_indices = layer_indices_to_fetch
+        self.normalization_mode = normalization
+        self.timeout = timeout
+
+        # Set device
+        _device_input = device or (
+            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        )
+        self.device = (
+            torch.device(_device_input)
+            if isinstance(_device_input, str)
+            else _device_input
+        )  # From Base
+
+        logger.warning("RemoteActivationStore is currently a STUB and not functional.")
+
+        # --- Set Base attributes (placeholders until metadata fetch works) ---
+        self.layer_indices = []  # From Base - Placeholder
+        self.d_model = -1  # From Base - Placeholder
+        self.dtype = torch.float32  # From Base - Placeholder
+        self.total_tokens = 0  # From Base - Placeholder
+
+        # --- Fetch metadata (STUBBED) ---
+        try:
+            self.metadata = self._fetch_metadata()
+            # --- Update Base attributes from real metadata ---
+            self.layer_indices = self.metadata.get("dataset_stats", {}).get(
+                "layer_indices", []
+            )
+            self.d_model = self.metadata.get("dataset_stats", {}).get("d_model", -1)
+            dtype_str = self.metadata.get("generation_params", {}).get(
+                "dtype", str(torch.float32)
+            )
+            self.dtype = getattr(torch, dtype_str.split(".")[-1], torch.float32)
+            self.total_tokens = self.metadata.get("dataset_stats", {}).get(
+                "total_tokens", 0
+            )
+            logger.info("Successfully fetched metadata (STUB - Check Implementation).")
+        except NotImplementedError:
+            self.metadata = {}
+            logger.error(
+                "Metadata fetching is not implemented. Store may not function correctly."
+            )
+        except Exception as e:
+            self.metadata = {}
+            logger.error(
+                f"Failed to fetch or parse metadata during init: {e}. Store may not function correctly."
+            )
+
+        # --- Load normalization stats (STUBBED) ---
+        self.input_means, self.input_stds = {}, {}
+        self.output_means, self.output_stds = {}, {}
+        self.apply_normalization = self._load_normalization_stats()  # Stubbed
+
+        # --- Prefetching Queue (STUBBED) ---
+        # self.prefetch_queue = Queue(maxsize=self.prefetch_batches)
+        # self.prefetch_thread = Thread(target=self._prefetch_worker, daemon=True)
+        # self.prefetch_thread.start()
+
+        logger.info(
+            f"RemoteActivationStore initialized for {dataset_id} at {server_url} (STUBBED)"
+        )
+
+    def _fetch_metadata(self) -> Dict[str, Any]:
+        """(STUB) Fetch dataset metadata from the server."""
+        # --- Replace with actual implementation later --- #
+        # url = f"{self.server_url}/datasets/{self.dataset_id}/info"
+        # try:
+        #     response = requests.get(url, timeout=self.timeout)
+        #     response.raise_for_status()
+        #     return response.json()
+        # except requests.exceptions.RequestException as e:
+        #     logger.error(f"Failed to fetch metadata from {url}: {e}")
+        #     raise RuntimeError(f"Failed to fetch metadata from {url}: {e}")
+        # ---------------------------------------------- #
+        logger.error("RemoteActivationStore._fetch_metadata is not implemented.")
+        raise NotImplementedError("_fetch_metadata not implemented yet.")
+
+    def _load_normalization_stats(self) -> bool:
+        """(STUB) Load normalization stats based on self.normalization_mode."""
+        # --- Replace with actual implementation later --- #
+        # Logic to fetch norm_stats.json from server if mode is 'auto',
+        # or load from local path if specified.
+        # Update self.input_means, self.input_stds, etc.
+        # ---------------------------------------------- #
+        logger.error(
+            "RemoteActivationStore._load_normalization_stats is not implemented."
+        )
+        # raise NotImplementedError("_load_normalization_stats not implemented yet.")
+        return False  # Assume no normalization for stub
+
+    def _apply_normalization(self, inputs, targets):
+        """(STUB) Applies normalization if enabled."""
+        if not self.apply_normalization:
+            return inputs, targets
+        # --- Replace with actual implementation later --- #
+        norm_inputs = {}
+        norm_targets = {}
+        for layer_idx in inputs.keys():
+            inp = inputs[layer_idx]
+            tgt = targets[layer_idx]
+            if layer_idx in self.input_means:
+                inp = (inp - self.input_means[layer_idx]) / self.input_stds[layer_idx]
+            if layer_idx in self.output_means:
+                tgt = (tgt - self.output_means[layer_idx]) / self.output_stds[layer_idx]
+            norm_inputs[layer_idx] = inp
+            norm_targets[layer_idx] = tgt
+        return norm_inputs, norm_targets
+        # ---------------------------------------------- #
+        # logger.warning("RemoteActivationStore._apply_normalization STUBBED.")
+        # return inputs, targets # Passthrough for stub
+
+    def _prefetch_worker(self):
+        """(STUB) Background worker that prefetches batches from the server."""
+        # --- Replace with actual implementation later --- #
+        # Loop, request batches from server endpoint, deserialize, normalize, put in queue
+        # Handle errors, timeouts, etc.
+        # ---------------------------------------------- #
+        logger.error("RemoteActivationStore._prefetch_worker is not implemented.")
+        raise NotImplementedError("_prefetch_worker not implemented yet.")
+
+    # Overrides BaseActivationStore.get_batch
+    def get_batch(self):
+        """(STUB) Get a batch of activations from the server."""
+        # --- Replace with actual implementation later --- #
+        # Try getting from prefetch_queue, fallback to direct request
+        # Deserialize response, convert to tensors, normalize
+        # ---------------------------------------------- #
+        logger.error("RemoteActivationStore.get_batch is not implemented.")
+        raise NotImplementedError("Remote batch fetching not implemented yet.")
+
+    # Overrides BaseActivationStore.state_dict
+    def state_dict(self) -> Dict[str, Any]:
+        """(STUB) Return state for saving/resumption."""
+        logger.warning("RemoteActivationStore.state_dict is a STUB.")
+        # Convert stats to lists for JSON if saving them
+        cpu_input_means = {k: v.cpu().tolist() for k, v in self.input_means.items()}
+        cpu_input_stds = {k: v.cpu().tolist() for k, v in self.input_stds.items()}
+        cpu_output_means = {k: v.cpu().tolist() for k, v in self.output_means.items()}
+        cpu_output_stds = {k: v.cpu().tolist() for k, v in self.output_stds.items()}
+        return {
+            "store_type": "RemoteActivationStore",
+            "server_url": self.server_url,
+            "dataset_id": self.dataset_id,
+            "train_batch_size_tokens": self.train_batch_size_tokens,
+            "normalization_applied": self.apply_normalization,
+            "input_means": cpu_input_means,
+            "input_stds": cpu_input_stds,
+            "output_means": cpu_output_means,
+            "output_stds": cpu_output_stds,
+            # Add other relevant config needed for resumption
+        }
+
+    # Overrides BaseActivationStore.load_state_dict
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        """(STUB) Load state from a dictionary."""
+        logger.warning("RemoteActivationStore.load_state_dict is a STUB.")
+        if state_dict.get("store_type") != "RemoteActivationStore":
+            logger.warning("Attempting to load state from incompatible store type.")
+        # Restore config needed to reconnect
+        # self.server_url = state_dict["server_url"]
+        # self.dataset_id = state_dict["dataset_id"]
+        # self.train_batch_size_tokens = state_dict["train_batch_size_tokens"]
+        # Restore normalization state
+        self.apply_normalization = state_dict.get("normalization_applied", False)
+        self.input_means = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["input_means"].items()
+        }
+        self.input_stds = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["input_stds"].items()
+        }
+        self.output_means = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["output_means"].items()
+        }
+        self.output_stds = {
+            k: torch.tensor(v, device=self.device, dtype=self.dtype)
+            for k, v in state_dict["output_stds"].items()
+        }
+        logger.info("RemoteActivationStore state loaded (STUBBED).")
+        pass
