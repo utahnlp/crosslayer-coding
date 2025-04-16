@@ -26,58 +26,78 @@ pip install -e .
 
 ### Training a CLT via Script
 
-The easiest way to train a CLT is using the `train_clt.py` script (or potentially other scripts using the underlying config system). The configuration is typically managed via Hydra or a similar system, often defined in YAML files or via command-line overrides.
+The easiest way to train a CLT is using the `train_clt.py` script. This script parses configuration directly from command-line arguments.
 
-While the exact script invocation might vary, here's a conceptual example using command-line overrides based on the defined configuration classes:
+**Key Arguments:**
 
-```bash
-# Example assuming a script that maps CLI args to Hydra config
-# (Actual script interface might differ)
-python scripts/train_clt.py \
-    clt.num_features=12288 \
-    clt.activation_fn=jumprelu \
-    clt.jumprelu_threshold=0.03 \
-    train.learning_rate=1e-4 \
-    train.training_steps=50000 \
-    train.train_batch_size_tokens=4096 \
-    train.activation_source=generate \
-    train.generation_config.model_name=gpt2 \
-    train.generation_config.mlp_input_template="transformer.h.{}.mlp.c_fc" \
-    train.generation_config.mlp_output_template="transformer.h.{}.mlp.c_proj" \
-    train.generation_config.context_size=128 \
-    train.generation_config.inference_batch_size=512 \
-    train.dataset_params.dataset_path="monology/pile-uncopyrighted" \
-    train.dataset_params.dataset_split=train \
-    train.dataset_params.dataset_text_column=text \
-    train.n_batches_in_buffer=16 \
-    train.normalization_method=estimated_mean_std \
-    train.normalization_estimation_batches=50 \
-    train.sparsity_lambda=1e-3 \
-    train.log_interval=100 \
-    train.eval_interval=1000 \
-    train.checkpoint_interval=1000 \
-    train.enable_wandb=True \
-    train.wandb_project=clt-training
-    # +hydra.run.dir="outputs/clt_training_\$(now:%Y-%m-%d_%H-%M-%S)" # Example Hydra output dir
-```
+*   `--activation-source`: Must be `generate` or `local`.
+*   `--num-features`: Number of CLT features per layer.
+*   Arguments related to `CLTConfig`, `TrainingConfig`, and activation generation (prefixed appropriately, e.g., `--learning-rate`, `--model-name`, `--dataset-path`).
+*   `--activation-path`: Required only if `--activation-source=local`.
 
-To train using pre-generated local activations, you would change `train.activation_source` and provide `train.activation_path`:
+Run `python train_clt.py --help` for a full list of arguments and their defaults.
+
+**Example 1: Training with On-the-Fly Activation Generation (`generate`)**
+
+This mode streams data from a dataset, extracts activations, and trains the CLT concurrently.
 
 ```bash
-python scripts/train_clt.py \
-    # ... clt config ... \
-    train.activation_source=local \
-    train.activation_path="./activations/gpt2/pile-uncopyrighted_train" \
-    train.normalization_method=auto # Use norm_stats.json from activation_path if available \
-    # ... other training config ...
+python train_clt.py \
+    --activation-source generate \
+    --output-dir ./clt_output_generate \
+    --num-features 3072 \
+    --activation-fn jumprelu \
+    --learning-rate 3e-4 \
+    --training-steps 50000 \
+    --train-batch-size-tokens 4096 \
+    --sparsity-lambda 1e-3 \
+    --model-name gpt2 \
+    --mlp-input-template "transformer.h.{}.mlp.c_fc" \
+    --mlp-output-template "transformer.h.{}.mlp.c_proj" \
+    --dataset-path monology/pile-uncopyrighted \
+    --context-size 128 \
+    --inference-batch-size 512 \
+    --n-batches-in-buffer 16 \
+    --normalization-method auto \
+    --log-interval 100 \
+    --eval-interval 1000 \
+    --checkpoint-interval 1000 \
+    --enable-wandb --wandb-project clt-training-generate
+    # Add other arguments as needed
 ```
 
-Key configuration parameters (mapped to config classes):
-- **CLTConfig (`clt.*`)**: `num_features`, `num_layers`, `d_model`, `activation_fn`, `jumprelu_threshold`, `clt_dtype`.
-- **TrainingConfig (`train.*`)**: `learning_rate`, `training_steps`, `train_batch_size_tokens`, `activation_source`, `activation_path` (for local), `generation_config` (dict for generate), `dataset_params` (dict for generate), `remote_config` (dict for remote), `n_batches_in_buffer`, `normalization_method`, `normalization_estimation_batches`, `sparsity_lambda`, `preactivation_coef`, `optimizer`, `lr_scheduler`, `log_interval`, `eval_interval`, `checkpoint_interval`, `dead_feature_window`, WandB settings (`enable_wandb`, `wandb_project`, etc.).
-- **ActivationConfig (via `train.generation_config.*`)**: `model_name`, `mlp_input_module_path_template`, `mlp_output_module_path_template`, `dataset_path` (via `train.dataset_params`), `model_dtype`, `dataset_split`, `dataset_text_column`, `context_size`, `inference_batch_size`, `exclude_special_tokens`, `prepend_bos`, `streaming`, `cache_path`, `target_total_tokens`, `compute_norm_stats`, `nnsight_*` args.
+**Example 2: Training from Pre-Generated Local Activations (`local`)**
 
-*Note: The actual command-line arguments and structure depend on the specific training script and its argument parsing (e.g., using Hydra, `argparse`). Refer to the script's `--help` for details.*
+This mode requires activations to be generated beforehand (e.g., using `scripts/generate_activations.py`) and stored locally.
+
+```bash
+# First, generate activations (example command):
+# python scripts/generate_activations.py --model-name gpt2 --dataset-path monology/pile-uncopyrighted --activation-dir ./tutorial_activations --target-total-tokens 2000000
+
+# Then, train using the generated data:
+python train_clt.py \
+    --activation-source local \
+    --activation-path ./tutorial_activations/gpt2/pile-uncopyrighted_train \
+    --output-dir ./clt_output_local \
+    --model-name gpt2 \ # Still needed to determine model dimensions for CLTConfig
+    --num-features 3072 \
+    --activation-fn jumprelu \
+    --learning-rate 3e-4 \
+    --training-steps 50000 \
+    --train-batch-size-tokens 4096 \
+    --sparsity-lambda 1e-3 \
+    --normalization-method auto \ # Uses norm_stats.json if available
+    --log-interval 100 \
+    --eval-interval 1000 \
+    --checkpoint-interval 1000 \
+    --enable-wandb --wandb-project clt-training-local
+    # Add other arguments as needed
+```
+
+Key configuration parameters (mapped to config classes via script arguments):
+- **CLTConfig**: `--num-features`, `--activation-fn`, `--jumprelu-threshold`, `--clt-dtype`. (`num_layers`, `d_model` are derived from `--model-name`).
+- **TrainingConfig**: `--learning-rate`, `--training-steps`, `--train-batch-size-tokens`, `--activation-source`, `--activation-path` (for `local`), `--normalization-method`, `--normalization-estimation-batches`, `--sparsity-lambda`, `--preactivation-coef`, `--optimizer`, `--lr-scheduler`, `--log-interval`, `--eval-interval`, `--checkpoint-interval`, `--dead-feature-window`, WandB settings (`--enable-wandb`, `--wandb-project`, etc.). Specific config dicts (`generation_config`, `dataset_params`, `remote_config`) are constructed internally based on `--activation-source` and related arguments.
+- **Activation Generation Params** (used when `activation_source=generate`): `--model-name`, `--mlp-input-module-path-template`, `--mlp-output-module-path-template`, `--model-dtype`, `--dataset-path`, `--dataset-split`, `--dataset-text-column`, `--context-size`, `--inference-batch-size`, `--exclude-special-tokens`, `--prepend-bos`, `--streaming`, `--cache-path`, `--trust-remote-code`, etc.
 
 ### Library Structure
 

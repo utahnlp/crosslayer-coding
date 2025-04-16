@@ -411,7 +411,7 @@ class CLTTrainer:
                     "dataset_trust_remote_code", False
                 ),
                 cache_path=ds_params.get("cache_path"),
-                max_samples=ds_params.get("max_samples"),
+                # max_samples=ds_params.get("max_samples"), # max_samples is not a valid arg for stream_activations
             )
 
             # --- Create Streaming Store --- #

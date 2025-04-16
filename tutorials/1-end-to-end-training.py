@@ -22,6 +22,7 @@ import torch
 import os
 import time
 import sys
+import traceback
 
 # Import components from the clt library
 # (Ensure the 'clt' directory is in your Python path or installed)
@@ -214,8 +215,6 @@ else:
         )
     except Exception as gen_err:
         print(f"[ERROR] Activation generation failed: {gen_err}")
-        import traceback
-
         traceback.print_exc()
         raise
 
