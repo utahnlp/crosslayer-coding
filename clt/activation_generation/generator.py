@@ -728,63 +728,106 @@ class ActivationGenerator:
             logger.error(f"Chunk file {file_path} not found for upload.")
             return
 
-        try:
-            # Construct dataset_id
-            model_name = self.config.model_name
-            dataset_name = os.path.basename(self.config.dataset_path)
-            split = self.config.dataset_split
-            dataset_id = quote(f"{model_name}/{dataset_name}_{split}", safe="")
+        # Set a much longer timeout for large files (10 minutes)
+        timeout = 600
+        # Set max retries
+        max_retries = 3
+        retry_count = 0
 
-            # Construct target URL
-            base_url = self.config.remote_server_url.rstrip("/") + "/"
-            # Prepend /api/v1/
-            endpoint = f"api/v1/datasets/{dataset_id}/chunks/{chunk_idx}"
-            target_url = urljoin(base_url, endpoint)
+        while retry_count < max_retries:
+            try:
+                # Construct dataset_id
+                model_name = self.config.model_name
+                dataset_name = os.path.basename(self.config.dataset_path)
+                split = self.config.dataset_split
+                dataset_id = quote(f"{model_name}/{dataset_name}_{split}", safe="")
 
-            logger.info(
-                f"Sending chunk file {os.path.basename(file_path)} ({num_tokens} tokens) to {target_url}..."
-            )
-            start_send = time.time()
+                # Construct target URL
+                base_url = self.config.remote_server_url.rstrip("/") + "/"
+                # Prepend /api/v1/
+                endpoint = f"api/v1/datasets/{dataset_id}/chunks/{chunk_idx}"
+                target_url = urljoin(base_url, endpoint)
 
-            # Prepare headers
-            headers = {
-                # Content-Type is set automatically by requests for multipart
-                # "Content-Type": "application/x-hdf5",
-                "X-Num-Tokens": str(num_tokens),
-                "X-Saved-Dtype": saved_dtype_str,
-            }
-
-            # Read file bytes and send as multipart/form-data
-            with open(file_path, "rb") as f:
-                # Define the files dictionary for requests
-                files = {
-                    # Key matches the parameter name in the FastAPI endpoint
-                    "chunk_file": (os.path.basename(file_path), f, "application/x-hdf5")
-                }
-                # Send using the 'files' argument, remove 'data'
-                response = requests.post(
-                    target_url, files=files, headers=headers, timeout=120
-                )  # Increased timeout for large files
-
-            # Check response
-            if response.status_code == 201:
                 logger.info(
-                    f"Chunk file {os.path.basename(file_path)} successfully sent to server in {time.time() - start_send:.2f}s."
+                    f"Sending chunk file {os.path.basename(file_path)} ({num_tokens} tokens) to {target_url}..."
                 )
-            else:
+                if retry_count > 0:
+                    logger.info(f"Retry attempt {retry_count} of {max_retries}")
+
+                start_send = time.time()
+
+                # Prepare headers
+                headers = {
+                    # Content-Type is set automatically by requests for multipart
+                    # "Content-Type": "application/x-hdf5",
+                    "X-Num-Tokens": str(num_tokens),
+                    "X-Saved-Dtype": saved_dtype_str,
+                }
+
+                # Read file bytes and send as multipart/form-data
+                with open(file_path, "rb") as f:
+                    # Define the files dictionary for requests
+                    files = {
+                        # Key matches the parameter name in the FastAPI endpoint
+                        "chunk_file": (
+                            os.path.basename(file_path),
+                            f,
+                            "application/x-hdf5",
+                        )
+                    }
+                    # Send using the 'files' argument, remove 'data'
+                    response = requests.post(
+                        target_url, files=files, headers=headers, timeout=timeout
+                    )  # Using much longer timeout for large files
+
+                # Check response
+                if response.status_code == 201:
+                    logger.info(
+                        f"Chunk file {os.path.basename(file_path)} successfully sent to server in {time.time() - start_send:.2f}s."
+                    )
+                    return  # Success! Exit the function
+                else:
+                    logger.error(
+                        f"Failed to send chunk file {os.path.basename(file_path)}. Server responded with {response.status_code}: {response.text}"
+                    )
+                    # Increment retry count for non-200 responses
+                    retry_count += 1
+                    if retry_count < max_retries:
+                        # Wait before retrying (exponential backoff)
+                        wait_time = 2**retry_count
+                        logger.info(f"Waiting {wait_time} seconds before retrying...")
+                        time.sleep(wait_time)
+
+            except requests.exceptions.RequestException as e:
                 logger.error(
-                    f"Failed to send chunk file {os.path.basename(file_path)}. Server responded with {response.status_code}: {response.text}"
+                    f"Network error sending chunk file {os.path.basename(file_path)}: {e}",
+                    exc_info=True,
                 )
-        except requests.exceptions.RequestException as e:
-            logger.error(
-                f"Network error sending chunk file {os.path.basename(file_path)}: {e}",
-                exc_info=True,
-            )
-        except Exception as e:
-            logger.error(
-                f"Unexpected error sending chunk file {os.path.basename(file_path)}: {e}",
-                exc_info=True,
-            )
+                # Increment retry count for network errors
+                retry_count += 1
+                if retry_count < max_retries:
+                    # Wait before retrying (exponential backoff)
+                    wait_time = 2**retry_count
+                    logger.info(f"Waiting {wait_time} seconds before retrying...")
+                    time.sleep(wait_time)
+
+            except Exception as e:
+                logger.error(
+                    f"Unexpected error sending chunk file {os.path.basename(file_path)}: {e}",
+                    exc_info=True,
+                )
+                # For unexpected errors, increment retry count
+                retry_count += 1
+                if retry_count < max_retries:
+                    # Wait before retrying (exponential backoff)
+                    wait_time = 2**retry_count
+                    logger.info(f"Waiting {wait_time} seconds before retrying...")
+                    time.sleep(wait_time)
+
+        # If we get here, all retries have failed
+        logger.error(
+            f"All {max_retries} attempts to upload chunk file {os.path.basename(file_path)} failed."
+        )
 
     def _send_chunk_to_server(
         self, inputs_dict, targets_dict, chunk_idx, num_tokens, dataset_dir

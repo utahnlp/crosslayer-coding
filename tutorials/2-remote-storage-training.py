@@ -71,8 +71,8 @@ else:
 print(f"Using device: {device}")
 
 # --- Server Configuration --- #
-SERVER_HOST = "127.0.0.1"  # Run locally
-SERVER_PORT = 8001  # Use a different port than default 8000 just in case
+SERVER_HOST = "34.41.125.189"  # Run on remote server
+SERVER_PORT = 8000  # Use a different port than default 8000 just in case
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 HEALTH_CHECK_URL = urljoin(SERVER_URL, "/api/v1/health")
 # Ensure server uses a temporary directory for this tutorial
@@ -158,15 +158,17 @@ training_config = TrainingConfig(
     # Training loop parameters
     learning_rate=3e-4,
     training_steps=1000,  # Very few steps for tutorial
-    train_batch_size_tokens=16384,
+    train_batch_size_tokens=1024,
     # >> Key change: Activation source is remote <<
     activation_source="remote",
     # >> Key change: Provide remote config <<
     remote_config={
         "server_url": SERVER_URL,
         "dataset_id": dataset_id,  # Match generator output
-        # Can add other RemoteActivationStore params like timeout, prefetch_batches if needed
-        # "prefetch_batches": 2,
+        # Added timeout parameters for remote connections
+        "timeout": 120,  # 2 minutes timeout for batch fetching
+        "max_retries": 3,  # Number of retries for failed batch fetches
+        "prefetch_batches": 4,  # Prefetch more batches to handle potential timeouts
     },
     remote_prefetch_batches=16,
     # Normalization (Remote store handles fetching based on 'auto')
@@ -180,7 +182,7 @@ training_config = TrainingConfig(
     lr_scheduler="linear",
     # Logging & Checkpointing
     log_interval=10,
-    eval_interval=50 // 16,
+    eval_interval=50,
     checkpoint_interval=100,
     dead_feature_window=200,
     # WandB (Optional)
