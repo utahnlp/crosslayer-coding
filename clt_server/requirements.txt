@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-dotenv # For loading config from .env file
+pydantic-settings # Needed for core.config
+pytest-asyncio # For running async tests
+# torch - Install separately based on system/CUDA
+requests # Needed if server makes outbound calls (unlikely for now)
+aiofiles # For async file operations 

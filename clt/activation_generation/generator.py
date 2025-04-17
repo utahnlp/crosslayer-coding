@@ -8,6 +8,9 @@ import h5py  # Requires: pip install h5py
 from tqdm import tqdm
 from typing import Dict, List, Optional, Union, Tuple
 from dataclasses import asdict
+import requests  # Add requests import
+import io  # Add io import
+from urllib.parse import urljoin, quote  # Add urljoin and quote import
 
 from clt.nnsight.extractor import ActivationExtractorCLT
 from clt.config.data_config import ActivationConfig
@@ -126,6 +129,17 @@ class ActivationGenerator:
         Generates activations for the dataset specified in self.config and saves them.
         Uses parameters directly from self.config.
         """
+        # --- Enforce HDF5 for remote for now --- #
+        if self.storage_type == "remote" and self.config.output_format != "hdf5":
+            logger.warning(
+                f"Remote storage currently requires HDF5 format. Overriding output_format from '{self.config.output_format}' to 'hdf5'."
+            )
+            self.config.output_format = "hdf5"
+        elif self.config.output_format == "hdf5" and h5py is None:
+            raise ImportError(
+                "h5py library is required for HDF5 format. Please install it: pip install h5py"
+            )
+
         # Use parameters from self.config
         dataset_path = self.config.dataset_path
         dataset_split = self.config.dataset_split
@@ -178,7 +192,9 @@ class ActivationGenerator:
         stats_counts: Dict[int, Dict[str, int]] = {}
         stats_means: Dict[int, Dict[str, torch.Tensor]] = {}
         stats_m2s: Dict[int, Dict[str, torch.Tensor]] = {}
-        final_norm_stats: Dict[int, Dict[str, List[float]]] = {}  # Final results
+        final_norm_stats: Dict[int, Dict[str, Dict[str, List[float]]]] = (
+            {}
+        )  # Final results
 
         layer_indices: Optional[List[int]] = None
         d_model = -1
@@ -354,6 +370,7 @@ class ActivationGenerator:
 
         # --- Finalize and save norm stats (if computed) ---
         stats_were_computed = False
+        norm_stats_path = None  # Initialize path
         if compute_norm_stats and layer_indices and stats_counts:
             logger.info("\nComputing final normalization statistics...")
             final_norm_stats = self._finalize_welford(
@@ -404,6 +421,8 @@ class ActivationGenerator:
                 and stats_were_computed,  # Reflect if stats were actually saved
                 "generation_duration_seconds": end_time - start_time,
                 "generator_stopped_early": generator_stopped_early,
+                # Add format info for clarity
+                "output_format": self.config.output_format,
             },
             "creation_date": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
@@ -413,8 +432,15 @@ class ActivationGenerator:
                 # Use default=str to handle potential non-serializable types gracefully
                 json.dump(metadata, f, indent=2, default=str)
             logger.info(f"Metadata saved to {metadata_path}")
+            # Upload metadata if remote storage is enabled
+            if self.storage_type == "remote":
+                self._upload_json_file(metadata_path, "metadata", dataset_dir)
         except Exception as e:
-            logger.error(f"Error saving metadata: {e}", exc_info=True)
+            logger.error(f"Error saving or uploading metadata: {e}", exc_info=True)
+
+        # Upload norm stats after metadata (server might need metadata first)
+        if self.storage_type == "remote" and stats_were_computed and norm_stats_path:
+            self._upload_json_file(norm_stats_path, "norm_stats", dataset_dir)
 
         logger.info(
             f"Activation generation completed in {end_time - start_time:.2f} seconds."
@@ -458,6 +484,7 @@ class ActivationGenerator:
                 return
 
             logger.debug(f"Concatenating tensors for chunk {chunk_idx}...")
+            first_tensor_dtype_str = None  # Track dtype for HDF5 saving
             for i, layer_idx in enumerate(layer_indices):
                 if not chunk_inputs.get(
                     layer_idx
@@ -476,14 +503,24 @@ class ActivationGenerator:
 
                 inputs_cat = torch.cat(chunk_inputs[layer_idx], dim=0)
                 targets_cat = torch.cat(chunk_targets[layer_idx], dim=0)
-                # Convert back to original model dtype for saving space
-                if self.config.model_dtype:
+
+                # Store first tensor dtype for HDF5 attributes
+                if i == 0:
+                    first_tensor_dtype_str = str(inputs_cat.dtype)
+
+                # Convert back to original model dtype if specified, primarily for NPZ space saving
+                # HDF5 handles different dtypes per dataset well
+                if self.config.output_format == "npz" and self.config.model_dtype:
                     try:
                         save_dtype = getattr(
                             torch, self.config.model_dtype.split(".")[-1]
                         )
                         inputs_cat = inputs_cat.to(save_dtype)
                         targets_cat = targets_cat.to(save_dtype)
+                        if i == 0:
+                            first_tensor_dtype_str = str(
+                                save_dtype
+                            )  # Update if converted
                     except AttributeError:
                         logger.warning(
                             f"Could not parse model_dtype '{self.config.model_dtype}' "
@@ -523,90 +560,78 @@ class ActivationGenerator:
         logger.info(
             f"Saving chunk {chunk_idx} ({num_tokens} tokens) to {self.storage_type}..."
         )
+        # Pass dtype info to savers
+        saved_dtype_str = first_tensor_dtype_str or "unknown"
+
         if self.storage_type == "local":
             self._save_chunk_local(
-                processed_inputs, processed_targets, dataset_dir, chunk_idx, num_tokens
+                processed_inputs,
+                processed_targets,
+                dataset_dir,
+                chunk_idx,
+                num_tokens,
+                saved_dtype_str,
             )
         elif self.storage_type == "remote":
-            # Generate locally first, then send (stubbed)
-            self._save_chunk_local(
-                processed_inputs, processed_targets, dataset_dir, chunk_idx, num_tokens
-            )
-            self._send_chunk_to_server(processed_inputs, processed_targets, chunk_idx)
+            # For remote, we need to save as HDF5 temporarily to get bytes to send
+            # unless we implement direct HDF5 byte streaming
+            temp_h5_path = os.path.join(dataset_dir, f"_temp_chunk_{chunk_idx}.h5")
+            try:
+                self._save_chunk_hdf5(
+                    temp_h5_path,
+                    processed_inputs,
+                    processed_targets,
+                    num_tokens,
+                    saved_dtype_str,
+                )
+                # Send the HDF5 file bytes
+                self._send_chunk_file_to_server(
+                    temp_h5_path, chunk_idx, num_tokens, dataset_dir, saved_dtype_str
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error during remote processing/sending chunk {chunk_idx}: {e}",
+                    exc_info=True,
+                )
+            finally:
+                # Clean up temporary HDF5 file
+                if os.path.exists(temp_h5_path):
+                    try:
+                        os.remove(temp_h5_path)
+                        logger.debug(f"Removed temporary HDF5 file: {temp_h5_path}")
+                    except OSError as rm_err:
+                        logger.error(
+                            f"Error removing temporary HDF5 file {temp_h5_path}: {rm_err}"
+                        )
+
+            # Optionally still save locally in the configured format if needed for backup/inspection
+            # self._save_chunk_local(
+            #     processed_inputs, processed_targets, dataset_dir, chunk_idx, num_tokens, saved_dtype_str
+            # )
 
     def _save_chunk_local(
-        self, inputs_dict, targets_dict, dataset_dir, chunk_idx, num_tokens
+        self,
+        inputs_dict,
+        targets_dict,
+        dataset_dir,
+        chunk_idx,
+        num_tokens,
+        saved_dtype_str,
     ):
-        """Saves a processed chunk to disk (HDF5 or NPZ)."""
+        """Saves a processed chunk to disk locally (HDF5 or NPZ)."""
         chunk_file_base = os.path.join(dataset_dir, f"chunk_{chunk_idx}")
         save_path = f"{chunk_file_base}.{self.config.output_format}"
         start_save = time.time()
 
         try:
             if self.config.output_format == "hdf5":
-                with h5py.File(save_path, "w") as f:
-                    f.attrs["num_tokens"] = num_tokens
-                    # Optionally store the saved dtype as an attribute
-                    if inputs_dict:
-                        first_layer = next(iter(inputs_dict))
-                        f.attrs["saved_dtype"] = str(inputs_dict[first_layer].dtype)
-
-                    for layer_idx, tensor in inputs_dict.items():
-                        # Check if targets exist for this layer before saving
-                        if layer_idx not in targets_dict:
-                            logger.warning(
-                                f"Skipping HDF5 save for layer {layer_idx} in chunk {chunk_idx}: "
-                                f"missing target tensor."
-                            )
-                            continue
-                        group = f.create_group(f"layer_{layer_idx}")
-                        group.create_dataset(
-                            "inputs",
-                            data=tensor.numpy(),
-                            compression=self.config.compression,
-                        )
-                        group.create_dataset(
-                            "targets",
-                            data=targets_dict[layer_idx].numpy(),
-                            compression=self.config.compression,
-                        )
-
+                self._save_chunk_hdf5(
+                    save_path, inputs_dict, targets_dict, num_tokens, saved_dtype_str
+                )
             elif self.config.output_format == "npz":
-                save_dict = {"num_tokens": np.array(num_tokens)}
-                # Optionally store saved dtype
-                if inputs_dict:
-                    first_layer = next(iter(inputs_dict))
-                    save_dict["saved_dtype"] = str(inputs_dict[first_layer].dtype)
-
-                for layer_idx, tensor in inputs_dict.items():
-                    if layer_idx not in targets_dict:
-                        logger.warning(
-                            f"Skipping NPZ save for layer {layer_idx} in chunk {chunk_idx}: "
-                            f"missing target tensor."
-                        )
-                        continue
-                    save_dict[f"layer_{layer_idx}_inputs"] = tensor.numpy()
-                    save_dict[f"layer_{layer_idx}_targets"] = targets_dict[
-                        layer_idx
-                    ].numpy()
-
-                if not save_dict:  # Don't save empty npz
-                    logger.warning(
-                        f"NPZ save dictionary for chunk {chunk_idx} is empty. "
-                        f"Skipping save."
-                    )
-                    return
-
-                if self.config.compression:
-                    # Note: np.savez_compressed uses zipfile with DEFLATE (like gzip)
-                    # It doesn't directly support lz4.
-                    if self.config.compression == "lz4":
-                        logger.warning(
-                            "LZ4 compression not directly supported for NPZ. Using default DEFLATE."
-                        )
-                    np.savez_compressed(save_path, **save_dict)
-                else:
-                    np.savez(save_path, **save_dict)
+                self._save_chunk_npz(
+                    save_path, inputs_dict, targets_dict, num_tokens, saved_dtype_str
+                )
 
             logger.info(
                 f"Chunk {chunk_idx} saved locally to {save_path} in {time.time() - start_save:.2f}s"
@@ -627,17 +652,263 @@ class ActivationGenerator:
                         f"Error removing partially written file {save_path}: {rm_err}"
                     )
 
-    def _send_chunk_to_server(self, inputs_dict, targets_dict, chunk_idx):
-        """(STUB) Placeholder for sending a processed chunk to a remote server."""
-        logger.info(
-            f"[STUB] Preparing to send chunk {chunk_idx} to remote server... (Not implemented)"
+    def _save_chunk_hdf5(
+        self, save_path: str, inputs_dict, targets_dict, num_tokens, saved_dtype_str
+    ):
+        """Saves a single chunk to an HDF5 file."""
+        with h5py.File(save_path, "w") as f:
+            f.attrs["num_tokens"] = num_tokens
+            f.attrs["saved_dtype"] = saved_dtype_str
+            for layer_idx, tensor in inputs_dict.items():
+                if layer_idx not in targets_dict:
+                    logger.warning(
+                        f"Skipping HDF5 save for layer {layer_idx} in {os.path.basename(save_path)}: missing target tensor."
+                    )
+                    continue
+                group = f.create_group(f"layer_{layer_idx}")
+                # Convert PyTorch tensor to NumPy array for saving
+                group.create_dataset(
+                    "inputs",
+                    data=tensor.numpy(),
+                    compression=self.config.compression,
+                    # Optional: Add chunking/shuffling for potentially better read perf
+                    # chunks=(64, tensor.shape[1]) if tensor.ndim == 2 else True,
+                    # shuffle=True
+                )
+                group.create_dataset(
+                    "targets",
+                    data=targets_dict[layer_idx].numpy(),
+                    compression=self.config.compression,
+                    # chunks=(64, targets_dict[layer_idx].shape[1]) if targets_dict[layer_idx].ndim == 2 else True,
+                    # shuffle=True
+                )
+
+    def _save_chunk_npz(
+        self, save_path: str, inputs_dict, targets_dict, num_tokens, saved_dtype_str
+    ):
+        """Saves a single chunk to an NPZ file."""
+        save_dict = {"num_tokens": np.array(num_tokens), "saved_dtype": saved_dtype_str}
+        for layer_idx, tensor in inputs_dict.items():
+            if layer_idx not in targets_dict:
+                logger.warning(
+                    f"Skipping NPZ save for layer {layer_idx} in {os.path.basename(save_path)}: missing target tensor."
+                )
+                continue
+            save_dict[f"layer_{layer_idx}_inputs"] = tensor.numpy()
+            save_dict[f"layer_{layer_idx}_targets"] = targets_dict[layer_idx].numpy()
+
+        if len(save_dict) <= 2:  # Only contains num_tokens and dtype
+            logger.warning(
+                f"NPZ save dictionary for {os.path.basename(save_path)} is effectively empty. Skipping save."
+            )
+            return
+
+        if self.config.compression:
+            if self.config.compression == "lz4":
+                logger.warning(
+                    "LZ4 compression not directly supported for NPZ. Using default DEFLATE."
+                )
+            np.savez_compressed(save_path, **save_dict)
+        else:
+            np.savez(save_path, **save_dict)
+
+    def _send_chunk_file_to_server(
+        self,
+        file_path: str,
+        chunk_idx: int,
+        num_tokens: int,
+        dataset_dir: str,
+        saved_dtype_str: str,
+    ):
+        """Sends a pre-saved chunk file (e.g., HDF5) to the remote server."""
+        if not self.config.remote_server_url:
+            logger.error("Remote server URL not configured. Cannot send chunk file.")
+            return
+        if not os.path.exists(file_path):
+            logger.error(f"Chunk file {file_path} not found for upload.")
+            return
+
+        try:
+            # Construct dataset_id
+            model_name = self.config.model_name
+            dataset_name = os.path.basename(self.config.dataset_path)
+            split = self.config.dataset_split
+            dataset_id = quote(f"{model_name}/{dataset_name}_{split}", safe="")
+
+            # Construct target URL
+            base_url = self.config.remote_server_url.rstrip("/") + "/"
+            # Prepend /api/v1/
+            endpoint = f"api/v1/datasets/{dataset_id}/chunks/{chunk_idx}"
+            target_url = urljoin(base_url, endpoint)
+
+            logger.info(
+                f"Sending chunk file {os.path.basename(file_path)} ({num_tokens} tokens) to {target_url}..."
+            )
+            start_send = time.time()
+
+            # Prepare headers
+            headers = {
+                # Content-Type is set automatically by requests for multipart
+                # "Content-Type": "application/x-hdf5",
+                "X-Num-Tokens": str(num_tokens),
+                "X-Saved-Dtype": saved_dtype_str,
+            }
+
+            # Read file bytes and send as multipart/form-data
+            with open(file_path, "rb") as f:
+                # Define the files dictionary for requests
+                files = {
+                    # Key matches the parameter name in the FastAPI endpoint
+                    "chunk_file": (os.path.basename(file_path), f, "application/x-hdf5")
+                }
+                # Send using the 'files' argument, remove 'data'
+                response = requests.post(
+                    target_url, files=files, headers=headers, timeout=120
+                )  # Increased timeout for large files
+
+            # Check response
+            if response.status_code == 201:
+                logger.info(
+                    f"Chunk file {os.path.basename(file_path)} successfully sent to server in {time.time() - start_send:.2f}s."
+                )
+            else:
+                logger.error(
+                    f"Failed to send chunk file {os.path.basename(file_path)}. Server responded with {response.status_code}: {response.text}"
+                )
+        except requests.exceptions.RequestException as e:
+            logger.error(
+                f"Network error sending chunk file {os.path.basename(file_path)}: {e}",
+                exc_info=True,
+            )
+        except Exception as e:
+            logger.error(
+                f"Unexpected error sending chunk file {os.path.basename(file_path)}: {e}",
+                exc_info=True,
+            )
+
+    def _send_chunk_to_server(
+        self, inputs_dict, targets_dict, chunk_idx, num_tokens, dataset_dir
+    ):
+        """(DEPRECATED - use _send_chunk_file_to_server) Sends a processed chunk to the remote activation server using torch.save bytes."""
+        logger.warning(
+            "_send_chunk_to_server using torch.save is deprecated. Use HDF5 and _send_chunk_file_to_server instead."
         )
-        # --- Future implementation ---
-        # 1. Serialize the inputs_dict and targets_dict (e.g., using torch.save or custom format)
-        # 2. Connect to the ActivationStorageServer endpoint
-        # 3. Send the serialized data (potentially with metadata like chunk_idx, model_name, dataset_id)
-        # 4. Handle response/confirmation from the server
-        pass  # Do nothing for now
+        # ... (previous implementation using torch.save remains here but marked deprecated) ...
+        if not self.config.remote_server_url:
+            logger.error("Remote server URL not configured. Cannot send chunk.")
+            return
+
+        try:
+            # Construct dataset_id (e.g., model_name/dataset_name_split)
+            model_name = self.config.model_name
+            dataset_name = os.path.basename(self.config.dataset_path)
+            split = self.config.dataset_split
+            # URL-encode the dataset_id to handle characters like '/'
+            dataset_id = quote(f"{model_name}/{dataset_name}_{split}", safe="")
+
+            # Construct target URL
+            # Ensure base URL ends with / and join paths
+            base_url = self.config.remote_server_url.rstrip("/") + "/"
+            endpoint = f"datasets/{dataset_id}/chunks/{chunk_idx}"
+            target_url = urljoin(base_url, endpoint)
+
+            logger.info(
+                f"Sending chunk {chunk_idx} ({num_tokens} tokens) to {target_url} via torch.save..."
+            )
+            start_send = time.time()
+
+            # Prepare payload (serialize dictionary of tensors)
+            payload_dict = {"inputs": inputs_dict, "targets": targets_dict}
+            buffer = io.BytesIO()
+            torch.save(payload_dict, buffer)
+            buffer.seek(0)
+            payload_bytes = buffer.read()
+            del buffer  # Free buffer memory
+
+            # Prepare headers
+            headers = {
+                "Content-Type": "application/octet-stream",  # Indicate torch.save bytes
+                "X-Num-Tokens": str(num_tokens),
+            }
+
+            # Send request
+            response = requests.post(
+                target_url, data=payload_bytes, headers=headers, timeout=60
+            )  # 60s timeout
+
+            # Check response
+            if response.status_code == 201:
+                logger.info(
+                    f"Chunk {chunk_idx} successfully sent to server (torch.save format) in {time.time() - start_send:.2f}s."
+                )
+            else:
+                logger.error(
+                    f"Failed to send chunk {chunk_idx} (torch.save format). Server responded with {response.status_code}: {response.text}"
+                )
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error sending chunk {chunk_idx}: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(
+                f"Unexpected error sending chunk {chunk_idx}: {e}", exc_info=True
+            )
+
+    def _upload_json_file(self, file_path: str, file_type: str, dataset_dir: str):
+        """Reads a JSON file and uploads its content to the server."""
+        if not self.config.remote_server_url:
+            logger.error(
+                f"Remote server URL not configured. Cannot upload {file_type}."
+            )
+            return
+        if not os.path.exists(file_path):
+            logger.error(
+                f"{file_type.capitalize()} file not found at {file_path}. Cannot upload."
+            )
+            return
+
+        try:
+            # Construct dataset_id
+            model_name = self.config.model_name
+            dataset_name = os.path.basename(self.config.dataset_path)
+            split = self.config.dataset_split
+            dataset_id = quote(f"{model_name}/{dataset_name}_{split}", safe="")
+
+            # Construct target URL
+            base_url = self.config.remote_server_url.rstrip("/") + "/"
+            # Prepend /api/v1/
+            endpoint = f"api/v1/datasets/{dataset_id}/{file_type}"  # file_type is 'metadata' or 'norm_stats'
+            target_url = urljoin(base_url, endpoint)
+
+            logger.info(f"Uploading {file_type} from {file_path} to {target_url}...")
+
+            # Read file content
+            with open(file_path, "r") as f:
+                json_data = json.load(f)
+
+            # Prepare headers
+            headers = {"Content-Type": "application/json"}
+
+            # Send request
+            response = requests.post(
+                target_url, json=json_data, headers=headers, timeout=30
+            )
+
+            # Check response
+            if response.status_code in [200, 201]:
+                logger.info(
+                    f"{file_type.capitalize()} successfully uploaded to server."
+                )
+            else:
+                logger.error(
+                    f"Failed to upload {file_type}. Server responded with {response.status_code}: {response.text}"
+                )
+
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Network error uploading {file_type}: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            logger.error(f"Error reading JSON from {file_path}: {e}", exc_info=True)
+        except Exception as e:
+            logger.error(f"Unexpected error uploading {file_type}: {e}", exc_info=True)
 
     def close(self):
         """Clean up resources, like the nnsight model."""
@@ -664,7 +935,7 @@ class ActivationGenerator:
                                      'targets': {'mean': list, 'std': list}}}
             Returns empty dict if no stats were computed.
         """
-        final_stats = {}
+        final_stats: Dict[int, Dict[str, Dict[str, List[float]]]] = {}
         if not counts:  # No stats computed
             return final_stats
 

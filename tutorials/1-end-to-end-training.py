@@ -154,7 +154,7 @@ training_config = TrainingConfig(
     # Normalization for training (use stored stats)
     normalization_method="auto",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
-    sparsity_lambda=0.00003,
+    sparsity_lambda=0.00001,
     sparsity_c=1.0,
     preactivation_coef=3e-6,
     # Optimizer & Scheduler

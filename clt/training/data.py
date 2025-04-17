@@ -12,8 +12,10 @@ import json
 import numpy as np
 import h5py  # Requires pip install h5py
 import requests  # Requires pip install requests
-from threading import Thread
-from queue import Queue, Empty
+from threading import Thread, Event
+from queue import Queue, Empty, Full
+from urllib.parse import urljoin, quote  # Add quote and urljoin
+import io
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -661,7 +663,7 @@ class StreamingActivationStore(BaseActivationStore):
         }
 
     # Overrides BaseActivationStore.load_state_dict
-    def load_state_dict(self, state_dict: Dict):
+    def load_state_dict(self, state_dict: Dict[str, Any]):
         """Load state. Requires a new generator to be provided externally."""
         if state_dict.get("store_type") != "StreamingActivationStore":
             logger.warning("Attempting to load state from incompatible store type.")
@@ -1211,7 +1213,7 @@ class MappedActivationStore(BaseActivationStore):
 
 
 class RemoteActivationStore(BaseActivationStore):
-    """(STUB) Client for retrieving pre-generated activations from a remote server."""
+    """Client for retrieving pre-generated activations from a remote server."""
 
     # Type hints for instance variables
     server_url: str
@@ -1225,27 +1227,34 @@ class RemoteActivationStore(BaseActivationStore):
     input_stds: Dict[int, torch.Tensor]
     output_means: Dict[int, torch.Tensor]
     output_stds: Dict[int, torch.Tensor]
+    metadata: Optional[Dict[str, Any]]  # Store fetched metadata
     prefetch_queue: Queue
-    prefetch_thread: Thread
+    prefetch_thread: Optional[Thread]
+    stop_event: Event
+    # Flag to indicate if the server has signaled end of data
+    _server_exhausted: bool = False
 
     def __init__(
         self,
         server_url: str,
         dataset_id: str,  # e.g., "gpt2/openwebtext_train"
         train_batch_size_tokens: int = 4096,
-        prefetch_batches: int = 2,
+        prefetch_batches: int = 4,  # Add prefetch param back, default to 4
         layer_indices_to_fetch: Optional[List[int]] = None,
         normalization: Union[
             str, bool
         ] = "auto",  # 'auto', 'none', False, or path to local JSON stats
         device: Optional[Union[str, torch.device]] = None,
-        timeout: int = 30,
+        timeout: int = 60,  # Increase default timeout for potentially large batch requests
     ):
-        """Initialize the remote activation store client (stubbed)."""
+        """Initialize the remote activation store client."""
         self.server_url = server_url.rstrip("/")
-        self.dataset_id = dataset_id
+        # URL-encode dataset_id for safe use in URLs
+        self.dataset_id_encoded = quote(dataset_id, safe="")
+        self.dataset_id_original = dataset_id  # Keep original for logging
+
         self.train_batch_size_tokens = train_batch_size_tokens  # From Base
-        self.prefetch_batches = prefetch_batches
+        self.prefetch_batches = max(1, prefetch_batches)  # Ensure at least 1
         self.requested_layer_indices = layer_indices_to_fetch
         self.normalization_mode = normalization
         self.timeout = timeout
@@ -1260,127 +1269,502 @@ class RemoteActivationStore(BaseActivationStore):
             else _device_input
         )  # From Base
 
-        logger.warning("RemoteActivationStore is currently a STUB and not functional.")
+        logger.info(
+            f"Initializing RemoteActivationStore for {self.dataset_id_original} at {self.server_url}"
+        )
 
-        # --- Set Base attributes (placeholders until metadata fetch works) ---
-        self.layer_indices = []  # From Base - Placeholder
-        self.d_model = -1  # From Base - Placeholder
-        self.dtype = torch.float32  # From Base - Placeholder
-        self.total_tokens = 0  # From Base - Placeholder
+        # --- Set Base attributes (will be updated by metadata fetch) ---
+        self.layer_indices = []
+        self.d_model = -1
+        self.dtype = torch.float32
+        self.total_tokens = 0
+        self.metadata = None  # Initialize metadata
 
-        # --- Fetch metadata (STUBBED) ---
+        # --- Fetch metadata --- #
         try:
             self.metadata = self._fetch_metadata()
-            # --- Update Base attributes from real metadata ---
-            self.layer_indices = self.metadata.get("dataset_stats", {}).get(
-                "layer_indices", []
-            )
-            self.d_model = self.metadata.get("dataset_stats", {}).get("d_model", -1)
-            dtype_str = self.metadata.get("generation_params", {}).get(
-                "dtype", str(torch.float32)
-            )
-            self.dtype = getattr(torch, dtype_str.split(".")[-1], torch.float32)
-            self.total_tokens = self.metadata.get("dataset_stats", {}).get(
-                "total_tokens", 0
-            )
-            logger.info("Successfully fetched metadata (STUB - Check Implementation).")
-        except NotImplementedError:
-            self.metadata = {}
-            logger.error(
-                "Metadata fetching is not implemented. Store may not function correctly."
-            )
-        except Exception as e:
-            self.metadata = {}
-            logger.error(
-                f"Failed to fetch or parse metadata during init: {e}. Store may not function correctly."
-            )
+            # --- Update Base attributes from fetched metadata --- #
+            if self.metadata:
+                dataset_stats = self.metadata.get("dataset_stats", {})
+                activation_config = self.metadata.get("activation_config", {})
 
-        # --- Load normalization stats (STUBBED) ---
+                self.layer_indices = dataset_stats.get("layer_indices", [])
+                self.d_model = dataset_stats.get("d_model", -1)
+                # Use total_tokens_generated if available, else try old key
+                self.total_tokens = dataset_stats.get(
+                    "total_tokens_generated", dataset_stats.get("total_tokens", 0)
+                )
+                # Get dtype string from dataset_stats or activation_config
+                dtype_str = dataset_stats.get(
+                    "dtype", activation_config.get("model_dtype", str(torch.float32))
+                )
+                try:
+                    self.dtype = getattr(torch, dtype_str.split(".")[-1])
+                except AttributeError:
+                    logger.warning(
+                        f"Could not parse dtype '{dtype_str}' from metadata, defaulting to float32."
+                    )
+                    self.dtype = torch.float32
+
+                logger.info(
+                    f"Successfully fetched metadata: Layers={self.layer_indices}, "
+                    f"d_model={self.d_model}, dtype={self.dtype}, TotalTokens={self.total_tokens:,}"
+                )
+            else:
+                logger.error(
+                    "Metadata fetch returned None. Store initialization incomplete."
+                )
+                # Optionally raise an error here
+
+        except (requests.exceptions.RequestException, RuntimeError, ValueError) as e:
+            logger.error(f"Failed to fetch or parse metadata during init: {e}")
+            # Decide how to handle: raise error? operate without metadata?
+            # For now, log error and continue with defaults
+            self.metadata = None
+        except Exception as e:
+            logger.error(f"Unexpected error during metadata fetch: {e}", exc_info=True)
+            self.metadata = None
+
+        # If layer indices were not set by metadata, log warning
+        if not self.layer_indices:
+            logger.warning("Could not determine layer indices from server metadata.")
+        # If specific layers requested, validate against available layers
+        if self.requested_layer_indices is not None and self.layer_indices:
+            invalid_layers = set(self.requested_layer_indices) - set(self.layer_indices)
+            if invalid_layers:
+                logger.warning(
+                    f"Requested layers {invalid_layers} not available in dataset layers {self.layer_indices}."
+                )
+                # Filter requested layers to only those available
+                self.requested_layer_indices = [
+                    l for l in self.requested_layer_indices if l in self.layer_indices
+                ]
+                logger.info(f"Fetching layers: {self.requested_layer_indices}")
+
+        # --- Load normalization stats --- #
         self.input_means, self.input_stds = {}, {}
         self.output_means, self.output_stds = {}, {}
-        self.apply_normalization = self._load_normalization_stats()  # Stubbed
+        self.apply_normalization = (
+            self._load_normalization_stats()
+        )  # Call implementation
 
-        # --- Prefetching Queue (STUBBED) ---
-        # self.prefetch_queue = Queue(maxsize=self.prefetch_batches)
-        # self.prefetch_thread = Thread(target=self._prefetch_worker, daemon=True)
-        # self.prefetch_thread.start()
+        # --- Prefetching --- #
+        self.prefetch_queue = Queue(maxsize=self.prefetch_batches)
+        self.stop_event = Event()
+        self._server_exhausted = False  # Initialize flag
+        self.prefetch_thread = Thread(target=self._prefetch_worker, daemon=True)
+        self.prefetch_thread.start()
 
-        logger.info(
-            f"RemoteActivationStore initialized for {dataset_id} at {server_url} (STUBBED)"
+        logger.info(f"RemoteActivationStore initialization finished.")
+
+    def _fetch_metadata(self) -> Optional[Dict[str, Any]]:
+        """Fetch dataset metadata from the server."""
+        # Construct URL using the encoded dataset ID
+        url = urljoin(
+            f"{self.server_url}/api/v1/datasets/", f"{self.dataset_id_encoded}/info"
         )
+        logger.debug(f"Fetching metadata from: {url}")
+        try:
+            response = requests.get(url, timeout=self.timeout)
+            response.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch metadata from {url}: {e}")
+            # Optionally return None or raise a custom exception
+            raise RuntimeError(f"Failed to fetch metadata from server: {e}")
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode metadata JSON from {url}: {e}")
+            raise RuntimeError(f"Invalid metadata format received from server: {e}")
 
-    def _fetch_metadata(self) -> Dict[str, Any]:
-        """(STUB) Fetch dataset metadata from the server."""
-        # --- Replace with actual implementation later --- #
-        # url = f"{self.server_url}/datasets/{self.dataset_id}/info"
-        # try:
-        #     response = requests.get(url, timeout=self.timeout)
-        #     response.raise_for_status()
-        #     return response.json()
-        # except requests.exceptions.RequestException as e:
-        #     logger.error(f"Failed to fetch metadata from {url}: {e}")
-        #     raise RuntimeError(f"Failed to fetch metadata from {url}: {e}")
-        # ---------------------------------------------- #
-        logger.error("RemoteActivationStore._fetch_metadata is not implemented.")
-        raise NotImplementedError("_fetch_metadata not implemented yet.")
+    def _fetch_norm_stats_remote(self) -> Optional[Dict[str, Any]]:
+        """Fetch normalization stats from the server."""
+        url = urljoin(
+            f"{self.server_url}/api/v1/datasets/",
+            f"{self.dataset_id_encoded}/norm_stats",
+        )
+        logger.debug(f"Fetching normalization stats from: {url}")
+        try:
+            response = requests.get(url, timeout=self.timeout)
+            if response.status_code == 404:
+                logger.info(
+                    f"Normalization stats not found on server for {self.dataset_id_original}."
+                )
+                return None
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to fetch normalization stats from {url}: {e}")
+            return None  # Don't prevent startup if stats fetch fails
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode norm_stats JSON from {url}: {e}")
+            return None
 
     def _load_normalization_stats(self) -> bool:
-        """(STUB) Load normalization stats based on self.normalization_mode."""
-        # --- Replace with actual implementation later --- #
-        # Logic to fetch norm_stats.json from server if mode is 'auto',
-        # or load from local path if specified.
-        # Update self.input_means, self.input_stds, etc.
-        # ---------------------------------------------- #
-        logger.error(
-            "RemoteActivationStore._load_normalization_stats is not implemented."
-        )
-        # raise NotImplementedError("_load_normalization_stats not implemented yet.")
-        return False  # Assume no normalization for stub
+        """Load normalization stats based on self.normalization_mode."""
+        norm_stats_data = None
+        source_description = ""
 
-    def _apply_normalization(self, inputs, targets):
-        """(STUB) Applies normalization if enabled."""
+        if self.normalization_mode == "auto":
+            logger.info(
+                "Normalization set to 'auto', attempting to fetch from server..."
+            )
+            norm_stats_data = self._fetch_norm_stats_remote()
+            source_description = "remote server"
+            if norm_stats_data is None:
+                logger.warning("Could not fetch normalization stats from server.")
+
+        elif isinstance(self.normalization_mode, str) and os.path.exists(
+            self.normalization_mode
+        ):
+            logger.info(
+                f"Loading normalization stats from local file: {self.normalization_mode}"
+            )
+            source_description = f"local file ({self.normalization_mode})"
+            try:
+                with open(self.normalization_mode, "r") as f:
+                    norm_stats_data = json.load(f)
+            except Exception as e:
+                logger.error(
+                    f"Error loading normalization stats from {self.normalization_mode}: {e}"
+                )
+                norm_stats_data = None
+
+        elif self.normalization_mode == "none" or self.normalization_mode is False:
+            logger.info("Normalization explicitly disabled.")
+            return False
+        else:
+            logger.warning(
+                f"Invalid normalization mode or file not found: '{self.normalization_mode}'. Disabling normalization."
+            )
+            return False
+
+        # Process loaded/fetched stats
+        if norm_stats_data:
+            logger.info(
+                f"Processing normalization statistics from {source_description}..."
+            )
+            stats_loaded_count = 0
+            try:
+                # Ensure layer_indices is populated before processing stats
+                if not self.layer_indices:
+                    logger.warning(
+                        "Layer indices not available from metadata, cannot load normalization stats."
+                    )
+                    return False
+
+                for layer_idx_str, stats in norm_stats_data.items():
+                    try:
+                        layer_idx = int(layer_idx_str)
+                    except ValueError:
+                        logger.warning(
+                            f"Skipping invalid layer index '{layer_idx_str}' in normalization stats."
+                        )
+                        continue
+
+                    if layer_idx in self.layer_indices:
+                        # Convert list back to tensor, add batch dim, move to device, set dtype
+                        if (
+                            stats.get("input_mean") is not None
+                            and stats.get("input_std") is not None
+                        ):
+                            self.input_means[layer_idx] = torch.tensor(
+                                stats["input_mean"],
+                                device=self.device,
+                                dtype=self.dtype,  # Use dtype determined from metadata
+                            ).unsqueeze(0)
+                            self.input_stds[layer_idx] = (
+                                torch.tensor(
+                                    stats["input_std"],
+                                    device=self.device,
+                                    dtype=self.dtype,
+                                ).unsqueeze(0)
+                                + 1e-6
+                            )
+                        if (
+                            stats.get("output_mean") is not None
+                            and stats.get("output_std") is not None
+                        ):
+                            self.output_means[layer_idx] = torch.tensor(
+                                stats["output_mean"],
+                                device=self.device,
+                                dtype=self.dtype,
+                            ).unsqueeze(0)
+                            self.output_stds[layer_idx] = (
+                                torch.tensor(
+                                    stats["output_std"],
+                                    device=self.device,
+                                    dtype=self.dtype,
+                                ).unsqueeze(0)
+                                + 1e-6
+                            )
+                        stats_loaded_count += 1
+                    else:
+                        logger.warning(
+                            f"Layer index {layer_idx} from norm stats not found in dataset layers {self.layer_indices}. Skipping."
+                        )
+
+                if stats_loaded_count > 0:
+                    logger.info(
+                        f"Normalization statistics loaded for {stats_loaded_count} layers. Normalization enabled."
+                    )
+                    return True
+                else:
+                    logger.warning(
+                        "Normalization stats found but contained no matching layer data. Normalization disabled."
+                    )
+                    return False
+
+            except Exception as e:
+                logger.error(
+                    f"Error processing normalization stats: {e}. Disabling normalization.",
+                    exc_info=True,
+                )
+                return False
+        else:
+            logger.info("No normalization statistics loaded. Normalization disabled.")
+            return False
+
+    def _apply_normalization(self, batch_inputs, batch_targets):
+        """Applies normalization if enabled and stats are available."""
         if not self.apply_normalization:
-            return inputs, targets
-        # --- Replace with actual implementation later --- #
+            return batch_inputs, batch_targets
+
         norm_inputs = {}
         norm_targets = {}
-        for layer_idx in inputs.keys():
-            inp = inputs[layer_idx]
-            tgt = targets[layer_idx]
-            if layer_idx in self.input_means:
+        for (
+            layer_idx
+        ) in batch_inputs.keys():  # Iterate over layers present in the batch
+            inp = batch_inputs[layer_idx]
+            tgt = batch_targets.get(
+                layer_idx
+            )  # Targets might be missing if only inputs requested?
+
+            # Ensure tensors are on the correct device before normalization
+            inp = inp.to(self.device)
+
+            if layer_idx in self.input_means and layer_idx in self.input_stds:
                 inp = (inp - self.input_means[layer_idx]) / self.input_stds[layer_idx]
-            if layer_idx in self.output_means:
-                tgt = (tgt - self.output_means[layer_idx]) / self.output_stds[layer_idx]
             norm_inputs[layer_idx] = inp
-            norm_targets[layer_idx] = tgt
+
+            if tgt is not None:
+                tgt = tgt.to(self.device)
+                if layer_idx in self.output_means and layer_idx in self.output_stds:
+                    tgt = (tgt - self.output_means[layer_idx]) / self.output_stds[
+                        layer_idx
+                    ]
+                norm_targets[layer_idx] = tgt
+            # If tgt was None, norm_targets won't have this layer_idx
+
         return norm_inputs, norm_targets
-        # ---------------------------------------------- #
-        # logger.warning("RemoteActivationStore._apply_normalization STUBBED.")
-        # return inputs, targets # Passthrough for stub
+
+    def _fetch_batch_from_server(self) -> bytes:
+        """Fetches a single serialized batch from the server. Raises errors or StopIteration."""
+        # Construct request URL
+        params = {"num_tokens": self.train_batch_size_tokens}
+        if self.requested_layer_indices:
+            params["layers"] = ",".join(map(str, self.requested_layer_indices))
+
+        # Use the encoded dataset ID in the URL path
+        url = urljoin(
+            f"{self.server_url}/api/v1/datasets/", f"{self.dataset_id_encoded}/batch"
+        )
+
+        logger.debug(
+            f"Prefetch worker requesting batch from {url} with params: {params}"
+        )
+        try:
+            response = requests.get(url, params=params, timeout=self.timeout)
+
+            # Check for 404 specifically to signal exhaustion cleanly
+            if response.status_code == 404:
+                logger.info(
+                    f"Server returned 404 for {self.dataset_id_original}, assuming dataset exhausted."
+                )
+                raise StopIteration(
+                    f"Dataset {self.dataset_id_original} exhausted or not found on server."
+                )
+
+            response.raise_for_status()  # Raise for other bad statuses (5xx, etc.)
+
+            # Check content type
+            content_type = response.headers.get("content-type", "").lower()
+            if "application/octet-stream" not in content_type:
+                logger.warning(
+                    f"Received unexpected content type '{content_type}' from batch endpoint. Expected 'application/octet-stream'."
+                )
+            return response.content
+
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout requesting batch from {url}")
+            raise StopIteration(
+                f"Timeout connecting to activation server: {self.server_url}"
+            )
+        except requests.exceptions.RequestException as e:
+            # Includes HTTPError for non-404 bad status codes
+            logger.error(f"Error requesting batch from {url}: {e}")
+            if hasattr(e, "response") and e.response is not None:
+                # Don't raise StopIteration for server errors, maybe retry later?
+                # For now, re-raise as RuntimeError to signal worker issue
+                raise RuntimeError(
+                    f"Server error fetching batch ({e.response.status_code}): {e.response.text}"
+                )
+            else:
+                # Network error likely
+                raise StopIteration(
+                    f"Network error connecting to activation server: {e}"
+                )
+        # Catch other potential errors during request
+        except Exception as e:
+            logger.error(f"Unexpected error fetching batch: {e}", exc_info=True)
+            raise StopIteration(f"Unexpected error fetching batch: {e}")
 
     def _prefetch_worker(self):
-        """(STUB) Background worker that prefetches batches from the server."""
-        # --- Replace with actual implementation later --- #
-        # Loop, request batches from server endpoint, deserialize, normalize, put in queue
-        # Handle errors, timeouts, etc.
-        # ---------------------------------------------- #
-        logger.error("RemoteActivationStore._prefetch_worker is not implemented.")
-        raise NotImplementedError("_prefetch_worker not implemented yet.")
+        """Background worker to fetch batches and put them in the queue."""
+        logger.info("Prefetch worker started.")
+        while not self.stop_event.is_set():
+            try:
+                # Only fetch if queue has space
+                if not self.prefetch_queue.full():
+                    # Check if server already signaled exhaustion
+                    if self._server_exhausted:
+                        logger.debug(
+                            "Prefetch worker: Server exhausted, not fetching more."
+                        )
+                        time.sleep(0.5)  # Sleep longer if exhausted
+                        continue
+
+                    batch_bytes = self._fetch_batch_from_server()
+                    # --- Log Queue Size Before Put --- #
+                    qsize_before = self.prefetch_queue.qsize()
+                    self.prefetch_queue.put(batch_bytes, timeout=5.0)
+                    # --- Log Queue Size After Put --- #
+                    qsize_after = self.prefetch_queue.qsize()
+                    logger.debug(
+                        f"Prefetch worker put batch in queue (size before: {qsize_before}, after: {qsize_after})"
+                    )
+                    # Optional: small sleep even after success to prevent hammering server
+                    time.sleep(0.01)
+                else:
+                    # --- Log When Queue is Full --- #
+                    logger.warning(
+                        f"Prefetch queue full (size: {self.prefetch_queue.qsize()}). Worker waiting..."
+                    )
+                    time.sleep(0.1)
+
+            except StopIteration as e:
+                # Server signaled end of data (404) or critical network error
+                logger.info(f"Prefetch worker stopping: {e}")
+                self._server_exhausted = True
+                break  # Exit the worker loop
+            except RuntimeError as e:
+                # Non-critical error during fetch (e.g., server 500 error)
+                logger.error(
+                    f"Prefetch worker encountered runtime error: {e}. Retrying after delay..."
+                )
+                time.sleep(5)  # Wait before retrying
+            except Full:
+                # Should ideally be caught by the `else` block above, but kept here as a failsafe.
+                logger.warning(
+                    f"Prefetch queue full (exception caught, size: {self.prefetch_queue.qsize()}). Worker waiting..."
+                )
+                time.sleep(0.1)
+            except Exception as e:
+                # Catch unexpected errors in the worker loop
+                logger.error(f"Unexpected error in prefetch worker: {e}", exc_info=True)
+                time.sleep(5)
+
+        logger.info(
+            f"Prefetch worker finished. Final queue size: {self.prefetch_queue.qsize()}"
+        )
 
     # Overrides BaseActivationStore.get_batch
     def get_batch(self):
-        """(STUB) Get a batch of activations from the server."""
-        # --- Replace with actual implementation later --- #
-        # Try getting from prefetch_queue, fallback to direct request
-        # Deserialize response, convert to tensors, normalize
-        # ---------------------------------------------- #
-        logger.error("RemoteActivationStore.get_batch is not implemented.")
-        raise NotImplementedError("Remote batch fetching not implemented yet.")
+        """Get a batch of activations from the prefetch queue."""
+        try:
+            # --- Log Queue Size Before Get --- #
+            qsize_before_get = self.prefetch_queue.qsize()
+            logger.debug(f"get_batch requesting item. Queue size: {qsize_before_get}")
+            batch_bytes = self.prefetch_queue.get(timeout=self.timeout)
+
+            if not batch_bytes:
+                raise ValueError("Received empty bytes from prefetch queue.")
+
+            # Deserialize the binary response using torch.load
+            buffer = io.BytesIO(batch_bytes)
+            batch_data = torch.load(
+                buffer, map_location=torch.device("cpu")
+            )  # Load to CPU first
+            del buffer
+
+            # Extract, move to device, and apply normalization
+            raw_inputs = batch_data.get("inputs", {})
+            raw_targets = batch_data.get("targets", {})
+
+            # Apply normalization (which also moves tensors to self.device)
+            batch_inputs, batch_targets = self._apply_normalization(
+                raw_inputs, raw_targets
+            )
+
+            # Validate batch content (optional)
+            if not batch_inputs:
+                logger.warning("Received batch with no input data after processing.")
+                raise RuntimeError("Processed empty batch data from queue.")
+
+            return batch_inputs, batch_targets
+
+        except Empty:
+            # --- Log Queue Size on Empty --- #
+            qsize_on_empty = self.prefetch_queue.qsize()
+            logger.warning(
+                f"Prefetch queue empty (size: {qsize_on_empty}) during get(). Checking worker/server status."
+            )
+            # Check if the server is marked as exhausted
+            if self._server_exhausted and self.prefetch_queue.empty():
+                logger.info(
+                    "Prefetch queue empty and server is exhausted. Signaling end of iteration."
+                )
+                raise StopIteration("Activation data exhausted.")
+            elif self.prefetch_thread and not self.prefetch_thread.is_alive():
+                logger.error("Prefetch queue empty and worker thread is not alive!")
+                raise RuntimeError("Prefetch worker thread died unexpectedly.")
+            else:
+                logger.error(
+                    f"Timeout waiting for batch from prefetch queue (timeout: {self.timeout}s). Worker might be slow or stuck."
+                )
+                raise RuntimeError(f"Timeout waiting for batch from prefetch queue.")
+        except (EOFError, RuntimeError, ValueError, KeyError, TypeError) as e:
+            # Catch potential errors during torch.load or processing
+            logger.error(
+                f"Error processing batch data received from queue: {e}", exc_info=True
+            )
+            raise RuntimeError(f"Failed to process batch data from queue: {e}")
+        except Exception as e:
+            logger.error(f"Unexpected error in get_batch: {e}", exc_info=True)
+            raise StopIteration(f"Unexpected error getting batch: {e}")
+
+    def close(self):
+        """Signals the prefetch worker to stop and waits for it to join."""
+        logger.info("Stopping RemoteActivationStore prefetch worker...")
+        self.stop_event.set()
+        if self.prefetch_thread and self.prefetch_thread.is_alive():
+            # Don't wait indefinitely, use a timeout
+            join_timeout = 5.0
+            self.prefetch_thread.join(timeout=join_timeout)
+            if self.prefetch_thread.is_alive():
+                logger.warning(
+                    f"Prefetch worker did not exit within {join_timeout} seconds."
+                )
+            else:
+                logger.info("Prefetch worker joined.")
+        self.prefetch_thread = None
+
+    # Ensure close is called when the object is deleted
+    def __del__(self):
+        self.close()
 
     # Overrides BaseActivationStore.state_dict
     def state_dict(self) -> Dict[str, Any]:
-        """(STUB) Return state for saving/resumption."""
-        logger.warning("RemoteActivationStore.state_dict is a STUB.")
+        """Return state for saving/resumption."""
         # Convert stats to lists for JSON if saving them
         cpu_input_means = {k: v.cpu().tolist() for k, v in self.input_means.items()}
         cpu_input_stds = {k: v.cpu().tolist() for k, v in self.input_stds.items()}
@@ -1389,43 +1773,23 @@ class RemoteActivationStore(BaseActivationStore):
         return {
             "store_type": "RemoteActivationStore",
             "server_url": self.server_url,
-            "dataset_id": self.dataset_id,
+            "dataset_id": self.dataset_id_original,
             "train_batch_size_tokens": self.train_batch_size_tokens,
             "normalization_applied": self.apply_normalization,
             "input_means": cpu_input_means,
             "input_stds": cpu_input_stds,
             "output_means": cpu_output_means,
             "output_stds": cpu_output_stds,
+            "requested_layer_indices": self.requested_layer_indices,
+            "normalization_mode": self.normalization_mode,
+            "timeout": self.timeout,
             # Add other relevant config needed for resumption
         }
 
     # Overrides BaseActivationStore.load_state_dict
     def load_state_dict(self, state_dict: Dict[str, Any]):
-        """(STUB) Load state from a dictionary."""
-        logger.warning("RemoteActivationStore.load_state_dict is a STUB.")
+        """Load state from a dictionary."""
+        # Note: Does not restart the prefetch thread automatically.
+        # Assumes a new instance is created or thread is managed externally if resuming.
         if state_dict.get("store_type") != "RemoteActivationStore":
             logger.warning("Attempting to load state from incompatible store type.")
-        # Restore config needed to reconnect
-        # self.server_url = state_dict["server_url"]
-        # self.dataset_id = state_dict["dataset_id"]
-        # self.train_batch_size_tokens = state_dict["train_batch_size_tokens"]
-        # Restore normalization state
-        self.apply_normalization = state_dict.get("normalization_applied", False)
-        self.input_means = {
-            k: torch.tensor(v, device=self.device, dtype=self.dtype)
-            for k, v in state_dict["input_means"].items()
-        }
-        self.input_stds = {
-            k: torch.tensor(v, device=self.device, dtype=self.dtype)
-            for k, v in state_dict["input_stds"].items()
-        }
-        self.output_means = {
-            k: torch.tensor(v, device=self.device, dtype=self.dtype)
-            for k, v in state_dict["output_means"].items()
-        }
-        self.output_stds = {
-            k: torch.tensor(v, device=self.device, dtype=self.dtype)
-            for k, v in state_dict["output_stds"].items()
-        }
-        logger.info("RemoteActivationStore state loaded (STUBBED).")
-        pass
