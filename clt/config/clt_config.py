@@ -60,6 +60,8 @@ class TrainingConfig:
     remote_config: Optional[Dict[str, Any]] = (
         None  # Dict with server_url, dataset_id, etc.
     )
+    # How many batches to prefetch for remote source
+    remote_prefetch_batches: Optional[int] = 4
     # --- End Activation Store Source --- #
 
     # Loss function coefficients
@@ -126,3 +128,7 @@ class TrainingConfig:
                 "server_url" in self.remote_config
                 and "dataset_id" in self.remote_config
             ), "remote_config must contain 'server_url' and 'dataset_id'"
+            if self.remote_prefetch_batches is not None:
+                assert (
+                    self.remote_prefetch_batches >= 1
+                ), "remote_prefetch_batches must be at least 1"

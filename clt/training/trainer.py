@@ -460,15 +460,22 @@ class CLTTrainer:
                 raise ValueError(
                     "remote_config must contain 'server_url' and 'dataset_id'."
                 )
+            # Extract prefetch_batches from training config
+            prefetch_batches = self.training_config.remote_prefetch_batches
 
             store = RemoteActivationStore(
                 server_url=server_url,
                 dataset_id=dataset_id,
                 train_batch_size_tokens=self.training_config.train_batch_size_tokens,
+                # Pass the configured prefetch value
+                prefetch_batches=prefetch_batches,  # Pass the value from config
                 # Pass normalization config - Remote store handles its own logic/'auto' interpretation
                 normalization=self.training_config.normalization_method,
                 device=self.device,
-                # Potentially add other remote-specific params like prefetch_batches, timeout from config
+                # Optionally add timeout from remote_config if needed
+                timeout=remote_cfg.get(
+                    "timeout", 60
+                ),  # Example: Read timeout from config, default 60
             )
         else:
             raise ValueError(f"Unknown activation_source: {activation_source}")

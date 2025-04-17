@@ -54,6 +54,9 @@ class ActivationConfig:
         True  # Compute mean/std during generation and save to norm_stats.json
     )
 
+    # --- Remote Storage Parameters ---
+    remote_server_url: Optional[str] = None  # Base URL of the remote activation server
+
     # --- NNsight Parameters (Optional) ---
     # Use field to allow mutable default dict
     nnsight_tracer_kwargs: Dict[str, Any] = field(default_factory=dict)
