@@ -7,7 +7,7 @@ This server provides a RESTful API for storing and retrieving pre-generated mode
 - Stores activation chunks uploaded by `ActivationGenerator`.
 - Serves dataset metadata (`metadata.json`).
 - Serves normalization statistics (`norm_stats.json`).
-- Serves random batches of activations for training (`RemoteActivationStore`). (Batch serving logic TBD)
+- Serves random batches of activations for training (`RemoteActivationStore`).
 
 ## Setup
 
@@ -40,7 +40,6 @@ Refer to `ref_docs/activation_server_api.md` in the main project for the detaile
 
 ## TODO
 
-- Implement efficient batch serving logic in `core/storage.py:get_batch`.
 - Add robust error handling and logging.
 - Consider authentication/authorization.
 - Add unit and integration tests.
