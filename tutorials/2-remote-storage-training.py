@@ -71,8 +71,8 @@ else:
 print(f"Using device: {device}")
 
 # --- Server Configuration --- #
-SERVER_HOST = "34.41.125.189"  # Run on remote server
-SERVER_PORT = 8000  # Use a different port than default 8000 just in case
+SERVER_HOST = "localhost"  # Run on local server for now
+SERVER_PORT = 8001  # Use a different port than default 8000 just in case
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 HEALTH_CHECK_URL = urljoin(SERVER_URL, "/api/v1/health")
 # Ensure server uses a temporary directory for this tutorial
@@ -128,6 +128,7 @@ activation_config = ActivationConfig(
     # Generation Parameters
     context_size=128,
     inference_batch_size=192,  # Smaller batch size if needed
+    activation_dtype="float32",
     exclude_special_tokens=True,
     prepend_bos=True,
     # Dataset Handling
@@ -236,6 +237,7 @@ def start_server():
             env["PORT"],
             "--log-level",
             env["LOG_LEVEL"],
+            "--no-access-log",
             # Add --reload flag if desired for development, but usually not needed for tutorials
             # "--reload",
         ]
@@ -319,7 +321,7 @@ print("\nStep 2: Generating Activations and Sending to Server...")
 
 try:
     generator = ActivationGenerator(
-        activation_config=activation_config,
+        cfg=activation_config,
         device=device,
     )
     # Explicitly set storage type to remote

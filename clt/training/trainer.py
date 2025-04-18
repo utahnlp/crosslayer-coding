@@ -16,8 +16,8 @@ from clt.training.data import (
     BaseActivationStore,
     StreamingActivationStore,
     MappedActivationStore,
-    RemoteActivationStore,
 )
+from clt.training.remote_activation_store import RemoteActivationStore
 from clt.training.losses import LossManager
 from clt.nnsight.extractor import (
     ActivationExtractorCLT,
@@ -446,9 +446,7 @@ class CLTTrainer:
                 device=self.device,
             )
         elif activation_source == "remote":
-            logger.info(
-                "Using RemoteActivationStore (reading remote server - STUBBED)."
-            )
+            logger.info("Using RemoteActivationStore (remote slice server).")
             remote_cfg = self.training_config.remote_config
             if remote_cfg is None:
                 raise ValueError(
@@ -467,15 +465,9 @@ class CLTTrainer:
                 server_url=server_url,
                 dataset_id=dataset_id,
                 train_batch_size_tokens=self.training_config.train_batch_size_tokens,
-                # Pass the configured prefetch value
-                prefetch_batches=prefetch_batches,  # Pass the value from config
-                # Pass normalization config - Remote store handles its own logic/'auto' interpretation
-                normalization=self.training_config.normalization_method,
+                prefetch_batches=prefetch_batches,
                 device=self.device,
-                # Optionally add timeout from remote_config if needed
-                timeout=remote_cfg.get(
-                    "timeout", 60
-                ),  # Example: Read timeout from config, default 60
+                timeout=remote_cfg.get("timeout", 60),
             )
         else:
             raise ValueError(f"Unknown activation_source: {activation_source}")
