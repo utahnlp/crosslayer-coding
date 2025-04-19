@@ -38,7 +38,7 @@ import logging
 
 # --- Set general INFO level for our application ---
 root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)  # Keep our code logging at INFO
+root_logger.setLevel(logging.DEBUG)  # Set to DEBUG for more verbose output
 
 # --- QUIET DOWN noisy libraries ---
 # Set level for 'requests' library (often includes urllib3 logs)
@@ -51,15 +51,15 @@ logging.getLogger("nnsight").setLevel(logging.WARNING)
 # --- Ensure handlers are configured ---
 if not root_logger.hasHandlers():
     handler = logging.StreamHandler(sys.stdout)
-    handler.setLevel(logging.INFO)  # Our handler shows INFO and above
+    handler.setLevel(logging.DEBUG)  # Handler should also show DEBUG
     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     handler.setFormatter(formatter)
     root_logger.addHandler(handler)
 else:
     # Ensure existing handlers are at least INFO level
     for handler in root_logger.handlers:
-        if handler.level > logging.INFO:
-            handler.setLevel(logging.INFO)
+        if handler.level > logging.DEBUG:
+            handler.setLevel(logging.DEBUG)
 
 # --- Optional: Print current levels ---
 print(f"Root logger level: {logging.getLevelName(root_logger.level)}")
@@ -166,7 +166,7 @@ activation_config = ActivationConfig(
     activation_dir=activation_dir,
     output_format="hdf5",  # MUST be hdf5 for current remote implementation
     compression="gzip",
-    chunk_token_threshold=8_000,  # Small chunk size (reduced from 10k)
+    chunk_token_threshold=10_000,  # Small chunk size (reduced from 10k)
     # >> Key change: Point to the server <<
     remote_server_url=SERVER_URL,
     # Normalization
@@ -246,114 +246,6 @@ except requests.exceptions.Timeout:
 except Exception as e:
     print(f"⚠️ An unexpected error occurred during health check: {e}")
 
-# %% [markdown]
-# ## 4. Start the Activation Storage Server
-#
-# We launch the server defined in `clt_server/main.py` as a background process.
-# We also wait for it to become available by polling its health check endpoint.
-
-
-# %%
-def start_server():
-    global server_process
-    if server_process is not None and server_process.poll() is None:
-        print("Server process already running.")
-        return True
-
-    print(f"Starting server from: {server_main_script}")
-    print(f"Server will store data in: {SERVER_STORAGE_DIR}")
-    # Ensure storage dir exists before server starts
-    os.makedirs(SERVER_STORAGE_DIR, exist_ok=True)
-
-    # Set environment variables for the server process
-    env = os.environ.copy()
-    env["STORAGE_BASE_DIR"] = SERVER_STORAGE_DIR
-    env["HOST"] = SERVER_HOST
-    env["PORT"] = str(SERVER_PORT)
-    env["LOG_LEVEL"] = "info"  # Or "debug" for more server output
-    # --- Explicitly add project root to PYTHONPATH for the subprocess --- #
-    current_pythonpath = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = f"{project_root}{os.pathsep}{current_pythonpath}"
-    # ------------------------------------------------------------------- #
-
-    try:
-        # Use sys.executable to ensure same Python environment
-        # Modify command to run via uvicorn
-        cmd = [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "clt_server.main:app",  # Path to the FastAPI app instance
-            "--host",
-            env["HOST"],
-            "--port",
-            env["PORT"],
-            "--log-level",
-            env["LOG_LEVEL"],
-            "--no-access-log",
-            # Add --reload flag if desired for development, but usually not needed for tutorials
-            # "--reload",
-        ]
-        server_process = subprocess.Popen(
-            cmd,
-            env=env,
-            # Redirect stdout/stderr if desired, otherwise they print to console
-            # stdout=subprocess.PIPE,
-            # stderr=subprocess.PIPE,
-        )
-        print(f"Server process started with PID: {server_process.pid}")
-
-        # Wait for server to be ready (health check)
-        max_wait = 30  # seconds
-        start_wait = time.time()
-        while time.time() - start_wait < max_wait:
-            try:
-                response = requests.get(HEALTH_CHECK_URL, timeout=1)
-                if response.status_code == 200 and response.json().get("status") == "ok":
-                    print(f"Server is ready at {SERVER_URL}")
-                    return True
-            except requests.exceptions.ConnectionError:
-                pass  # Server not up yet
-            except Exception as e:
-                print(f"Health check error: {e}")  # Log other errors
-            time.sleep(0.5)
-
-        print(f"Server did not become ready within {max_wait} seconds.")
-        stop_server()  # Clean up if server didn't start properly
-        return False
-    except Exception as e:
-        print(f"Failed to start server process: {e}")
-        traceback.print_exc()
-        server_process = None
-        return False
-
-
-def stop_server():
-    global server_process
-    if server_process and server_process.poll() is None:
-        print(f"\nStopping server process (PID: {server_process.pid})...")
-        # Try terminating gracefully first
-        server_process.terminate()
-        try:
-            server_process.wait(timeout=5)  # Wait up to 5 seconds
-            print("Server process terminated.")
-        except subprocess.TimeoutExpired:
-            print("Server did not terminate gracefully, killing...")
-            server_process.kill()  # Force kill if necessary
-            server_process.wait()
-            print("Server process killed.")
-        server_process = None
-    else:
-        print("\nServer process not running or already stopped.")
-
-
-# %%
-# --- Cell 1: Start Server --- #
-print("\nStep 1: Starting the Activation Server...")
-if not start_server():
-    raise RuntimeError("Failed to start activation server.")
-else:
-    print("Server started successfully. Proceed to the next cell.")
 
 # %% [markdown]
 # ## 5. Generate Activations (Send to Server)
@@ -384,101 +276,4 @@ try:
 except Exception as gen_err:
     print(f"[ERROR] Remote activation generation failed: {gen_err}")
     traceback.print_exc()
-    # Important: Stop the server if generation fails
-    stop_server()
     raise
-
-# %% [markdown]
-# ## 6. Train using Remote Activations
-#
-# Instantiate the `CLTTrainer`. With `activation_source='remote'`, it will create
-# a `RemoteActivationStore` internally.
-# This store fetches batches from the server's `/batch` endpoint, using prefetching
-# to hide latency.
-
-# %%
-# --- Cell 3: Train Model --- #
-print("\nStep 3: Initializing CLTTrainer for training from remote server...")
-log_dir = f"clt_training_logs/clt_gpt2_remote_train_{int(time.time())}"
-os.makedirs(log_dir, exist_ok=True)
-print(f"Logs and checkpoints will be saved to: {log_dir}")
-
-trainer = None  # Initialize trainer to None
-try:
-    print("\nCreating CLTTrainer instance...")
-    print(f"- Activation Source: {training_config.activation_source}")
-    # Check if remote_config exists before accessing keys
-    if training_config.remote_config:
-        print(f"- Reading activations from server: {training_config.remote_config.get('server_url')}")
-        print(f"- Dataset ID on server: {training_config.remote_config.get('dataset_id')}")
-    else:
-        print("- Error: remote_config is missing in TrainingConfig!")
-        raise ValueError("remote_config must be set for remote training source.")
-
-    trainer = CLTTrainer(
-        clt_config=clt_config,
-        training_config=training_config,
-        log_dir=log_dir,
-        device=device,
-    )
-    print("CLTTrainer instance created successfully.")
-
-    print("\nBeginning training using RemoteActivationStore...")
-    print(f"Training for {training_config.training_steps} steps.")
-    start_train_time = time.time()
-    trained_clt_model = trainer.train(eval_every=training_config.eval_interval)
-    end_train_time = time.time()
-    print(f"\nTraining finished in {end_train_time - start_train_time:.2f} seconds.")
-
-except Exception as train_err:
-    print(f"\n[ERROR] Remote training failed: {train_err}")
-    traceback.print_exc()
-    # Note: Trainer might not be fully initialized if error occurred early
-    # Ensure the trainer's activation store is closed if it exists
-    if trainer and hasattr(trainer, "activation_store") and trainer.activation_store:
-        if hasattr(trainer.activation_store, "close") and callable(trainer.activation_store.close):
-            print("Attempting to close activation store...")
-            trainer.activation_store.close()
-    # Important: Stop the server if training fails
-    stop_server()
-    raise
-
-# %% [markdown]
-# ## 7. Conclusion
-#
-# This tutorial demonstrated the end-to-end remote workflow:
-# - Starting the activation server.
-# - Generating activations directly to the server.
-# - Training a CLT by fetching batches from the server.
-#
-# This decouples generation and training, allowing them to run on different machines
-# and facilitates sharing of large activation datasets.
-
-# %%
-# --- Cell 4: Concluding Remarks --- #
-print("\nRemote Workflow Tutorial Complete!")
-# Log dir and server storage dir are now defined earlier in the script
-# We can reference them if needed, but avoid repeating the print
-# print(f"Training logs are in: {log_dir}")
-# print(f"Server data (if not cleaned up) might be in: {SERVER_STORAGE_DIR}")
-
-# %% [markdown]
-# ## 8. Shutdown Server
-#
-# Always ensure the server process is stopped when finished.
-
-# %%
-# --- Cell 5: Shutdown Server --- #
-# IMPORTANT: Run this cell manually when you are finished with the tutorial
-# or if any step above fails, to ensure the background server process is stopped.
-print("\nStep 4: Shutting down the server...")
-stop_server()
-
-# Optional: Clean up the temporary server storage directory
-import shutil
-
-if os.path.exists(SERVER_STORAGE_DIR):
-    print(f"Cleaning up server storage: {SERVER_STORAGE_DIR}")
-    shutil.rmtree(SERVER_STORAGE_DIR)
-
-# %%

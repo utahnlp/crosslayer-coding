@@ -97,6 +97,7 @@ def _async_uploader(upload_q: "queue.Queue[Path]", cfg: ActivationConfig):
         idx = int(p.stem.split("_")[-1])
         url = urljoin(base, f"datasets/{dataset_id}/chunks/{idx}")
         try:
+            print(f"[Uploader Thread] Attempting to upload chunk: {p.name} to {url}")
             with open(p, "rb") as f:
                 files = {"chunk_file": (p.name, f, "application/x-hdf5")}
                 headers = {
@@ -135,9 +136,7 @@ class _RunningStat:
 
     def finalize(self) -> Tuple[np.ndarray, np.ndarray]:
         var = self.M2 / max(self.n - 1, 1)
-        return self.mean.cpu().numpy().astype("float32"), np.sqrt(
-            var
-        ).cpu().numpy().astype("float32")
+        return self.mean.cpu().numpy().astype("float32"), np.sqrt(var).cpu().numpy().astype("float32")
 
 
 # ---------------------------------------------------------------------------
@@ -150,9 +149,7 @@ class ActivationGenerator:
         try:
             self.torch_dtype = getattr(torch, cfg.activation_dtype)
         except AttributeError:
-            logger.warning(
-                f"Invalid activation_dtype '{cfg.activation_dtype}' in config. Defaulting to bfloat16."
-            )
+            logger.warning(f"Invalid activation_dtype '{cfg.activation_dtype}' in config. Defaulting to bfloat16.")
             self.torch_dtype = torch.bfloat16
         self.extractor = ActivationExtractorCLT(
             model_name=cfg.model_name,
@@ -169,18 +166,14 @@ class ActivationGenerator:
         )
         # Paths
         ds_name = os.path.basename(cfg.dataset_path)
-        self.out_dir = (
-            Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}"
-        )
+        self.out_dir = Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_tmp = self.out_dir / "index.tmp"
         self.manifest_final = self.out_dir / "index.bin"
         # Background uploader
         self.upload_q: "queue.Queue[Path]" = queue.Queue()
         if cfg.remote_server_url:
-            self.uploader = threading.Thread(
-                target=_async_uploader, args=(self.upload_q, cfg), daemon=True
-            )
+            self.uploader = threading.Thread(target=_async_uploader, args=(self.upload_q, cfg), daemon=True)
             self.uploader.start()
         else:
             self.uploader = None
@@ -210,7 +203,7 @@ class ActivationGenerator:
         pbar = tqdm(total=tgt_tokens or None, unit="tok", smoothing=0.2)
 
         # Collect manifest rows in‑memory to avoid pre‑allocation mismatch bugs.
-        # Each entry is (chunk_id, local_row).  For 1 M tokens this is only 8 MB.
+        # Each entry is (chunk_id, local_row).  For 1 M tokens this is only 8 MB.
         manifest_rows: List[np.ndarray] = []
 
         # Norm‑stat structures
@@ -241,9 +234,7 @@ class ActivationGenerator:
                             "inputs": _RunningStat(d_model),
                             "targets": _RunningStat(d_model),
                         }
-                logger.info(
-                    "Layers=%d d_model=%d dtype=%s", len(layer_ids), d_model, dtype_str
-                )
+                logger.info("Layers=%d d_model=%d dtype=%s", len(layer_ids), d_model, dtype_str)
 
             n_tok = batch_inp[layer_ids[0]].shape[0]
             for lid in layer_ids:
@@ -383,9 +374,7 @@ class ActivationGenerator:
             # h5py doesn't natively support bfloat16, store as uint16
             # Note: Client needs to be aware of this if using bfloat16
             h5py_dtype_str = "uint16"
-            logger.warning(
-                "Storing bfloat16 as uint16 in HDF5. Ensure client handles conversion."
-            )
+            logger.warning("Storing bfloat16 as uint16 in HDF5. Ensure client handles conversion.")
         else:
             raise ValueError(f"Unsupported torch_dtype for HDF5: {self.torch_dtype}")
         # ----------------------------------------------------- #
@@ -432,8 +421,7 @@ class ActivationGenerator:
         if st == "remote":
             if self.cfg.remote_server_url is None:
                 raise ValueError(
-                    "Cannot set storage_type to 'remote' because "
-                    "cfg.remote_server_url is not configured."
+                    "Cannot set storage_type to 'remote' because " "cfg.remote_server_url is not configured."
                 )
             if self.uploader is None:
                 # Lazily start a new uploader thread
@@ -466,9 +454,7 @@ class ActivationGenerator:
             raise ValueError("remote_server_url is not configured for upload")
 
         dataset_name = os.path.basename(self.cfg.dataset_path)
-        dataset_id = quote(
-            f"{self.cfg.model_name}/{dataset_name}_{self.cfg.dataset_split}", safe=""
-        )
+        dataset_id = quote(f"{self.cfg.model_name}/{dataset_name}_{self.cfg.dataset_split}", safe="")
         # Point directly to the root-mounted slice server endpoints
         base = self.cfg.remote_server_url.rstrip("/") + "/"
         url = urljoin(base, f"datasets/{dataset_id}/{endpoint}")
@@ -489,9 +475,7 @@ class ActivationGenerator:
             raise ValueError("remote_server_url is not configured for upload")
 
         dataset_name = os.path.basename(self.cfg.dataset_path)
-        dataset_id = quote(
-            f"{self.cfg.model_name}/{dataset_name}_{self.cfg.dataset_split}", safe=""
-        )
+        dataset_id = quote(f"{self.cfg.model_name}/{dataset_name}_{self.cfg.dataset_split}", safe="")
         base = self.cfg.remote_server_url.rstrip("/") + "/"  # Point to root
         url = urljoin(base, f"datasets/{dataset_id}/{endpoint}")
 
