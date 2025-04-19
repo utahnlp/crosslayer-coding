@@ -3,8 +3,11 @@ import uvicorn
 import os  # Import os for environment variables
 
 # Import routers (assuming they exist, we will create them)
-from .api import health, datasets
+from .api import health
 from .core.config import settings  # Import settings
+
+# Import the low‑level slice server app to expose /datasets endpoints at root
+from .core import storage as slice_server
 
 app = FastAPI(
     title="CLT Activation Storage Server",
@@ -14,7 +17,10 @@ app = FastAPI(
 
 # Include API routers
 app.include_router(health.router, prefix="/api/v1", tags=["Health"])
-app.include_router(datasets.router, prefix="/api/v1/datasets", tags=["Datasets"])
+
+# Mount the slice server (raw HDF5 slice endpoints) at root so that
+# paths like /datasets/... are served alongside the higher‑level /api/v1 routes.
+app.mount("", slice_server.app)
 
 
 @app.get("/", tags=["Root"])

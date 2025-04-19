@@ -16,6 +16,9 @@ class ActivationConfig:
     model_dtype: Optional[str] = (
         None  # Optional dtype for the model ('float16', 'bfloat16')
     )
+    activation_dtype: Literal["bfloat16", "float16", "float32"] = (
+        "bfloat16"  # Precision for storing activations
+    )
     dataset_split: str = "train"  # Dataset split to use
     dataset_text_column: str = "text"  # Column containing text data
 
@@ -56,6 +59,7 @@ class ActivationConfig:
 
     # --- Remote Storage Parameters ---
     remote_server_url: Optional[str] = None  # Base URL of the remote activation server
+    delete_after_upload: bool = False  # Delete local chunk after successful upload
 
     # --- NNsight Parameters (Optional) ---
     # Use field to allow mutable default dict
