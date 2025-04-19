@@ -1,10 +1,11 @@
 [tool.black]
-line-length = 88
+line-length = 120
 target-version = ['py37']
 include = '\.pyi?$'
 
 [tool.flake8]
-max-line-length = 88
+max-line-length = 120
+ignore = ["E501"]
 extend-ignore = "E203"  # Ignore whitespace before ':' (conflicts with Black)
 per-file-ignores = []
 exclude = [

@@ -183,4 +183,5 @@ clt_output_tutorial/
 .DS_Store
 mock_log_dir/
 tutorials/tutorial_activations/
+tutorials/tutorial_activations_local/
 temp_tutorial_server_data/

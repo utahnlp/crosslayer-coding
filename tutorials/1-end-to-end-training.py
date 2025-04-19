@@ -4,8 +4,8 @@
 # This tutorial demonstrates the complete process of training a Cross-Layer Transcoder (CLT)
 # using the `clt` library. We will:
 # 1. Configure the CLT model, activation generation, and training parameters.
-# 2. (Simulate) Generate activations locally using the ActivationGenerator.
-# 3. Configure the trainer to use the locally stored activations.
+# 2. Generate activations locally (with manifest) using the ActivationGenerator.
+# 3. Configure the trainer to use the locally stored activations via the manifest.
 # 4. Train the CLT model.
 # 5. Save the trained CLT model.
 #
@@ -38,11 +38,13 @@ try:
     from clt.activation_generation.generator import ActivationGenerator
     from clt.training.trainer import CLTTrainer
     from clt.models.clt import CrossLayerTranscoder
+
+    # We no longer need to import specific stores here, trainer handles it
+    # from clt.training.local_activation_store import LocalActivationStore
+    # from clt.training.data import StreamingActivationStore
 except ImportError as e:
     print(f"ImportError: {e}")
-    print(
-        "Please ensure the 'clt' library is installed or the clt directory is in your PYTHONPATH."
-    )
+    print("Please ensure the 'clt' library is installed or the clt directory is in your PYTHONPATH.")
     # You might need to adjust your PYTHONPATH, e.g.,
     # import sys
     # sys.path.append('path/to/your/project/root')
@@ -66,8 +68,8 @@ BASE_MODEL_NAME = "gpt2"  # Using GPT-2 small
 #
 # We define three configuration objects:
 # - `CLTConfig`: Specifies the architecture of the Cross-Layer Transcoder itself (number of features, layers matching the base model, activation function, etc.).
-# - `ActivationConfig`: Specifies parameters for generating the activation dataset (source model, dataset, tokenization, storage format, etc.).
-# - `TrainingConfig`: Specifies parameters for the training process (learning rate, number of steps, loss coefficients, how to access activations, etc.).
+# - `ActivationConfig`: Specifies parameters for generating the activation dataset (source model, dataset, tokenization, storage format, *including manifest generation*, etc.).
+# - `TrainingConfig`: Specifies parameters for the training process (learning rate, number of steps, loss coefficients, *how to access activations via manifest*, etc.).
 #
 # **Note**: For this tutorial, we use small values for features, steps, and generated tokens for speed.
 
@@ -84,7 +86,7 @@ clt_config = CLTConfig(
     num_features=clt_num_features,
     num_layers=gpt2_num_layers,  # Must match the base model
     d_model=gpt2_d_model,  # Must match the base model
-    # clt_dtype="bfloat16",
+    # clt_dtype="bfloat16", # Configured via TrainingConfig.activation_dtype now
     activation_fn="relu",  # As described in the paper
     jumprelu_threshold=0.03,  # Default value from paper
 )
@@ -94,10 +96,9 @@ print(clt_config)
 # --- Activation Generation Configuration ---
 # Define where activations will be stored and how they should be generated
 # Use a small number of target tokens for the tutorial
-activation_dir = "./tutorial_activations"
-dataset_name = (
-    "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
-)
+activation_dir = "./tutorial_activations_local"
+# Fix SyntaxError: remove parenthesis around string assignment
+dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
@@ -110,7 +111,7 @@ activation_config = ActivationConfig(
     dataset_text_column="text",
     # Generation Parameters
     context_size=128,
-    inference_batch_size=256,
+    inference_batch_size=192,
     exclude_special_tokens=True,
     prepend_bos=True,
     # Dataset Handling
@@ -118,12 +119,13 @@ activation_config = ActivationConfig(
     dataset_trust_remote_code=False,
     cache_path=None,
     # Generation Output Control
-    target_total_tokens=2_000_000,  # Generate 2M tokens for the tutorial (~100GB)
+    target_total_tokens=1_000_000,  # Generate 1M tokens for the tutorial
     # Storage Parameters
     activation_dir=activation_dir,
     output_format="hdf5",
     compression="gzip",
-    chunk_token_threshold=10_000,
+    chunk_token_threshold=8_000,
+    activation_dtype="float32",  # Explicitly set desired storage precision
     # Normalization
     compute_norm_stats=True,
     # NNsight args (defaults are usually fine)
@@ -146,9 +148,11 @@ training_config = TrainingConfig(
     # Training loop parameters
     learning_rate=3e-4,
     training_steps=1000,  # Reduced steps for tutorial
-    # Activation source - use the generated data
-    activation_source="local",
-    activation_path=expected_activation_path,  # Point to generated data
+    seed=42,  # Added seed for reproducibility
+    # Activation source - use local manifest-based store
+    activation_source="local_manifest",  # Changed from 'local'
+    activation_path=expected_activation_path,  # Point to generated data directory
+    activation_dtype="float32",  # Specify dtype for loading/training
     # Training batch size
     train_batch_size_tokens=1024,
     # Normalization for training (use stored stats)
@@ -180,59 +184,61 @@ print(training_config)
 # ## 3. Generate Activations (One-Time Step)
 #
 # Before training, we need to generate the activation dataset using the configuration defined above.
-# This is typically done by running the `scripts/generate_activations.py` script from the command line.
+# The generator will now create HDF5 chunks, `metadata.json`, `norm_stats.json` (if enabled),
+# and importantly, the `index.bin` manifest file required by `LocalActivationStore`.
 #
 # **Example Command:**
 # ```bash
-# python scripts/generate_activations.py --model_name gpt2 --mlp_input_template "transformer.h.{}.mlp.input" --mlp_output_template "transformer.h.{}.mlp.output" --dataset_path monology/pile-uncopyrighted --context_size 128 --target_total_tokens 1000000 --activation_dir ./tutorial_activations --output_format hdf5 --compute_norm_stats
+# python scripts/generate_activations.py --config path/to/activation_config.yaml
 # ```
+# (Using a config file is recommended for complex generation setups)
 #
 # For this tutorial notebook, we will *simulate* this step by directly calling the generator class.
 # **Note:** This generation step can take some time depending on the model, dataset, and `target_total_tokens`.
 
 # %%
-print("\nStep 1: Generating/Verifying Activations...")
+print("\nStep 1: Generating/Verifying Activations (including manifest)...")
 
-# Check if activations already exist
+# Check if activations *and manifest* already exist
 metadata_path = os.path.join(expected_activation_path, "metadata.json")
-if os.path.exists(metadata_path):
-    print(f"Activations already found at: {expected_activation_path}")
+manifest_path = os.path.join(expected_activation_path, "index.bin")  # Check for manifest
+
+if os.path.exists(metadata_path) and os.path.exists(manifest_path):
+    print(f"Activations and manifest already found at: {expected_activation_path}")
     print("Skipping generation. Delete the directory to regenerate.")
 else:
-    print(f"Activations not found. Generating them now at: {expected_activation_path}")
+    print(f"Activations or manifest not found. Generating them now at: {expected_activation_path}")
     try:
         # Instantiate the generator with the ActivationConfig
         generator = ActivationGenerator(
-            activation_config=activation_config,
+            cfg=activation_config,
             device=device,  # Pass the device determined earlier
         )
         # Run the generation process
         generation_start_time = time.time()
-        generator.generate_and_save()
+        generator.generate_and_save()  # This now saves index.bin too
         generation_end_time = time.time()
-        print(
-            f"Activation generation complete in {generation_end_time - generation_start_time:.2f}s."
-        )
+        print(f"Activation generation complete in {generation_end_time - generation_start_time:.2f}s.")
     except Exception as gen_err:
         print(f"[ERROR] Activation generation failed: {gen_err}")
         traceback.print_exc()
         raise
 
 # %% [markdown]
-# ## 4. Training the CLT from Local Activations
+# ## 4. Training the CLT from Local Manifest
 #
-# Now we instantiate the `CLTTrainer`. Because `TrainingConfig.activation_source` is set to `'local'`,
-# the trainer will automatically create a `MappedActivationStore` internally, pointing to the
-# `TrainingConfig.activation_path` where we just generated the data.
+# Now we instantiate the `CLTTrainer`. Because `TrainingConfig.activation_source` is set to `'local_manifest'`,
+# the trainer will automatically create a `LocalActivationStore` internally. This store requires the
+# `index.bin` manifest file to exist in the `TrainingConfig.activation_path` directory.
 #
-# If `TrainingConfig.normalization_method` is set to `'auto'`, the `MappedActivationStore` will look for
+# If `TrainingConfig.normalization_method` is set to `'auto'`, the `LocalActivationStore` will look for
 # the `norm_stats.json` file (created during generation) and apply normalization accordingly.
 
 # %%
-print("\nInitializing CLTTrainer for training from local activations...")
+print("\nInitializing CLTTrainer for training from local manifest...")
 
 # Define a directory for logs and checkpoints (can be different from activation dir)
-log_dir = f"clt_training_logs/clt_gpt2_local_train_{int(time.time())}"
+log_dir = f"clt_training_logs/clt_gpt2_local_manifest_train_{int(time.time())}"
 os.makedirs(log_dir, exist_ok=True)
 print(f"Logs and checkpoints will be saved to: {log_dir}")
 
@@ -259,7 +265,7 @@ except Exception as e:
     raise
 
 # Start training
-print("\nBeginning training using MappedActivationStore...")
+print("\nBeginning training using LocalActivationStore (manifest-driven)...")
 print(f"Training for {training_config.training_steps} steps.")
 print(f"Normalization method set to: {training_config.normalization_method}")
 
@@ -276,7 +282,9 @@ except Exception as train_err:
 # %% [markdown]
 # ## 5. Saving and Loading the Trained Model
 #
-# The trainer automatically saves the final model (`clt_final.pt`) and checkpoints in the `log_dir`. The `CrossLayerTranscoder` model has `save` and `load` methods.
+# The trainer automatically saves the final model (`clt_final.pt`) and checkpoints in the `log_dir`.
+# It also saves the state of the activation store (e.g., current epoch for the manifest sampler).
+# The `CrossLayerTranscoder` model has `save` and `load` methods.
 
 # %%
 # The trainer already saved the final model, but we can also save it manually
@@ -313,11 +321,13 @@ print(f"Loaded model is on device: {next(loaded_clt_model.parameters()).device}"
 # %% [markdown]
 # ## 6. Next Steps
 #
-# This tutorial demonstrated the workflow of pre-generating activations and then training from them.
+# This tutorial demonstrated the workflow of pre-generating activations (including the manifest)
+# and then training using the manifest-driven `LocalActivationStore`.
 # This separation allows:
 # - Generating activations once and reusing them for multiple training runs/experiments.
 # - Generating activations on powerful hardware and training on less powerful hardware.
 # - Easier sharing of processed activation datasets.
+# - Deterministic data loading order across runs and distributed ranks (given the same seed).
 #
 # With a trained `CrossLayerTranscoder`, you can now:
 # - **Analyze Features**: Examine the learned encoder/decoder weights and feature activations.
@@ -326,7 +336,7 @@ print(f"Loaded model is on device: {next(loaded_clt_model.parameters()).device}"
 
 # %%
 print("\nTutorial Complete!")
-print("You have trained a Cross-Layer Transcoder!")
+print("You have trained a Cross-Layer Transcoder using manifest-based local data!")
 print(f"The trained model and logs are saved in: {log_dir}")
 
 # %%

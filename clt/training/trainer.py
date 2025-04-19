@@ -15,9 +15,13 @@ from clt.models.clt import CrossLayerTranscoder
 from clt.training.data import (
     BaseActivationStore,
     StreamingActivationStore,
-    MappedActivationStore,
+    # MappedActivationStore, # Removed legacy store
 )
+
+# Import the new manifest-based stores
+from clt.training.local_activation_store import LocalActivationStore
 from clt.training.remote_activation_store import RemoteActivationStore
+
 from clt.training.losses import LossManager
 from clt.nnsight.extractor import (
     ActivationExtractorCLT,
@@ -43,9 +47,7 @@ def _format_elapsed_time(seconds: float) -> str:
 class WandBLogger:
     """Wrapper class for Weights & Biases logging."""
 
-    def __init__(
-        self, training_config: TrainingConfig, clt_config: CLTConfig, log_dir: str
-    ):
+    def __init__(self, training_config: TrainingConfig, clt_config: CLTConfig, log_dir: str):
         """Initialize the WandB logger.
 
         Args:
@@ -171,16 +173,10 @@ class WandBLogger:
                             try:
                                 wandb_log_dict[wandb_key] = wandb.Histogram(layer_value)
                             except Exception as e:
-                                print(
-                                    f"Wandb: Error creating histogram for {wandb_key}: {e}"
-                                )
+                                print(f"Wandb: Error creating histogram for {wandb_key}: {e}")
                                 # Fallback: log mean or placeholder
                                 try:
-                                    mean_val = (
-                                        sum(layer_value) / len(layer_value)
-                                        if layer_value
-                                        else 0.0
-                                    )
+                                    mean_val = sum(layer_value) / len(layer_value) if layer_value else 0.0
                                     wandb_log_dict[f"{wandb_key}_mean"] = mean_val
                                 except TypeError:
                                     wandb_log_dict[f"{wandb_key}_mean"] = -1.0
@@ -212,9 +208,7 @@ class WandBLogger:
         if wandb_log_dict:
             wandb.log(wandb_log_dict, step=step)
 
-    def log_artifact(
-        self, artifact_path: str, artifact_type: str, name: Optional[str] = None
-    ):
+    def log_artifact(self, artifact_path: str, artifact_type: str, name: Optional[str] = None):
         """Log an artifact to WandB.
 
         Args:
@@ -271,14 +265,8 @@ class CLTTrainer:
         self.training_config = training_config
 
         # Ensure self.device is a torch.device object
-        _device_input = device or (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        )
-        self.device = (
-            torch.device(_device_input)
-            if isinstance(_device_input, str)
-            else _device_input
-        )
+        _device_input = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = torch.device(_device_input) if isinstance(_device_input, str) else _device_input
 
         # Set up log directory
         self.log_dir = log_dir or f"clt_train_{int(time.time())}"
@@ -292,27 +280,54 @@ class CLTTrainer:
 
         # Initialize optimizer
         if training_config.optimizer == "adam":
-            self.optimizer: Any = optim.Adam(
-                self.model.parameters(), lr=training_config.learning_rate
-            )
+            self.optimizer: Any = optim.Adam(self.model.parameters(), lr=training_config.learning_rate)
         else:  # "adamw"
-            self.optimizer = optim.AdamW(
-                self.model.parameters(), lr=training_config.learning_rate
-            )
+            self.optimizer = optim.AdamW(self.model.parameters(), lr=training_config.learning_rate)
 
         # Initialize scheduler
         self.scheduler: Optional[Any] = None
-        if training_config.lr_scheduler == "linear":
+        scheduler_type = training_config.lr_scheduler
+        # Get scheduler params from config, default to empty dict if None
+        scheduler_params = training_config.lr_scheduler_params or {}
+
+        if scheduler_type == "linear":
+            # Default params for LinearLR
+            default_linear_params = {
+                "start_factor": 1.0,
+                "end_factor": 0.1,
+                # total_iters is always training_steps for this setup
+            }
+            # Update defaults with user-provided params
+            final_params = {**default_linear_params, **scheduler_params}
+            # Ensure total_iters is not overridden by user params
+            final_params.pop("total_iters", None)
+
             self.scheduler = optim.lr_scheduler.LinearLR(
                 self.optimizer,
-                start_factor=1.0,
-                end_factor=0.1,
                 total_iters=training_config.training_steps,
+                **final_params,  # Pass start_factor, end_factor, etc.
             )
-        elif training_config.lr_scheduler == "cosine":
+            logger.info(
+                f"Using LinearLR scheduler with params: {final_params}, total_iters={training_config.training_steps}"
+            )
+
+        elif scheduler_type == "cosine":
+            # Default params for CosineAnnealingLR
+            default_cosine_params = {
+                # T_max defaults to training_steps
+                "eta_min": 0,  # Default minimum LR
+            }
+            # Update defaults with user-provided params
+            final_params = {**default_cosine_params, **scheduler_params}
+            # Set T_max explicitly, allowing override but defaulting to training_steps
+            t_max = final_params.pop("T_max", training_config.training_steps)
+
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=training_config.training_steps
+                self.optimizer, T_max=t_max, **final_params  # Pass eta_min, etc.
             )
+            logger.info(f"Using CosineAnnealingLR scheduler with params: {final_params}, T_max={t_max}")
+
+        # Add elif blocks here for other potential schedulers
 
         # Initialize activation store based on config
         # Note: The extractor is now created inside the StreamingActivationStore if needed
@@ -338,30 +353,28 @@ class CLTTrainer:
         }
 
         # Initialize WandB logger
-        self.wandb_logger = WandBLogger(
-            training_config=training_config, clt_config=clt_config, log_dir=self.log_dir
-        )
+        self.wandb_logger = WandBLogger(training_config=training_config, clt_config=clt_config, log_dir=self.log_dir)
 
     @property
     def dead_neurons_mask(self) -> torch.Tensor:
         """Boolean mask indicating dead neurons based on inactivity window."""
         # Ensure counter is initialized
-        if (
-            not hasattr(self, "n_forward_passes_since_fired")
-            or self.n_forward_passes_since_fired is None
-        ):
+        if not hasattr(self, "n_forward_passes_since_fired") or self.n_forward_passes_since_fired is None:
             # Return an all-false mask if counter doesn't exist yet
             return torch.zeros(
                 (self.clt_config.num_layers, self.clt_config.num_features),
                 dtype=torch.bool,
                 device=self.device,
             )
-        return (
-            self.n_forward_passes_since_fired > self.training_config.dead_feature_window
-        )
+        return self.n_forward_passes_since_fired > self.training_config.dead_feature_window
 
     def _create_activation_store(self, start_time: float) -> BaseActivationStore:
         """Create the appropriate activation store based on training config.
+
+        Valid activation_source values:
+        - "generate": Use StreamingActivationStore with on-the-fly generation.
+        - "local_manifest": Use LocalActivationStore with local manifest/chunks.
+        - "remote": Use RemoteActivationStore with remote server.
 
         Args:
             start_time: The training start time for elapsed time logging.
@@ -370,6 +383,11 @@ class CLTTrainer:
             Configured instance of a BaseActivationStore subclass.
         """
         activation_source = self.training_config.activation_source
+
+        # Determine rank and world size for distributed training, default to 0/1
+        # These might come from environment variables or a distributed library setup
+        rank = int(os.environ.get("RANK", 0))
+        world = int(os.environ.get("WORLD_SIZE", 1))
 
         if activation_source == "generate":
             logger.info("Using StreamingActivationStore (generating on-the-fly).")
@@ -382,15 +400,10 @@ class CLTTrainer:
                 )
 
             # --- Create Extractor from generation_config --- #
-            # Use .get() for optional extractor args
             extractor = ActivationExtractorCLT(
                 model_name=gen_cfg["model_name"],  # Required
-                mlp_input_module_path_template=gen_cfg[
-                    "mlp_input_template"
-                ],  # Required
-                mlp_output_module_path_template=gen_cfg[
-                    "mlp_output_template"
-                ],  # Required
+                mlp_input_module_path_template=gen_cfg["mlp_input_template"],  # Required
+                mlp_output_module_path_template=gen_cfg["mlp_output_template"],  # Required
                 device=self.device,  # Trainer manages device
                 model_dtype=gen_cfg.get("model_dtype"),
                 context_size=gen_cfg.get("context_size", 128),
@@ -407,70 +420,79 @@ class CLTTrainer:
                 dataset_split=ds_params.get("dataset_split", "train"),
                 dataset_text_column=ds_params.get("dataset_text_column", "text"),
                 streaming=ds_params.get("streaming", True),
-                dataset_trust_remote_code=ds_params.get(
-                    "dataset_trust_remote_code", False
-                ),
+                dataset_trust_remote_code=ds_params.get("dataset_trust_remote_code", False),
                 cache_path=ds_params.get("cache_path"),
                 # max_samples=ds_params.get("max_samples"), # max_samples is not a valid arg for stream_activations
             )
 
             # --- Create Streaming Store --- #
-            # Determine normalization method for streaming
             stream_norm_method = self.training_config.normalization_method
             if stream_norm_method == "auto":
-                # 'auto' for streaming means estimate on the fly
                 stream_norm_method = "estimated_mean_std"
 
             store = StreamingActivationStore(
                 activation_generator=activation_generator,
                 train_batch_size_tokens=self.training_config.train_batch_size_tokens,
                 n_batches_in_buffer=self.training_config.n_batches_in_buffer,
-                normalization_method=stream_norm_method,
-                normalization_estimation_batches=(
-                    self.training_config.normalization_estimation_batches
-                ),
+                normalization_method=str(stream_norm_method),
+                normalization_estimation_batches=(self.training_config.normalization_estimation_batches),
                 device=self.device,
                 start_time=start_time,
             )
-        elif activation_source == "local":
-            logger.info("Using MappedActivationStore (reading local files).")
+            logger.info(f"Initialized StreamingActivationStore.")
+            logger.info(f"  Normalization method: {store.normalization_method}")
+            logger.info(f"  Uses internal estimation, DOES NOT use norm_stats.json.")
+        # Use the new LocalActivationStore for manifest-based local datasets
+        elif activation_source == "local_manifest":
+            logger.info("Using LocalActivationStore (reading local manifest/chunks).")
             if not self.training_config.activation_path:
                 raise ValueError(
-                    "activation_path must be set in TrainingConfig when activation_source is 'local'."
+                    "activation_path must be set in TrainingConfig when activation_source is 'local_manifest'."
                 )
-            store = MappedActivationStore(
-                activation_path=self.training_config.activation_path,
+            store = LocalActivationStore(
+                dataset_path=self.training_config.activation_path,
                 train_batch_size_tokens=self.training_config.train_batch_size_tokens,
-                # Pass normalization config - Mapped store handles loading/disabling/'auto' logic
-                normalization=self.training_config.normalization_method,
                 device=self.device,
+                dtype=self.training_config.activation_dtype,  # Use explicit dtype from config
+                rank=rank,
+                world=world,
+                seed=self.training_config.seed,
             )
+            logger.info(f"Initialized LocalActivationStore from path: {store.dataset_path}")
+            if store.apply_normalization:
+                logger.info(f"  Normalization ENABLED using loaded norm_stats.json.")
+            else:
+                logger.warning(f"  Normalization DISABLED (norm_stats.json not found or failed to load).")
         elif activation_source == "remote":
             logger.info("Using RemoteActivationStore (remote slice server).")
             remote_cfg = self.training_config.remote_config
             if remote_cfg is None:
-                raise ValueError(
-                    "remote_config dict must be set in TrainingConfig when activation_source is 'remote'."
-                )
+                raise ValueError("remote_config dict must be set in TrainingConfig when activation_source is 'remote'.")
             server_url = remote_cfg.get("server_url")
             dataset_id = remote_cfg.get("dataset_id")
             if not server_url or not dataset_id:
-                raise ValueError(
-                    "remote_config must contain 'server_url' and 'dataset_id'."
-                )
-            # Extract prefetch_batches from training config
-            prefetch_batches = self.training_config.remote_prefetch_batches
+                raise ValueError("remote_config must contain 'server_url' and 'dataset_id'.")
 
             store = RemoteActivationStore(
                 server_url=server_url,
                 dataset_id=dataset_id,
                 train_batch_size_tokens=self.training_config.train_batch_size_tokens,
-                prefetch_batches=prefetch_batches,
                 device=self.device,
+                dtype=self.training_config.activation_dtype,  # Use explicit dtype from config
+                rank=rank,
+                world=world,
+                seed=self.training_config.seed,
                 timeout=remote_cfg.get("timeout", 60),
             )
+            logger.info(f"Initialized RemoteActivationStore for dataset: {store.did_raw}")
+            if store.apply_normalization:
+                logger.info(f"  Normalization ENABLED using fetched norm_stats.json.")
+            else:
+                logger.warning(f"  Normalization DISABLED (norm_stats.json not found on server or failed to load).")
         else:
-            raise ValueError(f"Unknown activation_source: {activation_source}")
+            raise ValueError(
+                f"Unknown activation_source: {activation_source}. Valid options: 'generate', 'local_manifest', 'remote'."
+            )
 
         return store
 
@@ -528,14 +550,6 @@ class CLTTrainer:
 
         # Save model checkpoint
         model_checkpoint_path = os.path.join(self.log_dir, f"clt_checkpoint_{step}.pt")
-        # --- Commented out memory logging --- #
-        # mem_before_save = 0
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     mem_before_save = torch.cuda.memory_allocated(self.device) / (1024**2)
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Checkpoint Step {step} - Before Save [{elapsed_str}]. Mem: {mem_before_save:.2f} MB"
-        #     )
 
         try:
             self.model.save(model_checkpoint_path)
@@ -546,28 +560,18 @@ class CLTTrainer:
                 name=f"clt_checkpoint_{step}",
             )
         except Exception as e:
-            print(
-                f"Warning: Failed to save model checkpoint to "
-                f"{model_checkpoint_path}: {e}"
-            )
+            print(f"Warning: Failed to save model checkpoint to " f"{model_checkpoint_path}: {e}")
 
         # Save activation store state
-        store_checkpoint_path = os.path.join(
-            self.log_dir, f"activation_store_checkpoint_{step}.pt"
-        )
+        store_checkpoint_path = os.path.join(self.log_dir, f"activation_store_checkpoint_{step}.pt")
         try:
             torch.save(self.activation_store.state_dict(), store_checkpoint_path)
         except Exception as e:
-            print(
-                f"Warning: Failed to save activation store state to "
-                f"{store_checkpoint_path}: {e}"
-            )
+            print(f"Warning: Failed to save activation store state to " f"{store_checkpoint_path}: {e}")
 
         # Also save a copy as latest
         latest_model_path = os.path.join(self.log_dir, "clt_checkpoint_latest.pt")
-        latest_store_path = os.path.join(
-            self.log_dir, "activation_store_checkpoint_latest.pt"
-        )
+        latest_store_path = os.path.join(self.log_dir, "activation_store_checkpoint_latest.pt")
         try:
             self.model.save(latest_model_path)
         except Exception as e:
@@ -577,17 +581,7 @@ class CLTTrainer:
         except Exception as e:
             print(f"Warning: Failed to save latest activation store state: {e}")
 
-        # --- Commented out memory logging --- #
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     mem_after_save = torch.cuda.memory_allocated(self.device) / (1024**2)
-        #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-        #     logger.debug(
-        #         f"Checkpoint Step {step} - After Save [{elapsed_str}]. Mem: {mem_after_save:.2f} MB (+{mem_after_save - mem_before_save:.2f} MB)"
-        #     )
-
-    def load_checkpoint(
-        self, checkpoint_path: str, store_checkpoint_path: Optional[str] = None
-    ):
+    def load_checkpoint(self, checkpoint_path: str, store_checkpoint_path: Optional[str] = None):
         """Load model and activation store checkpoint.
 
         Args:
@@ -613,16 +607,12 @@ class CLTTrainer:
             basename = os.path.basename(checkpoint_path)
             if basename.startswith("clt_checkpoint_"):
                 # Replace "clt_checkpoint_" with "activation_store_checkpoint_"
-                store_basename = basename.replace(
-                    "clt_checkpoint_", "activation_store_checkpoint_"
-                )
+                store_basename = basename.replace("clt_checkpoint_", "activation_store_checkpoint_")
                 store_checkpoint_path = os.path.join(dirname, store_basename)
             else:
                 # Try using _latest suffix if loading latest model
                 if basename == "clt_checkpoint_latest.pt":
-                    store_checkpoint_path = os.path.join(
-                        dirname, "activation_store_checkpoint_latest.pt"
-                    )
+                    store_checkpoint_path = os.path.join(dirname, "activation_store_checkpoint_latest.pt")
                 else:
                     # Fallback if naming convention doesn't match
                     store_checkpoint_path = None
@@ -633,25 +623,15 @@ class CLTTrainer:
         # Load activation store checkpoint if available
         if store_checkpoint_path and os.path.exists(store_checkpoint_path):
             try:
-                store_state = torch.load(
-                    store_checkpoint_path, map_location=self.device
-                )
+                store_state = torch.load(store_checkpoint_path, map_location=self.device)
                 # Ensure activation_store is initialized before loading state
-                if (
-                    not hasattr(self, "activation_store")
-                    or self.activation_store is None
-                ):
-                    print(
-                        "Warning: Activation store not initialized. Cannot load state."
-                    )
+                if not hasattr(self, "activation_store") or self.activation_store is None:
+                    print("Warning: Activation store not initialized. Cannot load state.")
                 else:
                     self.activation_store.load_state_dict(store_state)
                     print(f"Loaded activation store state from {store_checkpoint_path}")
             except Exception as e:
-                print(
-                    f"Warning: Failed to load activation store state from "
-                    f"{store_checkpoint_path}: {e}"
-                )
+                print(f"Warning: Failed to load activation store state from " f"{store_checkpoint_path}: {e}")
         else:
             print(
                 f"Warning: Activation store checkpoint path not found or specified: "
@@ -670,8 +650,7 @@ class CLTTrainer:
         print(f"Starting CLT training on {self.device}...")
         # Access num_features and num_layers via clt_config
         print(
-            f"Model has {self.clt_config.num_features} features per layer "
-            f"and {self.clt_config.num_layers} layers"
+            f"Model has {self.clt_config.num_features} features per layer " f"and {self.clt_config.num_layers} layers"
         )
         print(f"Training for {self.training_config.training_steps} steps.")
         print(f"Logging to {self.log_dir}")
@@ -679,15 +658,9 @@ class CLTTrainer:
         # Check if using normalization and notify user
         if self.training_config.normalization_method == "estimated_mean_std":
             print("\n>>> NORMALIZATION PHASE <<<")
-            print(
-                "Normalization statistics are being estimated from dataset activations."
-            )
-            print(
-                "This may take some time, but happens only once before training begins."
-            )
-            print(
-                f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n"
-            )
+            print("Normalization statistics are being estimated from dataset activations.")
+            print("This may take some time, but happens only once before training begins.")
+            print(f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n")
 
         # Make sure we flush stdout to ensure prints appear immediately,
         # especially important in Jupyter/interactive environments
@@ -699,11 +672,6 @@ class CLTTrainer:
         # Training loop using ActivationStore as iterator
         print("\n>>> TRAINING PHASE <<<")
         sys.stdout.flush()
-        # --- Commented out memory logging --- #
-        # if torch.cuda.is_available() and self.device.type == "cuda":
-        #     logger.info(
-        #         f"Training Start Mem: {torch.cuda.memory_allocated(self.device) / (1024**2):.2f} MB"
-        #     )
 
         # Use tqdm to create progress bar for training
         pbar = tqdm(
@@ -720,17 +688,7 @@ class CLTTrainer:
 
                 try:
                     # Get batch directly from the iterator
-                    # --- Commented out memory logging --- #
-                    # mem_before_get_batch = 0 # REMOVED
-                    # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                    #      mem_before_get_batch = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
-
                     inputs, targets = next(self.activation_store)
-
-                    # --- Commented out memory logging --- #
-                    # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                    #     mem_after_get_batch = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
-                    #     logger.debug(f"Step {step} - After get_batch: Mem {mem_after_get_batch:.2f} MB (+{mem_after_get_batch - mem_before_get_batch:.2f} MB)") # REMOVED
 
                 except StopIteration:
                     print("Activation store exhausted. Training finished early.")
@@ -740,21 +698,13 @@ class CLTTrainer:
                     continue  # Skip this step if batch fetching fails
 
                 # --- Check for empty batch --- (Optional but good practice)
-                if (
-                    not inputs
-                    or not targets
-                    or not any(v.numel() > 0 for v in inputs.values())
-                ):
+                if not inputs or not targets or not any(v.numel() > 0 for v in inputs.values()):
                     print(f"\nWarning: Received empty batch at step {step}. Skipping.")
                     continue
 
                 # --- Forward pass and compute loss ---
                 self.optimizer.zero_grad()
                 # Loss manager needs the model, inputs, targets, and step info
-                # --- Commented out memory logging --- #
-                # mem_before_forward = 0 # REMOVED
-                # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                #     mem_before_forward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
 
                 loss, loss_dict = self.loss_manager.compute_total_loss(
                     self.model,
@@ -764,20 +714,13 @@ class CLTTrainer:
                     self.training_config.training_steps,
                 )
 
-                # --- Commented out memory logging --- #
-                # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                #     mem_after_forward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
-                #     logger.debug(f"Step {step} - After forward/loss: Mem {mem_after_forward:.2f} MB (+{mem_after_forward - mem_before_forward:.2f} MB)") # REMOVED
-
                 # --- Update Dead Neuron Counters ---
                 # We need feature activations *after* non-linearity
                 if hasattr(self, "n_forward_passes_since_fired"):
                     with torch.no_grad():
                         # Get feature activations (post-nonlinearity) for the current batch
                         # Assuming inputs is the dictionary of layer activations fed to the model
-                        feature_activations_batch = self.model.get_feature_activations(
-                            inputs
-                        )
+                        feature_activations_batch = self.model.get_feature_activations(inputs)
 
                         for layer_idx, layer_acts in feature_activations_batch.items():
                             # Ensure layer index is within bounds of the counter tensor
@@ -785,26 +728,15 @@ class CLTTrainer:
                                 if layer_acts.numel() > 0:
                                     # layer_acts shape: [batch_tokens, num_features]
                                     # Check which features fired (activation > threshold)
-                                    fired_mask_per_token = (
-                                        layer_acts > 1e-6
-                                    )  # Shape: [batch_tokens, num_features]
-                                    fired_features_this_layer = (
-                                        fired_mask_per_token.any(dim=0)
-                                    )  # Shape: [num_features]
+                                    fired_mask_per_token = layer_acts > 1e-6  # Shape: [batch_tokens, num_features]
+                                    fired_features_this_layer = fired_mask_per_token.any(dim=0)  # Shape: [num_features]
 
                                     # Ensure fired_features mask matches counter dimension
-                                    if (
-                                        fired_features_this_layer.shape[0]
-                                        == self.n_forward_passes_since_fired.shape[1]
-                                    ):
+                                    if fired_features_this_layer.shape[0] == self.n_forward_passes_since_fired.shape[1]:
                                         # Increment counters for all features in this layer
-                                        self.n_forward_passes_since_fired[
-                                            layer_idx
-                                        ] += 1
+                                        self.n_forward_passes_since_fired[layer_idx] += 1
                                         # Reset counters for features that fired
-                                        self.n_forward_passes_since_fired[layer_idx][
-                                            fired_features_this_layer
-                                        ] = 0
+                                        self.n_forward_passes_since_fired[layer_idx][fired_features_this_layer] = 0
                                     else:
                                         print(
                                             f"Warning: Shape mismatch for dead neuron update at layer {layer_idx}. "
@@ -821,38 +753,22 @@ class CLTTrainer:
                     # Optionally log more details or raise an error
                 else:
                     try:
-                        # --- Commented out memory logging --- #
-                        # mem_before_backward = 0 # REMOVED
-                        # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                        #     mem_before_backward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
 
                         loss.backward()
 
-                        # --- Commented out memory logging --- #
-                        # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                        #     mem_after_backward = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
-                        #     logger.debug(f"Step {step} - After backward: Mem {mem_after_backward:.2f} MB (+{mem_after_backward - mem_before_backward:.2f} MB)") # REMOVED
-
+                        # --- Gradient clipping --- #
+                        if self.training_config.gradient_clip_val is not None:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.training_config.gradient_clip_val,
+                            )
                     except RuntimeError as e:
-                        print(
-                            f"\nError during backward pass at step {step}: {e}. "
-                            f"Skipping optimizer step."
-                        )
+                        print(f"\nError during backward pass at step {step}: {e}. " f"Skipping optimizer step.")
                         # Potentially inspect gradients here if debugging is needed
                         continue  # Skip optimizer step if backward fails
 
                     # --- Optimizer step ---
-                    # --- Commented out memory logging --- #
-                    # mem_before_optimizer = 0 # REMOVED
-                    # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                    #     mem_before_optimizer = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
-
                     self.optimizer.step()
-
-                    # --- Commented out memory logging --- #
-                    # if torch.cuda.is_available() and self.device.type == "cuda": # REMOVED
-                    #     mem_after_optimizer = torch.cuda.memory_allocated(self.device) / (1024**2) # REMOVED
-                    #     logger.debug(f"Step {step} - After optimizer: Mem {mem_after_optimizer:.2f} MB (+{mem_after_optimizer - mem_before_optimizer:.2f} MB)") # REMOVED
 
                 # --- Scheduler step ---
                 if self.scheduler:
@@ -877,11 +793,6 @@ class CLTTrainer:
 
                 # --- Log metrics --- # Simplified memory logging here
                 self._log_metrics(step, loss_dict)
-                # --- Commented out per-step memory logging --- #
-                # if torch.cuda.is_available() and self.device.type == "cuda":
-                #     mem_end_step = torch.cuda.memory_allocated(self.device) / (1024**2)
-                #     elapsed_str = _format_elapsed_time(time.time() - self.start_time)
-                #     logger.debug(f"Step {step} - End [{elapsed_str}]. Mem: {mem_end_step:.2f} MB")
 
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
@@ -890,9 +801,7 @@ class CLTTrainer:
                 save_checkpoint_flag = (step % checkpoint_interval == 0) or (
                     step == self.training_config.training_steps - 1
                 )
-                run_eval_flag = (step % eval_interval == 0) or (
-                    step == self.training_config.training_steps - 1
-                )
+                run_eval_flag = (step % eval_interval == 0) or (step == self.training_config.training_steps - 1)
 
                 if run_eval_flag:
                     # Detach mask for evaluator, which runs with no_grad
@@ -914,16 +823,10 @@ class CLTTrainer:
 
                     # Use the pre-calculated aggregate density if available
                     avg_density_mean = eval_metrics.get("sparsity/feature_density_mean")
-                    dens_str = (
-                        f"Dens: {avg_density_mean:.3f}"
-                        if avg_density_mean is not None
-                        else "Dens: N/A"
-                    )
+                    dens_str = f"Dens: {avg_density_mean:.3f}" if avg_density_mean is not None else "Dens: N/A"
 
                     # Add total dead features from evaluation metrics
-                    eval_dead_str = (
-                        f"Dead(Eval): {eval_metrics.get('dead_features/total_eval', 0)}"
-                    )
+                    eval_dead_str = f"Dead(Eval): {eval_metrics.get('dead_features/total_eval', 0)}"
 
                     # Note: Lambda is logged during training step
                     eval_msg = f"{l0_str}, {ev_str}, {dens_str}, {eval_dead_str}"
@@ -966,9 +869,7 @@ class CLTTrainer:
         try:
             self.model.save(final_path)
             # Log final model as artifact to WandB
-            self.wandb_logger.log_artifact(
-                artifact_path=final_path, artifact_type="model", name="clt_final"
-            )
+            self.wandb_logger.log_artifact(artifact_path=final_path, artifact_type="model", name="clt_final")
         except Exception as e:
             print(f"Warning: Failed to save final model: {e}")
 

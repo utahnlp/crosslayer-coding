@@ -35,6 +35,38 @@ import requests
 from urllib.parse import quote, urljoin
 import signal  # For stopping server
 
+import logging
+import sys
+
+# # --- Set general DEBUG level for our application ---
+# root_logger = logging.getLogger()
+# root_logger.setLevel(logging.DEBUG)  # Keep our code logging at DEBUG
+
+# # --- QUIET DOWN noisy libraries ---
+# # Set level for 'requests' library (often includes urllib3 logs)
+# logging.getLogger("requests").setLevel(logging.WARNING)
+# # Set level specifically for 'urllib3' connection pool logs
+# logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+# # --- Ensure handlers are configured (same as before) ---
+# if not root_logger.hasHandlers():
+#     handler = logging.StreamHandler(sys.stdout)
+#     handler.setLevel(logging.DEBUG)  # Our handler still shows DEBUG
+#     formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+#     handler.setFormatter(formatter)
+#     root_logger.addHandler(handler)
+# else:
+#     for handler in root_logger.handlers:
+#         if handler.level > logging.DEBUG:
+#             # print(f"Setting handler {handler} level to DEBUG") # Optional
+#             handler.setLevel(logging.DEBUG)
+
+# # --- Optional: Print current levels ---
+# print(f"Root logger level: {logging.getLevelName(root_logger.level)}")
+# print(f"Requests logger level: {logging.getLevelName(logging.getLogger('requests').level)}")
+# print(f"Urllib3 logger level: {logging.getLevelName(logging.getLogger('urllib3').level)}")
+
+
 # --- Path Setup --- #
 # Assume this script is run from the `tutorials` directory
 tutorial_dir = os.path.dirname(os.path.abspath(__file__))
@@ -55,9 +87,7 @@ try:
     from clt.models.clt import CrossLayerTranscoder
 except ImportError as e:
     print(f"ImportError: {e}")
-    print(
-        "Please ensure the 'clt' library is installed or the project root is in your PYTHONPATH."
-    )
+    print("Please ensure the 'clt' library is installed or the project root is in your PYTHONPATH.")
     raise
 
 # --- Device Setup --- #
@@ -110,12 +140,8 @@ print("CLT Configuration:")
 print(clt_config)
 
 # --- Activation Generation Configuration (Remote) ---
-activation_dir = (
-    "./tutorial_activations"  # Still needed for potential local fallback/temp files
-)
-dataset_name = (
-    "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
-)
+activation_dir = "./tutorial_activations"  # Still needed for potential local fallback/temp files
+dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
@@ -157,9 +183,10 @@ dataset_id = f"{activation_config.model_name}/{os.path.basename(activation_confi
 
 training_config = TrainingConfig(
     # Training loop parameters
-    learning_rate=3e-4,
+    learning_rate=1e-4,
     training_steps=1000,  # Very few steps for tutorial
     train_batch_size_tokens=1024,
+    gradient_clip_val=1.0,
     # >> Key change: Activation source is remote <<
     activation_source="remote",
     # >> Key change: Provide remote config <<
@@ -169,18 +196,19 @@ training_config = TrainingConfig(
         # Added timeout parameters for remote connections
         "timeout": 120,  # 2 minutes timeout for batch fetching
         "max_retries": 3,  # Number of retries for failed batch fetches
-        "prefetch_batches": 4,  # Prefetch more batches to handle potential timeouts
+        "prefetch_batches": 16,  # Prefetch more batches to handle potential timeouts
     },
-    remote_prefetch_batches=16,
     # Normalization (Remote store handles fetching based on 'auto')
     normalization_method="auto",
+    activation_dtype="float32",
     # Loss function coefficients
     sparsity_lambda=0.00001,
     sparsity_c=1.0,
     preactivation_coef=3e-6,
     # Optimizer & Scheduler
     optimizer="adamw",
-    lr_scheduler="linear",
+    lr_scheduler="cosine",
+    lr_scheduler_params={"eta_min": 1e-4},
     # Logging & Checkpointing
     log_interval=10,
     eval_interval=50,
@@ -256,10 +284,7 @@ def start_server():
         while time.time() - start_wait < max_wait:
             try:
                 response = requests.get(HEALTH_CHECK_URL, timeout=1)
-                if (
-                    response.status_code == 200
-                    and response.json().get("status") == "ok"
-                ):
+                if response.status_code == 200 and response.json().get("status") == "ok":
                     print(f"Server is ready at {SERVER_URL}")
                     return True
             except requests.exceptions.ConnectionError:
@@ -330,9 +355,7 @@ try:
     generation_start_time = time.time()
     generator.generate_and_save()
     generation_end_time = time.time()
-    print(
-        f"Activation generation and sending complete in {generation_end_time - generation_start_time:.2f}s."
-    )
+    print(f"Activation generation and sending complete in {generation_end_time - generation_start_time:.2f}s.")
 except Exception as gen_err:
     print(f"[ERROR] Remote activation generation failed: {gen_err}")
     traceback.print_exc()
@@ -361,12 +384,8 @@ try:
     print(f"- Activation Source: {training_config.activation_source}")
     # Check if remote_config exists before accessing keys
     if training_config.remote_config:
-        print(
-            f"- Reading activations from server: {training_config.remote_config.get('server_url')}"
-        )
-        print(
-            f"- Dataset ID on server: {training_config.remote_config.get('dataset_id')}"
-        )
+        print(f"- Reading activations from server: {training_config.remote_config.get('server_url')}")
+        print(f"- Dataset ID on server: {training_config.remote_config.get('dataset_id')}")
     else:
         print("- Error: remote_config is missing in TrainingConfig!")
         raise ValueError("remote_config must be set for remote training source.")
@@ -392,9 +411,7 @@ except Exception as train_err:
     # Note: Trainer might not be fully initialized if error occurred early
     # Ensure the trainer's activation store is closed if it exists
     if trainer and hasattr(trainer, "activation_store") and trainer.activation_store:
-        if hasattr(trainer.activation_store, "close") and callable(
-            trainer.activation_store.close
-        ):
+        if hasattr(trainer.activation_store, "close") and callable(trainer.activation_store.close):
             print("Attempting to close activation store...")
             trainer.activation_store.close()
     # Important: Stop the server if training fails

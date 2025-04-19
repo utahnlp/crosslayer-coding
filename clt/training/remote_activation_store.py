@@ -18,287 +18,182 @@ This module requires the server refactor (`/slice` endpoint).
 
 from __future__ import annotations
 
-import os, io, math, json, time, logging
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Any
-from collections import defaultdict
+import logging
+import json
+from typing import Dict, Optional, Any  # Keep Dict, Optional, Any
+
+# Removed unused: os, io, time, Path, Tuple, defaultdict, Thread, Event
 
 import numpy as np
 import torch
 import requests
 from urllib.parse import urljoin, quote
-from torch.utils.data import Sampler
-from threading import Thread, Event
+
+# Import the new base class
+from .manifest_activation_store import ManifestActivationStore
+
+# Removed unused imports from previous version
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
 
-# Base abstract class for compatibility with trainer
-from .data import BaseActivationStore
-
-
-# ---------------------------------------------------------------------------
-# Helper: ShardedIndexSampler
-# ---------------------------------------------------------------------------
-class ShardedIndexSampler(Sampler):
-    def __init__(
-        self,
-        idx: np.ndarray,
-        batch_size: int,
-        seed: int,
-        epoch: int,
-        rank: int,
-        world: int,
-    ):
-        self.batch = batch_size
-        rng = np.random.default_rng(seed + epoch)
-        perm = rng.permutation(len(idx))
-        self.local = idx[perm][rank::world]  # disjoint slice per GPU
-
-    def __iter__(self):
-        for i in range(0, len(self.local), self.batch):
-            yield self.local[i : i + self.batch]
-
-    def __len__(self):
-        return math.ceil(len(self.local) / self.batch)
+# Removed unused import: BaseActivationStore (now inherited via ManifestActivationStore)
+# Removed unused import: Sampler (now in manifest_activation_store)
 
 
 # ---------------------------------------------------------------------------
 # RemoteActivationStore
 # ---------------------------------------------------------------------------
-ActivationBatch = Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]
+class RemoteActivationStore(ManifestActivationStore):
+    """
+    Activation store that fetches data from a remote slice server using
+    a manifest file for deterministic, sharded sampling.
+    Inherits common logic from ManifestActivationStore.
+    """
 
-
-class RemoteActivationStore(BaseActivationStore):
     def __init__(
         self,
         server_url: str,
         dataset_id: str,
         train_batch_size_tokens: int = 4096,
         device: torch.device | str | None = None,
-        dtype: torch.dtype = torch.bfloat16,
-        prefetch_batches: int = 4,
+        dtype: torch.dtype | str = "bfloat16",  # Match base class default
         rank: int = 0,
         world: int = 1,
         seed: int = 42,
         timeout: int = 60,
     ):
+        """
+        Initializes the RemoteActivationStore.
+
+        Args:
+            server_url: Base URL of the activation server (e.g., "http://localhost:8000").
+            dataset_id: Identifier for the dataset on the server (e.g., "gpt2/pile_train").
+            train_batch_size_tokens: Number of tokens per training batch.
+            device: Device to place tensors on.
+            dtype: Desired torch dtype for activations.
+            rank: Rank of the current process in distributed training.
+            world: Total number of processes in distributed training.
+            seed: Random seed for the sampler.
+            timeout: HTTP request timeout in seconds.
+        """
         self.server = server_url.rstrip("/") + "/"
-        self.did_enc = quote(dataset_id, safe="")
-        self.did_raw = dataset_id
-        self.batch_tok = train_batch_size_tokens
+        self.did_enc = quote(dataset_id, safe="")  # URL-encoded dataset ID
+        self.did_raw = dataset_id  # Raw dataset ID for logging/errors
         self.timeout = timeout
-        self.device = torch.device(
-            device or ("cuda" if torch.cuda.is_available() else "cpu")
-        )
-        # --- fetch metadata & manifest ---
-        self._meta = self._get_json("info")
-        if self._meta is None:
-            raise RuntimeError(
-                "Failed to fetch dataset metadata from server. Is the server running and dataset uploaded?"
-            )
 
-        # Get dtype from metadata, defaulting to bfloat16 if missing
-        self.dtype_str = self._meta.get("dtype", "bfloat16")
+        # Initialize the base class - this will call the _load_* methods below
+        super().__init__(
+            train_batch_size_tokens=train_batch_size_tokens,
+            device=device,
+            dtype=dtype,
+            rank=rank,
+            world=world,
+            seed=seed,
+        )
+
+        logger.info(
+            f"RemoteActivationStore initialized for dataset '{self.did_raw}' at {self.server} "
+            f"(Rank {self.rank}/{self.world}, Seed {self.seed}, Batch {self.train_batch_size_tokens}, "
+            f"Device {self.device}, Dtype {self.dtype})"
+        )
+
+    # --- Implementation of abstract methods for remote fetching --- #
+
+    def _load_metadata(self) -> Optional[Dict[str, Any]]:
+        """Fetches metadata.json from the server."""
+        return self._get_json("info", required=True)
+
+    def _load_manifest(self) -> Optional[np.ndarray]:
+        """Downloads index.bin (manifest) from the server."""
+        url = urljoin(self.server, f"datasets/{self.did_enc}/manifest")
+        logger.info(f"Downloading manifest from {url}")
         try:
-            self.dtype = getattr(torch, self.dtype_str)
-            logger.info(f"Using activation dtype from metadata: {self.dtype_str}")
-        except AttributeError:
+            r = requests.get(url, timeout=self.timeout)
+            r.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
+            # Manifest is stored as flat uint32 pairs (chunk_id, row_id)
+            data = np.frombuffer(r.content, dtype=np.uint32).reshape(-1, 2)
+            logger.info(
+                f"Manifest downloaded ({len(data)} rows, {r.content.__sizeof__() / 1024:.1f} KiB)."
+            )
+            return data
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download manifest from {url}: {e}")
+            return None
+        except ValueError as e:
+            logger.error(f"Error reshaping manifest data (expected Nx2 shape): {e}")
+            return None
+
+    def _load_norm_stats(self) -> Optional[Dict[str, Any]]:
+        """Fetches norm_stats.json from the server (optional)."""
+        # required=False means it won't raise an error if the file doesn't exist (404)
+        return self._get_json("norm_stats", required=False)
+
+    def _fetch_slice(self, chunk_id: int, row_indices: np.ndarray) -> bytes:
+        """
+        Fetches raw bytes for specific rows from a chunk via the /slice endpoint.
+        Assumes row_indices are sorted uint32.
+        """
+        if row_indices.dtype != np.uint32:
             logger.warning(
-                f"Metadata specified invalid dtype '{self.dtype_str}'. Defaulting to bfloat16."
+                f"Row indices dtype is {row_indices.dtype}, expected uint32. Casting."
             )
-            self.dtype = torch.bfloat16
+            row_indices = row_indices.astype(np.uint32)
 
-        # BaseActivationStore required attributes
-        self.train_batch_size_tokens = train_batch_size_tokens
+        # Convert numpy array to comma-separated string efficiently
+        # Using a simple loop might be faster for small arrays than np.array2string
+        row_str = ",".join(map(str, row_indices))
 
-        self.rank, self.world, self.seed = rank, world, seed
-        # --- fetch metadata & manifest ---
-        self.num_layers = self._meta["num_layers"]
-        self.d_model = self._meta["d_model"]
-        self.chunk_tokens = self._meta["chunk_tokens"]
-        self.total_tokens = self._meta["total_tokens"]
-
-        # layer indices list for each layer
-        self.layer_indices = list(range(self.num_layers))
-
-        self.manifest = self._download_manifest()
-        # norm stats
-        self.norm = self._get_json("norm_stats", required=False) or {}
-        if self.norm:
-            self._prep_norm()
-        # epoch / sampler
-        self.epoch = 0
-        self.sampler_iter = iter(
-            ShardedIndexSampler(
-                self.manifest,
-                self.batch_tok,
-                self.seed,
-                self.epoch,
-                self.rank,
-                self.world,
-            )
+        url = urljoin(
+            self.server,
+            f"datasets/{self.did_enc}/slice?chunk={chunk_id}&rows={row_str}",
         )
+        # Consider adding retry logic here for transient network issues
+        try:
+            r = requests.get(url, timeout=self.timeout)
+            r.raise_for_status()  # Check for HTTP errors
+            return r.content
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout fetching slice from {url}")
+            raise  # Re-raise Timeout
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HTTP error fetching slice from {url}: {e}")
+            # You might want custom exceptions here to distinguish network vs server errors
+            raise RuntimeError(f"Failed to fetch slice for chunk {chunk_id}") from e
 
-    # ------------------------------------------------------------------
-    # Networking helpers
-    # ------------------------------------------------------------------
+    # --- Helper methods specific to remote fetching --- #
+
     def _get_json(
         self, endpoint: str, required: bool = True
     ) -> Optional[Dict[str, Any]]:
+        """Helper to fetch JSON data from a specific dataset endpoint."""
         url = urljoin(self.server, f"datasets/{self.did_enc}/{endpoint}")
-        r = requests.get(url, timeout=30)
-        if not r.ok:
-            if required:
-                r.raise_for_status()
-            else:
-                return None
-        return r.json()
-
-    def _download_manifest(self) -> np.ndarray:
-        url = urljoin(self.server, f"datasets/{self.did_enc}/manifest")
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        data = np.frombuffer(r.content, dtype="<u4").reshape(-1, 2)
-        return data
-
-    # ------------------------------------------------------------------
-    def _prep_norm(self):
-        self.mean_in: Dict[int, torch.Tensor] = {}
-        self.std_in: Dict[int, torch.Tensor] = {}
-        self.mean_tg: Dict[int, torch.Tensor] = {}
-        self.std_tg: Dict[int, torch.Tensor] = {}
-        for k, d in self.norm.items():
-            lid = int(k)
-            self.mean_in[lid] = torch.tensor(
-                d["inputs"]["mean"], device=self.device, dtype=torch.float32
-            )
-            self.std_in[lid] = torch.tensor(
-                d["inputs"]["std"], device=self.device, dtype=torch.float32
-            )
-            self.mean_tg[lid] = torch.tensor(
-                d["targets"]["mean"], device=self.device, dtype=torch.float32
-            )
-            self.std_tg[lid] = torch.tensor(
-                d["targets"]["std"], device=self.device, dtype=torch.float32
-            )
-
-    # ------------------------------------------------------------------
-    def _fetch_slice(self, chunk: int, rows: List[int]) -> bytes:
-        row_str = ",".join(map(str, rows))
-        url = urljoin(
-            self.server, f"datasets/{self.did_enc}/slice?chunk={chunk}&rows={row_str}"
-        )
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        return r.content
-
-    # ------------------------------------------------------------------
-    def get_batch(self) -> ActivationBatch:
         try:
-            idxs = next(self.sampler_iter)  # (batch, 2) np.ndarray
-        except StopIteration:
-            # new epoch
-            self.epoch += 1
-            self.sampler_iter = iter(
-                ShardedIndexSampler(
-                    self.manifest,
-                    self.batch_tok,
-                    self.seed,
-                    self.epoch,
-                    self.rank,
-                    self.world,
-                )
-            )
-            idxs = next(self.sampler_iter)
-        # group by chunk
-        by_chunk: Dict[int, List[int]] = defaultdict(list)
-        for chunk_id, row in idxs:
-            by_chunk[int(chunk_id)].append(int(row))
-        layer_inputs: Dict[int, List[torch.Tensor]] = defaultdict(list)
-        layer_targets: Dict[int, List[torch.Tensor]] = defaultdict(list)
-        # download slices
-        for chunk_id, rows in by_chunk.items():
-            buf = self._fetch_slice(chunk_id, rows)
-            slice_tok = len(rows)
-            # --- Calculate byte offsets based on actual dtype --- #
-            bytes_per_element = torch.finfo(self.dtype).bits // 8
-            bytes_per_row = self.d_model * bytes_per_element
-            bytes_per_tensor = (
-                slice_tok * bytes_per_row
-            )  # for one tensor (input OR target)
-            per_layer_bytes = bytes_per_tensor * 2  # for both input and target
-            # ---------------------------------------------------- #
-            for li in range(self.num_layers):
-                start = li * per_layer_bytes
-                mid = start + bytes_per_tensor  # End of input tensor
-                end = start + per_layer_bytes
-                inp_buf = memoryview(buf)[start:mid]
-                tgt_buf = memoryview(buf)[mid:end]
-                inp = (
-                    torch.frombuffer(inp_buf, dtype=self.dtype)
-                    .reshape(slice_tok, self.d_model)
-                    .to(self.device)
-                )
-                tgt = (
-                    torch.frombuffer(tgt_buf, dtype=self.dtype)
-                    .reshape(slice_tok, self.d_model)
-                    .to(self.device)
-                )
-                if self.norm:
-                    inp = (inp - self.mean_in[li]) / (self.std_in[li] + 1e-6)
-                    tgt = (tgt - self.mean_tg[li]) / (self.std_tg[li] + 1e-6)
-                layer_inputs[li].append(inp)
-                layer_targets[li].append(tgt)
-        # concat pieces from multiple chunks if any
-        batch_inp = {
-            lid: torch.cat(tensors, dim=0) for lid, tensors in layer_inputs.items()
-        }
-        batch_tgt = {
-            lid: torch.cat(tensors, dim=0) for lid, tensors in layer_targets.items()
-        }
-        return batch_inp, batch_tgt
+            r = requests.get(url, timeout=self.timeout)
+            if not r.ok:
+                if r.status_code == 404 and not required:
+                    logger.info(f"Optional resource not found at {url} (404)")
+                    return None
+                else:
+                    # Raise detailed error
+                    r.raise_for_status()
 
-    # for trainer compatibility
-    def __iter__(self):
-        return self
+            return r.json()
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout fetching JSON from {url}")
+            if required:
+                raise
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.error(f"HTTP error fetching JSON from {url}: {e}")
+            if required:
+                raise  # Re-raise if required
+            return None
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to decode JSON response from {url}: {e}")
+            if required:
+                raise
+            return None
 
-    def __next__(self):
-        return self.get_batch()
-
-    # ------------------------------------------------------------------
-    # BaseActivationStore compatibility helpers
-    # ------------------------------------------------------------------
-
-    def state_dict(self) -> Dict[str, Any]:
-        """Return minimal state needed to resume iteration."""
-        return {
-            "store_type": "RemoteActivationStore",
-            "epoch": self.epoch,
-            "seed": self.seed,
-            # Note: we don't serialize sampler iterator position for simplicity.
-        }
-
-    def load_state_dict(self, state_dict: Dict[str, Any]):
-        """Load state created by `state_dict`. Resets sampler to saved epoch."""
-        self.epoch = int(state_dict.get("epoch", 0))
-        self.seed = int(state_dict.get("seed", self.seed))
-        # Re‑create sampler iterator from saved epoch
-        self.sampler_iter = iter(
-            ShardedIndexSampler(
-                self.manifest,
-                self.batch_tok,
-                self.seed,
-                self.epoch,
-                self.rank,
-                self.world,
-            )
-        )
-
-    def __len__(self):
-        """Rough estimate of number of batches in the dataset."""
-        if self.total_tokens <= 0 or self.train_batch_size_tokens <= 0:
-            return 0
-        return (
-            self.total_tokens + self.train_batch_size_tokens - 1
-        ) // self.train_batch_size_tokens
+    # state_dict and load_state_dict are handled by the base class
+    # __len__ is handled by the base class
+    # __iter__ and __next__ are handled by the base class
