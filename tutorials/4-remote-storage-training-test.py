@@ -139,47 +139,7 @@ print("CLT Configuration:")
 print(clt_config)
 
 # --- Activation Generation Configuration (Remote) ---
-activation_dir = "./tutorial_activations"  # Still needed for potential local fallback/temp files
-dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
-activation_config = ActivationConfig(
-    # Model Source
-    model_name=BASE_MODEL_NAME,
-    mlp_input_module_path_template="transformer.h.{}.ln_2.input",
-    mlp_output_module_path_template="transformer.h.{}.mlp.output",
-    # Dataset Source
-    dataset_path=dataset_name,
-    dataset_split="train",
-    dataset_text_column="text",
-    # Generation Parameters
-    context_size=128,
-    inference_batch_size=192,  # Smaller batch size if needed
-    activation_dtype="float32",
-    exclude_special_tokens=True,
-    prepend_bos=True,
-    # Dataset Handling
-    streaming=True,
-    dataset_trust_remote_code=False,
-    cache_path=None,
-    # Generation Output Control
-    target_total_tokens=1_000_000,  # Very small token count for tutorial speed
-    # Storage Parameters
-    activation_dir=activation_dir,
-    output_format="hdf5",  # MUST be hdf5 for current remote implementation
-    compression="gzip",
-    chunk_token_threshold=8_000,  # Small chunk size (reduced from 10k)
-    # >> Key change: Point to the server <<
-    remote_server_url=SERVER_URL,
-    # Normalization
-    compute_norm_stats=True,
-    model_dtype=None,
-)
-print("\nActivation Generation Configuration (Remote):")
-print(activation_config)
-
-# --- Training Configuration (Remote) ---
-# Construct the dataset_id used by the server/generator
-dataset_id = f"{activation_config.model_name}/{os.path.basename(activation_config.dataset_path)}_{activation_config.dataset_split}"
-
+dataset_id = "gpt2/pile-uncopyrighted_train"
 training_config = TrainingConfig(
     # Training loop parameters
     learning_rate=1e-4,
@@ -292,3 +252,5 @@ except Exception as train_err:
             trainer.activation_store.close()
     # Important: Stop the server if training fails
     raise
+
+# %%

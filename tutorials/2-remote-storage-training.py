@@ -100,8 +100,8 @@ else:
 print(f"Using device: {device}")
 
 # --- Server Configuration --- #
-SERVER_HOST = "34.41.125.189"  # Run on local server for now
-SERVER_PORT = 8000  # Use a different port than default 8000 just in case
+SERVER_HOST = "127.0.0.1"  # Run on local server for now
+SERVER_PORT = 8001  # Use a different port than default 8000 just in case
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 HEALTH_CHECK_URL = urljoin(SERVER_URL, "/api/v1/health")
 # Ensure server uses a temporary directory for this tutorial
@@ -139,7 +139,7 @@ print("CLT Configuration:")
 print(clt_config)
 
 # --- Activation Generation Configuration (Remote) ---
-activation_dir = "./tutorial_activations"  # Still needed for potential local fallback/temp files
+activation_dir = "./tutorial_activations_small"  # Still needed for potential local fallback/temp files
 dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
     # Model Source
@@ -152,7 +152,7 @@ activation_config = ActivationConfig(
     dataset_text_column="text",
     # Generation Parameters
     context_size=128,
-    inference_batch_size=192,  # Smaller batch size if needed
+    inference_batch_size=256,  # Smaller batch size if needed
     activation_dtype="float32",
     exclude_special_tokens=True,
     prepend_bos=True,
@@ -161,7 +161,7 @@ activation_config = ActivationConfig(
     dataset_trust_remote_code=False,
     cache_path=None,
     # Generation Output Control
-    target_total_tokens=1_000_000,  # Very small token count for tutorial speed
+    target_total_tokens=40_000,  # Very small token count for tutorial speed
     # Storage Parameters
     activation_dir=activation_dir,
     output_format="hdf5",  # MUST be hdf5 for current remote implementation
