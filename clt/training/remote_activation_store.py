@@ -28,6 +28,7 @@ import numpy as np
 import torch
 import requests
 from urllib.parse import urljoin, quote
+import time
 
 # Import the new base class
 from .manifest_activation_store import ManifestActivationStore
@@ -101,30 +102,44 @@ class RemoteActivationStore(ManifestActivationStore):
 
     def _load_metadata(self) -> Optional[Dict[str, Any]]:
         """Fetches metadata.json from the server."""
-        return self._get_json("info", required=True)
+        return self._get_json("info", required=True, retries=3)
 
     def _load_manifest(self) -> Optional[np.ndarray]:
         """Downloads index.bin (manifest) from the server."""
+        max_retries = 3
+        base_delay = 2  # seconds
         url = urljoin(self.server, f"datasets/{self.did_enc}/manifest")
         logger.info(f"Downloading manifest from {url}")
-        try:
-            r = requests.get(url, timeout=self.timeout)
-            r.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
-            # Manifest is stored as flat uint32 pairs (chunk_id, row_id)
-            data = np.frombuffer(r.content, dtype=np.uint32).reshape(-1, 2)
-            logger.info(f"Manifest downloaded ({len(data)} rows, {r.content.__sizeof__() / 1024:.1f} KiB).")
-            return data
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to download manifest from {url}: {e}")
-            return None
-        except ValueError as e:
-            logger.error(f"Error reshaping manifest data (expected Nx2 shape): {e}")
-            return None
+
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url, timeout=self.timeout)
+                r.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
+                # Manifest is stored as flat uint32 pairs (chunk_id, row_id)
+                data = np.frombuffer(r.content, dtype=np.uint32).reshape(-1, 2)
+                logger.info(f"Manifest downloaded ({len(data)} rows, {r.content.__sizeof__() / 1024:.1f} KiB).")
+                return data  # Success
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to download manifest from {url}: {e}")
+                if attempt + 1 == max_retries:
+                    logger.error(f"Final attempt failed to download manifest. Returning None.")
+                    return None  # Failure after retries
+                else:
+                    delay = base_delay * (2**attempt)
+                    logger.info(f"Retrying manifest download in {delay:.1f} seconds...")
+                    time.sleep(delay)
+            except ValueError as e:
+                # This error is likely permanent (bad data), don't retry
+                logger.error(f"Error reshaping manifest data (expected Nx2 shape): {e}")
+                return None
+        # Should not be reached if retries exhaust, but added for safety
+        return None
 
     def _load_norm_stats(self) -> Optional[Dict[str, Any]]:
         """Fetches norm_stats.json from the server (optional)."""
+        # Don't retry aggressively for optional file
         # required=False means it won't raise an error if the file doesn't exist (404)
-        return self._get_json("norm_stats", required=False)
+        return self._get_json("norm_stats", required=False, retries=1)
 
     def _fetch_slice(self, chunk_id: int, row_indices: np.ndarray) -> bytes:
         """
@@ -160,35 +175,52 @@ class RemoteActivationStore(ManifestActivationStore):
 
     # --- Helper methods specific to remote fetching --- #
 
-    def _get_json(self, endpoint: str, required: bool = True) -> Optional[Dict[str, Any]]:
-        """Helper to fetch JSON data from a specific dataset endpoint."""
+    def _get_json(self, endpoint: str, required: bool = True, retries: int = 1) -> Optional[Dict[str, Any]]:
+        """Helper to fetch JSON data from a specific dataset endpoint.
+        Retries up to `retries` times on failure.
+        """
+        base_delay = 1  # seconds
         url = urljoin(self.server, f"datasets/{self.did_enc}/{endpoint}")
-        try:
-            r = requests.get(url, timeout=self.timeout)
-            if not r.ok:
-                if r.status_code == 404 and not required:
-                    logger.info(f"Optional resource not found at {url} (404)")
-                    return None
-                else:
-                    # Raise detailed error
-                    r.raise_for_status()
 
-            return r.json()
-        except requests.exceptions.Timeout:
-            logger.error(f"Timeout fetching JSON from {url}")
-            if required:
-                raise
-            return None
-        except requests.exceptions.RequestException as e:
-            logger.error(f"HTTP error fetching JSON from {url}: {e}")
-            if required:
-                raise  # Re-raise if required
-            return None
-        except json.JSONDecodeError as e:
-            logger.error(f"Failed to decode JSON response from {url}: {e}")
-            if required:
-                raise
-            return None
+        for attempt in range(retries):
+            try:
+                r = requests.get(url, timeout=self.timeout)
+                if not r.ok:
+                    # If it's optional and not found, return None immediately (no retry needed)
+                    if r.status_code == 404 and not required:
+                        logger.info(f"Optional resource not found at {url} (404)")
+                        return None
+                    else:
+                        # Raise detailed error for other non-OK statuses (will be caught below)
+                        r.raise_for_status()
+
+                # Success case
+                data = r.json()
+                logger.info(f"Successfully fetched JSON from {url} on attempt {attempt + 1}")
+                return data
+
+            except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+                logger.warning(f"Attempt {attempt + 1}/{retries} failed to fetch JSON from {url}: {e}")
+                if attempt + 1 == retries:
+                    # Final attempt failed
+                    logger.error(f"Final attempt failed to fetch JSON from {url}. Returning None or raising error.")
+                    if required:
+                        # Re-raise the exception if the resource was required
+                        raise RuntimeError(
+                            f"Failed to fetch required resource {endpoint} after {retries} attempts"
+                        ) from e
+                    else:
+                        # Return None if optional
+                        return None
+                else:
+                    # Wait and retry
+                    delay = base_delay * (2**attempt)
+                    logger.info(f"Retrying JSON fetch from {url} in {delay:.1f} seconds...")
+                    time.sleep(delay)
+        # Should not be reached if retries exhaust, but added for safety
+        if required:
+            raise RuntimeError(f"Failed to fetch required resource {endpoint} after {retries} attempts (logic error)")
+        return None
 
     # state_dict and load_state_dict are handled by the base class
     # __len__ is handled by the base class

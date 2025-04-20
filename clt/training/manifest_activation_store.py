@@ -19,6 +19,8 @@ import numpy as np
 import torch
 from torch.utils.data import Sampler
 import h5py  # Needed for _open_h5 cache type hint
+import random  # For jitter
+import requests  # <-- Add import for requests
 
 # Import BaseActivationStore from the original data module
 from .data import BaseActivationStore
@@ -442,7 +444,15 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             self.mean_in, self.std_in, self.mean_tg, self.std_tg = {}, {}, {}, {}
 
     def get_batch(self) -> ActivationBatch:
-        """Fetches the next batch based on the manifest sampler."""
+        """Fetches the next batch based on the manifest sampler.
+        Raises RuntimeError if a batch cannot be fetched due to persistent chunk errors.
+        """
+        # --> ADDED: Retry config for fetch <--
+        max_fetch_retries = 3
+        fetch_initial_backoff = 0.5  # seconds
+        fetch_max_backoff = 10.0  # seconds
+        # --> END ADDED <--
+
         start_time = time.monotonic()
         try:
             idxs = next(self.sampler_iter)
@@ -478,24 +488,72 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         raw_bytes_by_chunk: Dict[int, bytes] = {}
         fetch_errors = []
         for chunk_id, row_indices_for_chunk in rows_by_chunk.items():
-            try:
-                # Use a sorted COPY for efficient fetching while preserving the
-                # original order so we can restore it later without per‑row loops.
-                sorted_rows = np.sort(row_indices_for_chunk)
-                raw_bytes_by_chunk[chunk_id] = self._fetch_slice(chunk_id, sorted_rows)
-                expected_bytes = len(sorted_rows) * self.bytes_per_row * 2 * self.num_layers
-                actual_bytes = len(raw_bytes_by_chunk[chunk_id])
-                if actual_bytes != expected_bytes:
-                    logger.error(
-                        f"Chunk {chunk_id}: Fetched byte size mismatch. Expected {expected_bytes}, got {actual_bytes}"
-                    )
-                    raise ValueError(f"Incorrect byte size fetched for chunk {chunk_id}")
-            except Exception as e:
-                logger.error(f"Failed to fetch slice for chunk {chunk_id}: {e}", exc_info=True)
-                fetch_errors.append(chunk_id)
+            # --> ADDED: Retry Loop for _fetch_slice <--
+            chunk_fetch_success = False
+            for attempt in range(max_fetch_retries):
+                try:
+                    # Use a sorted COPY for efficient fetching
+                    sorted_rows = np.sort(row_indices_for_chunk)
+                    fetched_bytes = self._fetch_slice(chunk_id, sorted_rows)
+                    raw_bytes_by_chunk[chunk_id] = fetched_bytes  # Store fetched bytes
 
+                    # Check byte size immediately after fetch
+                    expected_bytes = len(sorted_rows) * self.bytes_per_row * 2 * self.num_layers
+                    actual_bytes = len(fetched_bytes)
+                    if actual_bytes != expected_bytes:
+                        # Raise specific error for size mismatch
+                        raise ValueError(
+                            f"Incorrect byte size fetched for chunk {chunk_id}. Expected {expected_bytes}, got {actual_bytes}"
+                        )
+
+                    # If fetch and size check successful
+                    chunk_fetch_success = True
+                    logger.debug(f"Successfully fetched chunk {chunk_id} slice on attempt {attempt + 1}")
+                    break  # Exit retry loop for this chunk
+
+                except (ValueError, RuntimeError, requests.exceptions.RequestException) as e:
+                    # Catch fetch errors (RuntimeError from _fetch_slice, RequestException, ValueError for size mismatch)
+                    logger.warning(
+                        f"Attempt {attempt + 1}/{max_fetch_retries} failed to fetch/validate slice for chunk {chunk_id}: {e}"
+                    )
+                    if attempt + 1 == max_fetch_retries:
+                        logger.error(f"Final attempt failed for chunk {chunk_id}. Adding to fetch_errors.")
+                        fetch_errors.append(chunk_id)
+                        # Break inner loop, error recorded
+                        break
+                    else:
+                        backoff_time = min(fetch_initial_backoff * (2**attempt), fetch_max_backoff)
+                        jitter = backoff_time * 0.1
+                        sleep_time = backoff_time + random.uniform(-jitter, jitter)
+                        logger.info(f"Retrying fetch for chunk {chunk_id} in {sleep_time:.2f} seconds...")
+                        time.sleep(sleep_time)
+                except Exception as e:
+                    # Catch unexpected errors
+                    logger.error(
+                        f"Unexpected error fetching slice for chunk {chunk_id} on attempt {attempt + 1}: {e}",
+                        exc_info=True,
+                    )
+                    fetch_errors.append(chunk_id)
+                    # Treat unexpected errors as fatal for this chunk fetch
+                    break  # Exit retry loop for this chunk
+            # --> END ADDED: Retry Loop <--
+
+            # If a chunk failed all retries, we stop processing this batch
+            if not chunk_fetch_success and chunk_id in fetch_errors:
+                logger.error(f"Stopping batch processing because chunk {chunk_id} failed all fetch attempts.")
+                break  # Exit the outer loop over chunks
+
+        # If any chunk failed permanently after retries, raise an error for the whole batch
         if fetch_errors:
-            raise RuntimeError(f"Failed to fetch data for chunks: {fetch_errors}")
+            # ---> MODIFIED: Raise RuntimeError again <---
+            failed_chunks_str = ", ".join(map(str, sorted(fetch_errors)))
+            logger.error(
+                f"Permanently failed to fetch data for chunk(s): {failed_chunks_str} after {max_fetch_retries} retries."
+            )
+            # Raise runtime error to be caught by __next__
+            raise RuntimeError(f"Failed to fetch data for chunk(s): {sorted(fetch_errors)} after retries.")
+            # ---> END MODIFIED <---
+
         fetch_duration = time.monotonic() - fetch_start_time
         parse_start_time = time.monotonic()
 
@@ -635,7 +693,27 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         return self
 
     def __next__(self):
-        return self.get_batch()
+        # --> MODIFIED: Implement skip logic <--
+        try:
+            # Attempt to get the next batch normally
+            return self.get_batch()
+        except RuntimeError as e:
+            # This exception is raised by get_batch() if fetching fails permanently
+            logger.warning(f"Batch fetch failed ({e}), attempting to skip and fetch the next one...")
+            try:
+                # Try getting the *subsequent* batch
+                next_batch = self.get_batch()
+                logger.info("Successfully fetched subsequent batch after skipping failed one.")
+                return next_batch
+            except RuntimeError as e2:
+                logger.error(f"Failed to fetch subsequent batch after skip ({e2}). Stopping iteration.")
+                raise StopIteration("Consecutive batch fetches failed.") from e2
+            except StopIteration:
+                # If the store was exhausted when trying to get the next batch
+                logger.info("Store exhausted while trying to fetch subsequent batch after skip.")
+                raise  # Re-raise StopIteration
+        # Note: StopIteration from the initial self.get_batch() call propagates normally
+        # --> END MODIFIED <--
 
 
 # --- LRU Cache for HDF5 Files (used by Local variant) ---

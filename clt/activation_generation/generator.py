@@ -81,6 +81,8 @@ def _async_uploader(upload_q: "queue.Queue[Path]", cfg: ActivationConfig):
                 if item is None:
                     upload_q.task_done()
                     break
+                # Mark drained items as done too
+                logger.warning(f"Draining un-uploadable item: {item.name}")
                 upload_q.task_done()
             except queue.Empty:
                 break
@@ -89,31 +91,117 @@ def _async_uploader(upload_q: "queue.Queue[Path]", cfg: ActivationConfig):
     base = cfg.remote_server_url.rstrip("/") + "/"
     sess = requests.Session()
 
+    # --> ADDED: Retry/Backoff Configuration <--
+    # TODO: Make these configurable via ActivationConfig?
+    max_retries_per_chunk = getattr(cfg, "upload_max_retries", 5)  # Default 5 retries
+    initial_backoff = getattr(cfg, "upload_initial_backoff", 1.0)  # Default 1 second
+    max_backoff = getattr(cfg, "upload_max_backoff", 30.0)  # Default 30 seconds
+    # --> END ADDED <--
+
     while True:
         p = upload_q.get()
         if p is None:
             upload_q.task_done()
-            break
+            break  # Sentinel value received, terminate thread
+
         idx = int(p.stem.split("_")[-1])
         url = urljoin(base, f"datasets/{dataset_id}/chunks/{idx}")
-        try:
-            print(f"[Uploader Thread] Attempting to upload chunk: {p.name} to {url}")
-            with open(p, "rb") as f:
-                files = {"chunk_file": (p.name, f, "application/x-hdf5")}
-                headers = {
-                    "X-Num-Tokens": str(cfg.chunk_token_threshold),
-                    "X-Saved-Dtype": cfg.activation_dtype,
-                }
-                r = sess.post(url, files=files, headers=headers, timeout=300)
-                r.raise_for_status()
-                logger.info("Uploaded %s → %d", p.name, r.status_code)
-                if cfg.delete_after_upload:
-                    p.unlink(missing_ok=True)
-        except Exception as e:
-            logger.warning("Upload failed %s: %s – will retry", p, e)
-            upload_q.put(p)
-        finally:
-            upload_q.task_done()
+        upload_success = False
+
+        # --> ADDED: Retry Loop <--
+        for attempt in range(max_retries_per_chunk):
+            try:
+                print(
+                    f"[Uploader Thread Attempt {attempt+1}/{max_retries_per_chunk}] Uploading chunk: {p.name} to {url}"
+                )
+                with open(p, "rb") as f:
+                    files = {"chunk_file": (p.name, f, "application/x-hdf5")}
+                    # TODO: Fetch num_tokens and saved_dtype from the chunk file itself or metadata?
+                    # For now, using config values, which might be okay if consistent.
+                    headers = {
+                        "X-Num-Tokens": str(cfg.chunk_token_threshold),
+                        "X-Saved-Dtype": cfg.activation_dtype,
+                    }
+                    r = sess.post(url, files=files, headers=headers, timeout=300)
+
+                    # Check status code for retry logic
+                    if r.ok:  # 2xx status codes
+                        logger.info(f"Uploaded {p.name} -> {r.status_code} on attempt {attempt + 1}")
+                        upload_success = True
+                        if cfg.delete_after_upload:
+                            try:
+                                p.unlink(missing_ok=True)
+                                logger.debug(f"Deleted local chunk {p.name} after successful upload.")
+                            except OSError as unlink_err:
+                                logger.warning(f"Failed to delete chunk {p.name} after upload: {unlink_err}")
+                        break  # Exit retry loop on success
+                    else:
+                        # Non-2xx status codes - decide whether to retry
+                        is_retryable = False
+                        if r.status_code in {408, 429, 500, 502, 503, 504}:
+                            is_retryable = True
+                            logger.warning(
+                                f"Upload attempt {attempt + 1} for {p.name} failed with retryable status {r.status_code}: {r.text}"
+                            )
+                        elif r.status_code == 507:
+                            logger.error(f"Upload failed for {p.name}: Server out of storage (507). Not retrying.")
+                            # Non-retryable error
+                        elif 400 <= r.status_code < 500:
+                            logger.error(
+                                f"Upload failed for {p.name}: Client error {r.status_code}. Not retrying. Response: {r.text}"
+                            )
+                            # Non-retryable client error
+                        else:
+                            logger.error(
+                                f"Upload attempt {attempt + 1} for {p.name} failed with unexpected status {r.status_code}: {r.text}. Not retrying."
+                            )
+                        # Unexpected - treat as non-retryable for safety
+
+                        if not is_retryable:
+                            break  # Exit retry loop for non-retryable errors
+                        # For retryable errors, continue to backoff logic below
+
+            except requests.exceptions.Timeout as e:
+                logger.warning(f"Upload attempt {attempt + 1} for {p.name} timed out: {e}")
+                is_retryable = True  # Treat timeouts as retryable
+            except requests.exceptions.ConnectionError as e:
+                logger.warning(f"Upload attempt {attempt + 1} for {p.name} failed due to connection error: {e}")
+                is_retryable = True  # Treat connection errors as retryable
+            except requests.exceptions.RequestException as e:
+                # Catch other potential request exceptions (e.g., DNS errors)
+                logger.warning(f"Upload attempt {attempt + 1} for {p.name} failed with request exception: {e}")
+                is_retryable = True  # Generally treat these as retryable
+            except Exception as e:
+                # Catch unexpected errors during file open, etc.
+                logger.error(f"Unexpected error during upload attempt {attempt + 1} for {p.name}: {e}", exc_info=True)
+                is_retryable = False  # Don't retry unexpected code errors
+                break  # Exit retry loop
+
+            # --- Backoff logic if retry is needed --- #
+            if attempt + 1 < max_retries_per_chunk and is_retryable:
+                backoff_time = min(initial_backoff * (2**attempt), max_backoff)
+                jitter = backoff_time * 0.1
+                sleep_time = backoff_time + random.uniform(-jitter, jitter)
+                logger.info(f"Retrying upload of {p.name} in {sleep_time:.2f} seconds...")
+                time.sleep(sleep_time)
+            elif not is_retryable:
+                logger.error(f"Upload failed for {p.name} due to non-retryable error. Stopping attempts.")
+                break  # Exit retry loop immediately if error is non-retryable
+
+        # --- After Retry Loop --- #
+        if not upload_success:
+            logger.error(
+                f"Failed to upload chunk {p.name} after {max_retries_per_chunk} attempts. Chunk will remain locally."
+            )
+            # NOTE: We are NOT re-queuing the item here to prevent potential infinite loops
+            # if the error condition persists. The file remains locally.
+            # Consider adding logic here later to move failed chunks to a separate directory.
+
+        # --> Moved task_done outside the retry loop <--
+        # Ensure task_done is called exactly once per item from the queue,
+        # regardless of success, failure, or retries.
+        upload_q.task_done()
+        # --> END MOVED <--
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +273,8 @@ class ActivationGenerator:
         # Default storage mode is inferred from whether a remote URL is
         # configured. Users can later override via `set_storage_type()`.
         self.storage_type: str = "remote" if cfg.remote_server_url else "local"
+        if self.storage_type == "remote" and not cfg.remote_server_url:
+            raise ValueError("Storage type is 'remote' but no remote_server_url is configured.")
 
     # ------------------------------------------------------------------
     def generate_and_save(self):
@@ -379,13 +469,28 @@ class ActivationGenerator:
             raise ValueError(f"Unsupported torch_dtype for HDF5: {self.torch_dtype}")
         # ----------------------------------------------------- #
 
-        with h5py.File(p, "w", libver="latest") as hf:
-            _create_datasets(hf, layer_ids, rows, d_model, h5py_dtype=h5py_dtype_str)
-            for lid in layer_ids:
-                inp = torch.cat(buf_inp[lid], 0)[perm].to(self.torch_dtype).numpy()
-                tgt = torch.cat(buf_tgt[lid], 0)[perm].to(self.torch_dtype).numpy()
-                hf[f"layer_{lid}/inputs"][:] = inp
-                hf[f"layer_{lid}/targets"][:] = tgt
+        try:
+            with h5py.File(p, "w", libver="latest") as hf:
+                _create_datasets(hf, layer_ids, rows, d_model, h5py_dtype=h5py_dtype_str)
+                for lid in layer_ids:
+                    inp = torch.cat(buf_inp[lid], 0)[perm].to(self.torch_dtype).numpy()
+                    tgt = torch.cat(buf_tgt[lid], 0)[perm].to(self.torch_dtype).numpy()
+                    # View casting for bfloat16 before saving
+                    if h5py_dtype_str == "uint16" and inp.dtype == np.dtype("bfloat16"):
+                        inp = inp.view(np.uint16)
+                        tgt = tgt.view(np.uint16)
+
+                    hf[f"layer_{lid}/inputs"][:] = inp
+                    hf[f"layer_{lid}/targets"][:] = tgt
+        except (IOError, OSError) as e:
+            logger.error(f"Failed to write HDF5 chunk {p}: {e}", exc_info=True)
+            # Attempt to remove potentially corrupted partial file
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                logger.warning(f"Failed to remove partial chunk file {p} after write error.")
+            # Re-raise to halt generation
+            raise RuntimeError(f"Fatal error writing HDF5 chunk {chunk_idx}") from e
 
         # Append manifest rows for this chunk
         m = np.empty((rows, 2), dtype="<u4")
@@ -445,7 +550,10 @@ class ActivationGenerator:
         """Upload metadata or norm_stats JSON to the server.
 
         `endpoint` must be either 'metadata' or 'norm_stats'.
+        Retries up to 3 times on failure.
         """
+        max_retries = 3
+        base_delay = 1  # seconds
 
         if endpoint not in {"metadata", "norm_stats"}:
             raise ValueError("endpoint must be 'metadata' or 'norm_stats'")
@@ -459,18 +567,35 @@ class ActivationGenerator:
         base = self.cfg.remote_server_url.rstrip("/") + "/"
         url = urljoin(base, f"datasets/{dataset_id}/{endpoint}")
 
-        with open(path, "r") as f:
-            data = json.load(f)
+        for attempt in range(max_retries):
+            try:
+                with open(path, "r") as f:
+                    data = json.load(f)
 
-        r = requests.post(url, json=data, timeout=60)
-        r.raise_for_status()
+                r = requests.post(url, json=data, timeout=60)
+                r.raise_for_status()
+                logger.info(f"Successfully uploaded {path.name} to {endpoint} endpoint on attempt {attempt + 1}")
+                return  # Success
+            except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to upload {path.name} to {endpoint}: {e}")
+                if attempt + 1 == max_retries:
+                    logger.error(f"Final attempt failed to upload {path.name}. Giving up.")
+                    raise RuntimeError(f"Failed to upload {path.name} after {max_retries} attempts") from e
+                else:
+                    delay = base_delay * (2**attempt)
+                    logger.info(f"Retrying upload of {path.name} in {delay:.1f} seconds...")
+                    time.sleep(delay)
 
     # ------------------------------------------------------------------
     def _upload_binary_file(self, path: Path, endpoint: str):
         """Upload a binary file (like index.bin) to the server.
 
         `endpoint` must be the target path component (e.g., 'manifest').
+        Retries up to 3 times on failure.
         """
+        max_retries = 3
+        base_delay = 2  # seconds, slightly longer for potentially larger files
+
         if not self.cfg.remote_server_url:
             raise ValueError("remote_server_url is not configured for upload")
 
@@ -479,16 +604,36 @@ class ActivationGenerator:
         base = self.cfg.remote_server_url.rstrip("/") + "/"  # Point to root
         url = urljoin(base, f"datasets/{dataset_id}/{endpoint}")
 
-        try:
-            with open(path, "rb") as f:
-                # Use the correct key expected by the server endpoint (manifest_file)
-                files = {"manifest_file": (path.name, f, "application/octet-stream")}
-                r = requests.post(url, files=files, timeout=300)  # Increased timeout
-                r.raise_for_status()
-                logger.info(f"Uploaded {path.name} to {endpoint} endpoint")
-        except Exception as e:
-            logger.error(f"Failed to upload {path.name} to {endpoint}: {e}")
-            raise  # Re-raise after logging
+        for attempt in range(max_retries):
+            try:
+                with open(path, "rb") as f:
+                    # Use the correct key expected by the server endpoint (e.g., manifest_file)
+                    file_key = f"{endpoint}_file"  # Dynamically create key, assuming convention
+                    if endpoint == "manifest":  # Explicit mapping if needed
+                        file_key = "manifest_file"
+                    # Add other endpoint -> key mappings here if necessary
+
+                    files = {file_key: (path.name, f, "application/octet-stream")}
+                    r = requests.post(url, files=files, timeout=300)  # Increased timeout
+                    r.raise_for_status()
+                    logger.info(f"Successfully uploaded {path.name} to {endpoint} endpoint on attempt {attempt + 1}")
+                    return  # Success
+            except requests.exceptions.RequestException as e:
+                logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to upload {path.name} to {endpoint}: {e}")
+                if attempt + 1 == max_retries:
+                    logger.error(f"Final attempt failed to upload {path.name}. Giving up.")
+                    raise RuntimeError(f"Failed to upload {path.name} after {max_retries} attempts") from e
+                else:
+                    delay = base_delay * (2**attempt)
+                    logger.info(f"Retrying upload of {path.name} in {delay:.1f} seconds...")
+                    time.sleep(delay)
+            except Exception as e:
+                # Catch other potential errors during file handling/request prep
+                logger.error(
+                    f"Unexpected error during upload attempt {attempt + 1} for {path.name}: {e}", exc_info=True
+                )
+                # Treat unexpected errors as fatal for now
+                raise RuntimeError(f"Unexpected error uploading {path.name}") from e
 
 
 # ---------------------------------------------------------------------------
