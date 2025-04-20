@@ -112,9 +112,7 @@ class RemoteActivationStore(ManifestActivationStore):
             r.raise_for_status()  # Raises HTTPError for bad responses (4xx or 5xx)
             # Manifest is stored as flat uint32 pairs (chunk_id, row_id)
             data = np.frombuffer(r.content, dtype=np.uint32).reshape(-1, 2)
-            logger.info(
-                f"Manifest downloaded ({len(data)} rows, {r.content.__sizeof__() / 1024:.1f} KiB)."
-            )
+            logger.info(f"Manifest downloaded ({len(data)} rows, {r.content.__sizeof__() / 1024:.1f} KiB).")
             return data
         except requests.exceptions.RequestException as e:
             logger.error(f"Failed to download manifest from {url}: {e}")
@@ -134,22 +132,22 @@ class RemoteActivationStore(ManifestActivationStore):
         Assumes row_indices are sorted uint32.
         """
         if row_indices.dtype != np.uint32:
-            logger.warning(
-                f"Row indices dtype is {row_indices.dtype}, expected uint32. Casting."
-            )
+            logger.warning(f"Row indices dtype is {row_indices.dtype}, expected uint32. Casting.")
             row_indices = row_indices.astype(np.uint32)
 
-        # Convert numpy array to comma-separated string efficiently
         # Using a simple loop might be faster for small arrays than np.array2string
-        row_str = ",".join(map(str, row_indices))
+        # Convert numpy array to list of ints for JSON serialization
+        rows_list = row_indices.tolist()
 
+        # Construct URL without rows query param
         url = urljoin(
             self.server,
-            f"datasets/{self.did_enc}/slice?chunk={chunk_id}&rows={row_str}",
+            f"datasets/{self.did_enc}/slice?chunk={chunk_id}",
         )
-        # Consider adding retry logic here for transient network issues
+
+        # Send POST request with rows in JSON body
         try:
-            r = requests.get(url, timeout=self.timeout)
+            r = requests.post(url, json={"rows": rows_list}, timeout=self.timeout)
             r.raise_for_status()  # Check for HTTP errors
             return r.content
         except requests.exceptions.Timeout:
@@ -162,9 +160,7 @@ class RemoteActivationStore(ManifestActivationStore):
 
     # --- Helper methods specific to remote fetching --- #
 
-    def _get_json(
-        self, endpoint: str, required: bool = True
-    ) -> Optional[Dict[str, Any]]:
+    def _get_json(self, endpoint: str, required: bool = True) -> Optional[Dict[str, Any]]:
         """Helper to fetch JSON data from a specific dataset endpoint."""
         url = urljoin(self.server, f"datasets/{self.did_enc}/{endpoint}")
         try:

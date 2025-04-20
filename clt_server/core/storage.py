@@ -11,20 +11,18 @@ Changes from previous version:
 
 from __future__ import annotations
 
-import io
-import os
-import numpy as np
 import json
-import time
 import logging
 from functools import lru_cache
 from pathlib import Path
 from typing import List, Dict, Any
 
 import h5py
-from fastapi import FastAPI, HTTPException, UploadFile, File, Query
+from fastapi import FastAPI, HTTPException, UploadFile, File, Query, Body
 from fastapi.responses import StreamingResponse, JSONResponse
 from starlette.status import HTTP_201_CREATED
+from pydantic import BaseModel
+import numpy as np
 
 from .config import settings
 
@@ -51,12 +49,8 @@ def _open_h5(path: Path) -> h5py.File:
 # ---------------------------------------------------------------------------
 # Upload endpoint – unchanged except for file ext check
 # ---------------------------------------------------------------------------
-@app.post(
-    "/datasets/{dataset_id:path}/chunks/{chunk_idx}", status_code=HTTP_201_CREATED
-)
-async def upload_chunk(
-    dataset_id: str, chunk_idx: int, chunk_file: UploadFile = File(...)
-):
+@app.post("/datasets/{dataset_id:path}/chunks/{chunk_idx}", status_code=HTTP_201_CREATED)
+async def upload_chunk(dataset_id: str, chunk_idx: int, chunk_file: UploadFile = File(...)):
     ds_dir = _ds_path(dataset_id)
     ds_dir.mkdir(parents=True, exist_ok=True)
     fname = ds_dir / f"chunk_{chunk_idx}.h5"
@@ -71,31 +65,41 @@ async def upload_chunk(
 
 
 # ---------------------------------------------------------------------------
-# New slice endpoint
+# New Slice Request Body Model
 # ---------------------------------------------------------------------------
-@app.get("/datasets/{dataset_id:path}/slice")
+class SliceRequest(BaseModel):
+    rows: List[int]
+
+
+# ---------------------------------------------------------------------------
+# New slice endpoint (changed to POST)
+# ---------------------------------------------------------------------------
+@app.post("/datasets/{dataset_id:path}/slice")
 async def slice_chunk(
     dataset_id: str,
-    chunk: int = Query(..., ge=0),
-    rows: str = Query(..., description="Comma‑separated row indices"),
+    chunk: int = Query(..., ge=0, description="Chunk index to slice"),
+    request_body: SliceRequest = Body(...),
 ):
     """
     Return raw bf16 bytes for the requested rows of a given chunk.
     Payload layout per layer:  inputs  then  targets (contiguous).
+    Reads row indices from the POST request body.
     """
     ds_dir = _ds_path(dataset_id)
     chunk_path = ds_dir / f"chunk_{chunk}.h5"
     if not chunk_path.exists():
         raise HTTPException(404, f"Chunk {chunk} not found")
 
-    # ---- parse & sort row list ------------------------------------------------
-    try:
-        row_idx = np.fromstring(rows, dtype="<u4", sep=",")
-    except ValueError:
-        raise HTTPException(400, "rows must be comma‑separated integers")
+    # ---- get rows from body and convert to numpy ----------------------------
+    row_list = request_body.rows
+    if not row_list:
+        raise HTTPException(400, "rows list in request body cannot be empty")
 
-    if row_idx.size == 0:
-        raise HTTPException(400, "rows parameter empty")
+    try:
+        # Convert list of ints to numpy uint32 array
+        row_idx = np.array(row_list, dtype=np.uint32)
+    except (ValueError, TypeError):
+        raise HTTPException(400, "rows must be a list of integers")
 
     row_idx.sort()  # <‑‑ key speed‑up (contiguous reads)
 
@@ -119,8 +123,11 @@ async def slice_chunk(
         for lk in layer_keys:
             g = hf[lk]
             # h5py returns a NumPy array; .tobytes() gives a view‑copy of the data
-            yield g["inputs"][row_idx, :].tobytes()
-            yield g["targets"][row_idx, :].tobytes()
+            # Ensure we access the dataset correctly
+            inputs_dataset = g["inputs"]
+            targets_dataset = g["targets"]
+            yield inputs_dataset[row_idx, :].tobytes()
+            yield targets_dataset[row_idx, :].tobytes()
 
     return StreamingResponse(
         iter_layers(),
