@@ -101,6 +101,7 @@ class WandBLogger:
         loss_dict: Dict[str, float],
         lr: Optional[float] = None,
         sparsity_lambda: Optional[float] = None,
+        total_tokens_processed: Optional[int] = None,
     ):
         """Log metrics for a training step under the 'training/' group.
 
@@ -109,6 +110,7 @@ class WandBLogger:
             loss_dict: Dictionary of loss values (e.g., total, reconstruction, sparsity)
             lr: Current learning rate
             sparsity_lambda: Current sparsity coefficient lambda
+            total_tokens_processed: Total tokens processed up to this step
         """
         if not self.enabled:
             return
@@ -138,6 +140,10 @@ class WandBLogger:
         # Add sparsity lambda
         if sparsity_lambda is not None:
             metrics["training/sparsity_lambda"] = sparsity_lambda
+
+        # Add total tokens processed
+        if total_tokens_processed is not None:
+            metrics["training/total_tokens_processed"] = total_tokens_processed
 
         # Log to wandb
         wandb.log(metrics, step=step)
@@ -439,9 +445,9 @@ class CLTTrainer:
                 device=self.device,
                 start_time=start_time,
             )
-            logger.info(f"Initialized StreamingActivationStore.")
+            logger.info("Initialized StreamingActivationStore.")
             logger.info(f"  Normalization method: {store.normalization_method}")
-            logger.info(f"  Uses internal estimation, DOES NOT use norm_stats.json.")
+            logger.info("  Uses internal estimation, DOES NOT use norm_stats.json.")
         # Use the new LocalActivationStore for manifest-based local datasets
         elif activation_source == "local_manifest":
             logger.info("Using LocalActivationStore (reading local manifest/chunks).")
@@ -460,9 +466,9 @@ class CLTTrainer:
             )
             logger.info(f"Initialized LocalActivationStore from path: {store.dataset_path}")
             if store.apply_normalization:
-                logger.info(f"  Normalization ENABLED using loaded norm_stats.json.")
+                logger.info("  Normalization ENABLED using loaded norm_stats.json.")
             else:
-                logger.warning(f"  Normalization DISABLED (norm_stats.json not found or failed to load).")
+                logger.warning("  Normalization DISABLED (norm_stats.json not found or failed to load).")
         elif activation_source == "remote":
             logger.info("Using RemoteActivationStore (remote slice server).")
             remote_cfg = self.training_config.remote_config
@@ -486,9 +492,9 @@ class CLTTrainer:
             )
             logger.info(f"Initialized RemoteActivationStore for dataset: {store.did_raw}")
             if store.apply_normalization:
-                logger.info(f"  Normalization ENABLED using fetched norm_stats.json.")
+                logger.info("  Normalization ENABLED using fetched norm_stats.json.")
             else:
-                logger.warning(f"  Normalization DISABLED (norm_stats.json not found on server or failed to load).")
+                logger.warning("  Normalization DISABLED (norm_stats.json not found on server or failed to load).")
         else:
             raise ValueError(
                 f"Unknown activation_source: {activation_source}. Valid options: 'generate', 'local_manifest', 'remote'."
@@ -517,11 +523,16 @@ class CLTTrainer:
         # --- Log to WandB --- #
         # Note: Dead features from trainer window are no longer logged here.
         # We use the dead feature count calculated during evaluation step.
+
+        # Calculate total tokens processed
+        total_tokens_processed = self.training_config.train_batch_size_tokens * (step + 1)
+
         self.wandb_logger.log_step(
             step,
             loss_dict,
             lr=current_lr,
             sparsity_lambda=current_lambda,
+            total_tokens_processed=total_tokens_processed,
         )
 
         # --- Save metrics periodically --- #
