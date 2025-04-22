@@ -338,12 +338,6 @@ class CLTTrainer:
         except Exception as e:
             logger.error(f"Rank {self.rank}: Error counting parameters (CPU): {e}")
 
-        # --- Add barrier after model initialization for DDP ---
-        if self.ddp and dist.is_initialized():
-            logger.info(f"Rank {self.rank}: Waiting at barrier after model initialization...")
-            dist.barrier()
-            logger.info(f"Rank {self.rank}: Passed barrier after model initialization.")
-
         # --- Wrap model with DDP if needed --- Note: Model is moved to device here
         if self.ddp:
             if not isinstance(self.device, torch.device) or self.device.type != "cuda":
