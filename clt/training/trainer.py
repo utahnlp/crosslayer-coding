@@ -327,6 +327,20 @@ class CLTTrainer:
         # The CLT model now takes device/dtype in __init__
         # Initialize as CrossLayerTranscoder first
         _model: CrossLayerTranscoder = CrossLayerTranscoder(clt_config, device=self.device)
+        logger.info(f"Rank {self.rank}: Base CrossLayerTranscoder initialized.")
+
+        # --- DEBUG: Check parameter count before DDP ---
+        try:
+            num_params = sum(p.numel() for p in _model.parameters() if p.requires_grad)
+            logger.info(f"Rank {self.rank}: Parameter count BEFORE DDP wrap: {num_params}")
+        except Exception as e:
+            logger.error(f"Rank {self.rank}: Error counting parameters BEFORE DDP wrap: {e}")
+
+        # --- DEBUG: Add barrier before DDP initialization ---
+        if self.ddp:
+            logger.info(f"Rank {self.rank}: Entering barrier before DDP initialization...")
+            dist.barrier()
+            logger.info(f"Rank {self.rank}: Passed barrier before DDP initialization.")
 
         # --- Wrap model with DDP if needed ---
         if self.ddp:
