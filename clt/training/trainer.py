@@ -336,12 +336,6 @@ class CLTTrainer:
         except Exception as e:
             logger.error(f"Rank {self.rank}: Error counting parameters BEFORE DDP wrap: {e}")
 
-        # --- DEBUG: Add barrier before DDP initialization ---
-        if self.ddp:
-            logger.info(f"Rank {self.rank}: Entering barrier before DDP initialization...")
-            dist.barrier()
-            logger.info(f"Rank {self.rank}: Passed barrier before DDP initialization.")
-
         # --- Wrap model with DDP if needed ---
         if self.ddp:
             if not isinstance(self.device, torch.device) or self.device.type != "cuda":
@@ -439,6 +433,13 @@ class CLTTrainer:
             rank=self.rank,
         )
         logger.info(f"Rank {self.rank}: CLTTrainer initialization complete.")
+
+        # --- DEBUG: Add barrier just before DDP initialization ---
+        if self.ddp:
+            logger.info(f"Rank {self.rank}: Entering barrier before DDP initialization...")
+            # Specify the device ID for the barrier
+            dist.barrier(device_ids=[self.device.index])
+            logger.info(f"Rank {self.rank}: Passed barrier before DDP initialization.")
 
     @property
     def dead_neurons_mask(self) -> torch.Tensor:
