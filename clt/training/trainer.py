@@ -359,8 +359,15 @@ class CLTTrainer:
 
         # ---- Synchronize ranks before wrapping with DDP (important) ----
         if self.ddp and dist.is_initialized():
-            logger.info(f"Rank {self.rank}: Synchronizing (barrier) before DDP wrap…")
-            dist.barrier()
+            logger.info(f"Rank {self.rank}: Synchronizing (barrier) before DDP wrap on device {self.device.index}…")
+            try:
+                # Explicitly pass the device id to avoid NCCL selecting an unknown device
+                if self.device.type == "cuda":
+                    dist.barrier(device_ids=[self.device.index])
+                else:
+                    dist.barrier()
+            except Exception as e:
+                logger.warning(f"Rank {self.rank}: Barrier failed or timed out: {e}")
             logger.info(f"Rank {self.rank}: Barrier passed – proceeding to DDP wrap.")
 
         # --- Wrap model with DDP if needed ---
