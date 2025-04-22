@@ -396,6 +396,13 @@ class CLTTrainer:
         self.activation_store = self._create_activation_store(self.start_time, self.rank, self.world)
         logger.info(f"Rank {self.rank}: Activation store created.")
 
+        # --- DEBUG: Add barrier AFTER activation store initialization ---
+        if self.ddp:
+            logger.info(f"Rank {self.rank}: Entering barrier after Activation Store init...")
+            # Specify the device ID for the barrier
+            dist.barrier(device_ids=[self.device.index])
+            logger.info(f"Rank {self.rank}: Passed barrier after Activation Store init.")
+
         logger.info(f"Rank {self.rank}: Initializing loss manager...")
         # Initialize loss manager
         self.loss_manager = LossManager(training_config)
