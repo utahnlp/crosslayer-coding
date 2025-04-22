@@ -338,28 +338,36 @@ class CLTTrainer:
         except Exception as e:
             logger.error(f"Rank {self.rank}: Error counting parameters (CPU): {e}")
 
-        # --- Wrap model with DDP if needed --- Note: Model is moved to device here
+        # ------------------------------------------------------------
+        # Create activation store *before* initializing DDP to avoid
+        # blocking communications during param all‑gather while some
+        # ranks are still fetching remote metadata.
+        # ------------------------------------------------------------
+
+        logger.info(f"Rank {self.rank}: Creating activation store...")
+        self.activation_store = self._create_activation_store(self.start_time, self.rank, self.world)
+        logger.info(f"Rank {self.rank}: Activation store created.")
+
+        # ---- Synchronize ranks before wrapping with DDP (important) ----
+        if self.ddp and dist.is_initialized():
+            logger.info(f"Rank {self.rank}: Synchronizing (barrier) before DDP wrap…")
+            dist.barrier()
+            logger.info(f"Rank {self.rank}: Barrier passed – proceeding to DDP wrap.")
+
+        # --- Wrap model with DDP if needed ---
         if self.ddp:
             if not isinstance(self.device, torch.device) or self.device.type != "cuda":
                 raise ValueError("DDP requires CUDA device.")
-            # Move model to the correct device *before* wrapping # NO LONGER NEEDED
-            # _model = _model.to(self.device) # REMOVED - Model already on device
-            # logger.info(f"Rank {self.rank}: Moved model to device {self.device} for DDP.") # REMOVED
-            self.model = DDP(  # Assign to self.model here
+
+            self.model = DDP(
                 _model,
-                device_ids=(
-                    [self.device.index] if self.device.type == "cuda" else None
-                ),  # Handle non-cuda devices correctly
-                output_device=(
-                    self.device.index if self.device.type == "cuda" else None
-                ),  # Handle non-cuda devices correctly
-                find_unused_parameters=False,  # Set to True if graph has unused outputs
+                device_ids=[self.device.index],
+                output_device=self.device.index,
+                find_unused_parameters=False,
             )
             logger.info(f"Rank {self.rank}: Wrapped model with DDP.")
         else:
-            # Move model to device if not using DDP # NO LONGER NEEDED
-            # self.model = _model.to(self.device) # REMOVED - Model already on device
-            self.model = _model  # Assign the already correctly-placed model
+            self.model = _model  # Already on correct device
             logger.info(f"Rank {self.rank}: Model placed on device {self.device} (DDP disabled).")
 
         logger.info(f"Rank {self.rank}: Initializing optimizer...")
@@ -397,11 +405,6 @@ class CLTTrainer:
                 f"Rank {self.rank}: Using CosineAnnealingLR scheduler with params: {final_params}, T_max={t_max}"
             )
         logger.info(f"Rank {self.rank}: Scheduler initialized.")
-
-        logger.info(f"Rank {self.rank}: Creating activation store...")
-        # Initialize activation store based on config, passing rank/world
-        self.activation_store = self._create_activation_store(self.start_time, self.rank, self.world)
-        logger.info(f"Rank {self.rank}: Activation store created.")
 
         logger.info(f"Rank {self.rank}: Initializing loss manager...")
         # Initialize loss manager
