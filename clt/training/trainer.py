@@ -323,40 +323,53 @@ class CLTTrainer:
         # Record start time
         self.start_time = time.time()
 
-        # Initialize model on the correct device *before* potentially wrapping with DDP
-        # The CLT model now takes device/dtype in __init__
-        # Initialize as CrossLayerTranscoder first
-        _model: CrossLayerTranscoder = CrossLayerTranscoder(clt_config, device=self.device)
-        logger.info(f"Rank {self.rank}: Base CrossLayerTranscoder initialized.")
+        # --- Initialize model directly on the target device ---
+        logger.info(f"Rank {self.rank}: Initializing CrossLayerTranscoder directly on {self.device}...")
+        # _model: CrossLayerTranscoder = CrossLayerTranscoder(clt_config, device=torch.device("cpu")) # Old CPU init
+        # logger.info(f"Rank {self.rank}: Base CrossLayerTranscoder initialized on CPU.") # Old log
+        with torch.cuda.device(self.device if self.device.type == "cuda" else None):  # Ensure correct CUDA context
+            _model: CrossLayerTranscoder = CrossLayerTranscoder(clt_config, device=self.device)
+        logger.info(f"Rank {self.rank}: CrossLayerTranscoder initialized on {self.device}.")
 
-        # --- DEBUG: Check parameter count before DDP ---
+        # --- DEBUG: Check parameter count before DDP/device move ---
         try:
             num_params = sum(p.numel() for p in _model.parameters() if p.requires_grad)
-            logger.info(f"Rank {self.rank}: Parameter count BEFORE DDP wrap: {num_params}")
+            logger.info(f"Rank {self.rank}: Parameter count (CPU): {num_params}")
         except Exception as e:
-            logger.error(f"Rank {self.rank}: Error counting parameters BEFORE DDP wrap: {e}")
+            logger.error(f"Rank {self.rank}: Error counting parameters (CPU): {e}")
 
-        # --- Wrap model with DDP if needed ---
+        # --- Add barrier after model initialization for DDP ---
+        if self.ddp and dist.is_initialized():
+            logger.info(f"Rank {self.rank}: Waiting at barrier after model initialization...")
+            dist.barrier()
+            logger.info(f"Rank {self.rank}: Passed barrier after model initialization.")
+
+        # --- Wrap model with DDP if needed --- Note: Model is moved to device here
         if self.ddp:
             if not isinstance(self.device, torch.device) or self.device.type != "cuda":
                 raise ValueError("DDP requires CUDA device.")
-            # Ensure model is on the correct device before wrapping
-            _model = _model.to(self.device)
+            # Move model to the correct device *before* wrapping # NO LONGER NEEDED
+            # _model = _model.to(self.device) # REMOVED - Model already on device
+            # logger.info(f"Rank {self.rank}: Moved model to device {self.device} for DDP.") # REMOVED
             self.model = DDP(  # Assign to self.model here
                 _model,
-                device_ids=[self.device.index],  # device is e.g., torch.device('cuda:1')
-                output_device=self.device.index,
+                device_ids=(
+                    [self.device.index] if self.device.type == "cuda" else None
+                ),  # Handle non-cuda devices correctly
+                output_device=(
+                    self.device.index if self.device.type == "cuda" else None
+                ),  # Handle non-cuda devices correctly
                 find_unused_parameters=False,  # Set to True if graph has unused outputs
             )
             logger.info(f"Rank {self.rank}: Wrapped model with DDP.")
         else:
-            # Ensure model is on device even if not using DDP
-            self.model = _model.to(self.device)  # Assign to self.model here
+            # Move model to device if not using DDP # NO LONGER NEEDED
+            # self.model = _model.to(self.device) # REMOVED - Model already on device
+            self.model = _model  # Assign the already correctly-placed model
             logger.info(f"Rank {self.rank}: Model placed on device {self.device} (DDP disabled).")
 
         logger.info(f"Rank {self.rank}: Initializing optimizer...")
         # Initialize optimizer (after model is potentially wrapped and moved to device)
-        # DDP handles parameter synchronization, so using self.model.parameters() is correct
         if training_config.optimizer == "adam":
             self.optimizer: Any = optim.Adam(self.model.parameters(), lr=training_config.learning_rate)
         else:  # "adamw"
