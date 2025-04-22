@@ -346,6 +346,7 @@ class CLTTrainer:
             self.model = _model.to(self.device)  # Assign to self.model here
             logger.info(f"Rank {self.rank}: Model placed on device {self.device} (DDP disabled).")
 
+        logger.info(f"Rank {self.rank}: Initializing optimizer...")
         # Initialize optimizer (after model is potentially wrapped and moved to device)
         # DDP handles parameter synchronization, so using self.model.parameters() is correct
         if training_config.optimizer == "adam":
@@ -354,6 +355,7 @@ class CLTTrainer:
             self.optimizer = optim.AdamW(self.model.parameters(), lr=training_config.learning_rate)
         logger.info(f"Rank {self.rank}: Optimizer '{training_config.optimizer}' initialized.")
 
+        logger.info(f"Rank {self.rank}: Initializing scheduler...")
         # Initialize scheduler
         self.scheduler: Optional[Any] = None
         scheduler_type = training_config.lr_scheduler
@@ -379,25 +381,34 @@ class CLTTrainer:
             logger.info(
                 f"Rank {self.rank}: Using CosineAnnealingLR scheduler with params: {final_params}, T_max={t_max}"
             )
+        logger.info(f"Rank {self.rank}: Scheduler initialized.")
 
+        logger.info(f"Rank {self.rank}: Creating activation store...")
         # Initialize activation store based on config, passing rank/world
         self.activation_store = self._create_activation_store(self.start_time, self.rank, self.world)
+        logger.info(f"Rank {self.rank}: Activation store created.")
 
+        logger.info(f"Rank {self.rank}: Initializing loss manager...")
         # Initialize loss manager
         self.loss_manager = LossManager(training_config)
+        logger.info(f"Rank {self.rank}: Loss manager initialized.")
 
+        logger.info(f"Rank {self.rank}: Initializing evaluator...")
         # Initialize Evaluator - Evaluation typically done on rank 0
         # Pass the underlying CrossLayerTranscoder instance
         underlying_model = self.model.module if self.ddp else self.model
         assert isinstance(underlying_model, CrossLayerTranscoder), "Model for Evaluator must be CrossLayerTranscoder"
         self.evaluator = CLTEvaluator(underlying_model, self.device, self.start_time)
+        logger.info(f"Rank {self.rank}: Evaluator initialized.")
 
+        logger.info(f"Rank {self.rank}: Initializing dead neuron counters...")
         # Initialize dead neuron counters (local per rank)
         self.n_forward_passes_since_fired = torch.zeros(
             (clt_config.num_layers, clt_config.num_features),
             device=self.device,  # Local device
             dtype=torch.long,
         )
+        logger.info(f"Rank {self.rank}: Dead neuron counters initialized.")
 
         # Training metrics (only populated on rank 0)
         self.metrics: Dict[str, list] = {
@@ -405,6 +416,7 @@ class CLTTrainer:
             "eval_metrics": [],
         }
 
+        logger.info(f"Rank {self.rank}: Initializing WandB logger...")
         # Initialize WandB logger (handles rank internally)
         self.wandb_logger = WandBLogger(
             training_config=training_config,
@@ -412,6 +424,7 @@ class CLTTrainer:
             log_dir=self.log_dir,
             rank=self.rank,
         )
+        logger.info(f"Rank {self.rank}: CLTTrainer initialization complete.")
 
     @property
     def dead_neurons_mask(self) -> torch.Tensor:

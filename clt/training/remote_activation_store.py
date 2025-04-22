@@ -102,6 +102,7 @@ class RemoteActivationStore(ManifestActivationStore):
 
     def _load_metadata(self) -> Optional[Dict[str, Any]]:
         """Fetches metadata.json from the server."""
+        logger.info(f"Rank {self.rank}: Attempting to fetch metadata from {self.server} for dataset {self.did_raw}...")
         return self._get_json("info", required=True, retries=3)
 
     def _load_manifest(self) -> Optional[np.ndarray]:
@@ -109,7 +110,7 @@ class RemoteActivationStore(ManifestActivationStore):
         max_retries = 3
         base_delay = 2  # seconds
         url = urljoin(self.server, f"datasets/{self.did_enc}/manifest")
-        logger.info(f"Downloading manifest from {url}")
+        logger.info(f"Rank {self.rank}: Attempting to download manifest from {url}...")
 
         for attempt in range(max_retries):
             try:
@@ -122,7 +123,9 @@ class RemoteActivationStore(ManifestActivationStore):
             except requests.exceptions.RequestException as e:
                 logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to download manifest from {url}: {e}")
                 if attempt + 1 == max_retries:
-                    logger.error(f"Final attempt failed to download manifest. Returning None.")
+                    logger.error("Final attempt failed to download manifest. Returning None.")
+                    # Log rank info on final failure
+                    logger.error(f"Rank {self.rank}: Final attempt failed to download manifest.")
                     return None  # Failure after retries
                 else:
                     delay = base_delay * (2**attempt)
@@ -139,6 +142,9 @@ class RemoteActivationStore(ManifestActivationStore):
         """Fetches norm_stats.json from the server (optional)."""
         # Don't retry aggressively for optional file
         # required=False means it won't raise an error if the file doesn't exist (404)
+        logger.info(
+            f"Rank {self.rank}: Attempting to fetch optional norm_stats from {self.server} for dataset {self.did_raw}..."
+        )
         return self._get_json("norm_stats", required=False, retries=1)
 
     def _fetch_slice(self, chunk_id: int, row_indices: np.ndarray) -> bytes:
@@ -160,6 +166,7 @@ class RemoteActivationStore(ManifestActivationStore):
             f"datasets/{self.did_enc}/slice?chunk={chunk_id}",
         )
 
+        logger.debug(f"Rank {self.rank}: Fetching slice from {url} for chunk {chunk_id}, {len(rows_list)} rows.")
         # Send POST request with rows in JSON body
         try:
             r = requests.post(url, json={"rows": rows_list}, timeout=self.timeout)
@@ -169,6 +176,7 @@ class RemoteActivationStore(ManifestActivationStore):
             logger.error(f"Timeout fetching slice from {url}")
             raise  # Re-raise Timeout
         except requests.exceptions.RequestException as e:
+            logger.error(f"Rank {self.rank}: HTTP error fetching slice from {url}: {e}")
             logger.error(f"HTTP error fetching slice from {url}: {e}")
             # You might want custom exceptions here to distinguish network vs server errors
             raise RuntimeError(f"Failed to fetch slice for chunk {chunk_id}") from e
