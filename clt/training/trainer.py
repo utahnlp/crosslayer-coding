@@ -338,6 +338,15 @@ class CLTTrainer:
         except Exception as e:
             logger.error(f"Rank {self.rank}: Error counting parameters (CPU): {e}")
 
+        # --- DEBUG START -------------------------------------------------
+        param_names = [p[0] for p in _model.named_parameters()]
+        logger.info(f"Rank {self.rank}: about to call DDP – " f"{len(param_names)} params, first 5 = {param_names[:5]}")
+        torch.save(
+            {k: v.shape for k, v in _model.state_dict().items()},
+            f"{self.log_dir}/rank{self.rank}_param_shapes.pt",
+        )
+        # --- DEBUG END ---------------------------------------------------
+
         # ------------------------------------------------------------
         # Create activation store *before* initializing DDP to avoid
         # blocking communications during param all‑gather while some
