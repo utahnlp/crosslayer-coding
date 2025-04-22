@@ -396,13 +396,6 @@ class CLTTrainer:
         self.activation_store = self._create_activation_store(self.start_time, self.rank, self.world)
         logger.info(f"Rank {self.rank}: Activation store created.")
 
-        # --- DEBUG: Add barrier AFTER activation store initialization ---
-        if self.ddp:
-            logger.info(f"Rank {self.rank}: Entering barrier after Activation Store init...")
-            # Specify the device ID for the barrier
-            dist.barrier(device_ids=[self.device.index])
-            logger.info(f"Rank {self.rank}: Passed barrier after Activation Store init.")
-
         logger.info(f"Rank {self.rank}: Initializing loss manager...")
         # Initialize loss manager
         self.loss_manager = LossManager(training_config)
@@ -440,13 +433,6 @@ class CLTTrainer:
             rank=self.rank,
         )
         logger.info(f"Rank {self.rank}: CLTTrainer initialization complete.")
-
-        # --- DEBUG: Add barrier just before DDP initialization ---
-        if self.ddp:
-            logger.info(f"Rank {self.rank}: Entering barrier before DDP initialization...")
-            # Specify the device ID for the barrier
-            dist.barrier(device_ids=[self.device.index])
-            logger.info(f"Rank {self.rank}: Passed barrier before DDP initialization.")
 
     @property
     def dead_neurons_mask(self) -> torch.Tensor:
@@ -575,19 +561,29 @@ class CLTTrainer:
             if not server_url or not dataset_id:
                 raise ValueError("remote_config must contain 'server_url' and 'dataset_id'.")
 
-            store = RemoteActivationStore(  # Assign to store
-                server_url=server_url,
-                dataset_id=dataset_id,
-                train_batch_size_tokens=self.training_config.train_batch_size_tokens,
-                device=self.device,  # Use rank-specific device
-                dtype=self.training_config.activation_dtype,
-                rank=rank,  # Pass rank
-                world=world,  # Pass world size
-                seed=self.training_config.seed,
-                timeout=remote_cfg.get("timeout", 60),
-            )
-            # Accessing specific attributes requires isinstance check or careful typing
-            # For logging, it's often acceptable to assume the type or use getattr
+            # --- DEBUG: Log before RemoteActivationStore instantiation ---
+            logger.info(f"Rank {rank}: Attempting to instantiate RemoteActivationStore...")
+            try:
+                store = RemoteActivationStore(  # Assign to store
+                    server_url=server_url,
+                    dataset_id=dataset_id,
+                    train_batch_size_tokens=self.training_config.train_batch_size_tokens,
+                    device=self.device,  # Use rank-specific device
+                    dtype=self.training_config.activation_dtype,
+                    rank=rank,  # Pass rank
+                    world=world,  # Pass world size
+                    seed=self.training_config.seed,
+                    timeout=remote_cfg.get("timeout", 60),
+                    # Pass other relevant remote config if needed by constructor
+                    # max_retries=remote_cfg.get("max_retries", 3),
+                    # prefetch_batches=remote_cfg.get("prefetch_batches", 16),
+                )
+                # --- DEBUG: Log after successful RemoteActivationStore instantiation ---
+                logger.info(f"Rank {rank}: RemoteActivationStore object instantiated successfully.")
+            except Exception as e:
+                logger.error(f"Rank {rank}: FAILED to instantiate RemoteActivationStore: {e}", exc_info=True)
+                raise  # Re-raise the exception to halt execution
+
             did_raw = getattr(store, "did_raw", "unknown")
             logger.info(f"Rank {rank}: Initialized RemoteActivationStore for dataset: {did_raw}")
             apply_norm = getattr(store, "apply_normalization", False)
