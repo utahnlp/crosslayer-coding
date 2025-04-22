@@ -11,6 +11,7 @@ from typing import Literal, Optional
 import logging
 import time
 import json
+import os  # Add os import for environment variables
 
 # Attempt to import transformers for model dimension detection
 try:
@@ -22,6 +23,9 @@ except ImportError:
 try:
     from clt.config import CLTConfig, TrainingConfig
     from clt.training.trainer import CLTTrainer
+
+    # Import distributed utility
+    from clt.utils.dist import init_distributed
 except ImportError as e:
     print(
         f"FATAL: ImportError: {e}. Please ensure the 'clt' library is installed or "
@@ -92,7 +96,7 @@ def parse_args():
         "--device",
         type=str,
         default=None,
-        help="Device to use (e.g., 'cuda', 'cpu', 'mps'). Auto-detected if None.",
+        help="Base device to use (e.g., 'cuda', 'cpu', 'mps'). For multi-GPU, this is ignored and devices are assigned by rank.",
     )
 
     # --- CLT Model Architecture ---
@@ -137,7 +141,7 @@ def parse_args():
         "--train-batch-size-tokens",
         type=int,
         default=4096,
-        help="Target number of tokens per training batch.",
+        help="Target number of tokens per training batch (per GPU if distributed).",
     )
     train_group.add_argument(
         "--normalization-method",
@@ -250,29 +254,45 @@ def main():
     """Main function to configure and run the CLTTrainer for local activations."""
     args = parse_args()
 
-    # --- Setup Output Directory ---
+    # --- Initialize Distributed Training (if applicable) ---
+    rank, world = init_distributed()
+    ddp_enabled = world > 1
+    is_rank_zero = rank == 0
+
+    # --- Setup Output Directory (Rank 0 only) ---
     output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-    logger.info(f"Output directory: {output_dir.resolve()}")
+    if is_rank_zero:
+        output_dir.mkdir(exist_ok=True, parents=True)
+        logger.info(f"Output directory: {output_dir.resolve()}")
 
-    # Save command-line arguments
-    try:
-        with open(output_dir / "cli_args.json", "w") as f:
-            json.dump(vars(args), f, indent=2)
-    except Exception as e:
-        logger.warning(f"Could not save command-line args: {e}")
+        # Save command-line arguments (Rank 0 only)
+        try:
+            with open(output_dir / "cli_args.json", "w") as f:
+                json.dump(vars(args), f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save command-line args: {e}")
 
-    # --- Determine Device ---
-    if args.device:
+    # --- Determine Device --- # Adjusted for DDP
+    if ddp_enabled:
+        # DDP assigns ranks to specific GPUs
+        local_rank_str = os.environ.get("LOCAL_RANK")
+        if local_rank_str is None:
+            logger.error("LOCAL_RANK not set in DDP environment. Exiting.")
+            exit(1)  # Or raise an error
+        device = f"cuda:{local_rank_str}"
+        logger.info(f"Rank {rank}/{world} using device: {device}")
+    elif args.device:
+        # Use specified device if not DDP
         device = args.device
     else:
+        # Auto-detect if not DDP and no device specified
         if torch.cuda.is_available():
             device = "cuda"
         elif torch.backends.mps.is_available():
-            device = "mps"
+            device = "mps"  # Note: MPS doesn't support DDP
         else:
             device = "cpu"
-    logger.info(f"Using device: {device}")
+        logger.info(f"Rank {rank} (non-DDP) using device: {device}")
 
     # --- Determine Base Model Dimensions ---
     # Use the provided --model-name to get dimensions for the CLT config.
@@ -336,28 +356,44 @@ def main():
     )
     logger.info(f"Training Config: {training_config}")
 
-    # --- Initialize Trainer ---
-    logger.info("Initializing CLTTrainer...")
+    # --- Initialize Trainer --- # Pass rank/world/ddp
+    logger.info(f"Initializing CLTTrainer (Rank {rank}/{world}, DDP: {ddp_enabled})...")
     try:
         trainer = CLTTrainer(
             clt_config=clt_config,
             training_config=training_config,
             log_dir=str(output_dir),
             device=device,
+            rank=rank,
+            world=world,
+            ddp=ddp_enabled,
         )
     except Exception as e:
         logger.exception(f"Failed to initialize CLTTrainer: {e}")  # Use logger.exception
         raise
 
-    # --- Start Training ---
-    logger.info("Starting training from local activations...")
+    # --- Start Training --- # Rank 0 logging improved
+    if is_rank_zero:
+        logger.info(f"Starting training (Rank {rank}/{world}) from local path {args.activation_path}...")
     try:
         trainer.train()  # eval_every is handled internally now
-        logger.info("Training complete!")
-        logger.info(f"Final model and logs saved in: {output_dir.resolve()}")
+        if is_rank_zero:
+            logger.info("Training complete!")
+            logger.info(f"Final model and logs saved in: {output_dir.resolve()}")
     except Exception as e:
-        logger.exception(f"Training failed: {e}")  # Use logger.exception
+        logger.exception(f"Training failed (Rank {rank}): {e}")  # Use logger.exception
+        # Optional: Add dist barrier or cleanup here
         raise
+    finally:
+        # Optional: Ensure distributed processes exit cleanly
+        if ddp_enabled:
+            # Add a barrier to sync before exiting? May not be necessary.
+            # torch.distributed.barrier()
+            pass
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+            if is_rank_zero:
+                logger.info("Destroyed distributed process group.")
 
 
 if __name__ == "__main__":
