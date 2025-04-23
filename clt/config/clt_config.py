@@ -62,7 +62,9 @@ class TrainingConfig:
 
     # Optimizer parameters
     optimizer: Literal["adam", "adamw"] = "adamw"
-    lr_scheduler: Optional[Literal["linear", "cosine"]] = "linear"
+    # Learning rate scheduler type. "linear_final20" keeps LR constant for the first 80% of
+    # training and then linearly decays it to 0 for the final 20% (configurable via lr_scheduler_params).
+    lr_scheduler: Optional[Literal["linear", "cosine", "linear_final20"]] = "linear"
     lr_scheduler_params: Optional[Dict[str, Any]] = None
 
     # Logging parameters

@@ -333,6 +333,31 @@ class CLTTrainer:
             )
             logger.info(f"Using CosineAnnealingLR scheduler with params: {final_params}, T_max={t_max}")
 
+        elif scheduler_type == "linear_final20":
+            # This scheduler keeps LR constant for the initial fraction of training
+            # and then linearly decays it to 0 over the remaining steps (default 20%).
+            # The fraction can be customized via lr_scheduler_params["decay_start_frac"].
+            decay_start_frac = scheduler_params.get("decay_start_frac", 0.8)  # 0.8 means last 20% decays
+            assert 0.0 < decay_start_frac < 1.0, "decay_start_frac must be between 0 and 1"
+            total_steps = training_config.training_steps
+            decay_start_step = int(decay_start_frac * total_steps)
+
+            def lr_lambda(current_step: int):
+                if current_step < decay_start_step:
+                    return 1.0  # Keep LR constant
+                # Linearly decay from 1 -> 0 over the remaining steps
+                remaining = total_steps - current_step
+                decay_steps = total_steps - decay_start_step
+                return max(remaining / decay_steps, 0.0)
+
+            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
+            logger.info(
+                "Using linear_final20 LR scheduler with decay_start_frac=%s (start step %d of %d)",
+                decay_start_frac,
+                decay_start_step,
+                total_steps,
+            )
+
         # Add elif blocks here for other potential schedulers
 
         # Initialize activation store based on config

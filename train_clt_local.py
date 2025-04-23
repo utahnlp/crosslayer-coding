@@ -177,9 +177,12 @@ def parse_args():
     train_group.add_argument(
         "--lr-scheduler",
         type=str,
-        choices=["linear", "cosine", "none"],
+        choices=["linear", "cosine", "linear_final20", "none"],
         default="linear",
-        help="Learning rate scheduler type ('none' to disable).",
+        help=(
+            "Learning rate scheduler type. 'linear_final20' keeps LR constant until the last 20% "
+            "of steps then decays linearly to 0 ('none' to disable)."
+        ),
     )
     train_group.add_argument(
         "--seed",
@@ -297,7 +300,9 @@ def main():
 
     # --- Create Training Configuration ---
     # Handle 'none' scheduler case
-    lr_scheduler_arg: Optional[Literal["linear", "cosine"]] = args.lr_scheduler if args.lr_scheduler != "none" else None
+    lr_scheduler_arg: Optional[Literal["linear", "cosine", "linear_final20"]] = (
+        args.lr_scheduler if args.lr_scheduler != "none" else None
+    )
 
     # Simplified TrainingConfig instantiation for local source only
     training_config = TrainingConfig(
