@@ -695,23 +695,28 @@ class CLTTrainer:
 
             # Save model checkpoint - use FSDP state_dict context manager
             model_checkpoint_path = os.path.join(self.log_dir, f"clt_checkpoint_{step}.pt")
+
+            # Try saving directly using FSDP's state_dict override
+            # FSDP should handle gathering the full state dict when called without context
+            # Only rank 0 will actually write the file.
+            state_to_save = None
             try:
                 if self.distributed:
-                    # Use the context manager to get the full state dict
-                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
-                        full_state_dict = self.model.state_dict()
-                    torch.save(full_state_dict, model_checkpoint_path)
+                    # Let FSDP gather the state dict internally.
+                    # Note: This might still be memory intensive on rank 0 depending on how FSDP implements it.
+                    # Consider sharded state dicts for very large models.
+                    state_to_save = self.model.state_dict()
                 else:
-                    # Original save method
-                    self.base_model.save(model_checkpoint_path)  # Save the base model
+                    # Use the base model's save method directly
+                    state_to_save = self.base_model.state_dict()
 
-                # Log checkpoint as artifact to WandB (still only on rank 0)
-                self.wandb_logger.log_artifact(
-                    artifact_path=model_checkpoint_path,
-                    artifact_type="model",
-                    name=f"clt_checkpoint_{step}",
-                )
+                if state_to_save:
+                    torch.save(state_to_save, model_checkpoint_path)
+                    self.wandb_logger.log_artifact(
+                        artifact_path=model_checkpoint_path,
+                        artifact_type="model",
+                        name=f"clt_checkpoint_{step}",
+                    )
             except Exception as e:
                 print(f"Warning: Failed to save model checkpoint to {model_checkpoint_path}: {e}")
 
@@ -728,13 +733,14 @@ class CLTTrainer:
 
             try:
                 if self.distributed:
-                    # Use the context manager for the latest save as well
-                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
-                        full_state_dict = self.model.state_dict()
-                    torch.save(full_state_dict, latest_model_path)
+                    # Save latest checkpoint directly
+                    state_to_save = self.model.state_dict()
+                    if state_to_save:
+                        torch.save(state_to_save, latest_model_path)
                 else:
-                    self.base_model.save(latest_model_path)  # Save the base model
+                    state_to_save = self.base_model.state_dict()
+                    if state_to_save:
+                        torch.save(state_to_save, latest_model_path)
             except Exception as e:
                 print(f"Warning: Failed to save latest model checkpoint: {e}")
 
@@ -767,14 +773,16 @@ class CLTTrainer:
                 with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=load_policy):
                     # Load the state_dict on rank 0, FSDP handles broadcast/scatter
                     if self.rank == 0:
-                        cpu_state_dict = torch.load(checkpoint_path, map_location="cpu")
-                        self.model.load_state_dict(cpu_state_dict)
+                        state_dict = torch.load(checkpoint_path, map_location="cpu")
+                        self.model.load_state_dict(state_dict)
                     else:
                         # Non-rank 0 loads an empty dict, FSDP handles it
-                        self.model.load_state_dict({})
+                        state_dict = {}  # Create empty dict for non-rank 0 to receive broadcast
 
-                print(f"Loaded FSDP model checkpoint from {checkpoint_path} (rank {self.rank})")
-                dist.barrier()  # Ensure all ranks have loaded before proceeding
+                    # All ranks call FSDP's load_state_dict directly
+                    self.model.load_state_dict(state_dict)
+                    print(f"Loaded FSDP model checkpoint from {checkpoint_path} (rank {self.rank})")
+                    dist.barrier()  # Ensure all ranks have loaded before proceeding
             else:
                 self.base_model.load(checkpoint_path)
                 print(f"Loaded model checkpoint from {checkpoint_path}")
@@ -1005,7 +1013,7 @@ class CLTTrainer:
 
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
-                checkpoint_interval = self.training_config.checkpoint_interval
+                checkpoint_interval = self.training_interval.checkpoint_interval
 
                 save_checkpoint_flag = (step % checkpoint_interval == 0) or (
                     step == self.training_config.training_steps - 1
@@ -1095,7 +1103,9 @@ class CLTTrainer:
                     # Log final model as artifact to WandB
                     self.wandb_logger.log_artifact(artifact_path=final_path, artifact_type="model", name="clt_final")
                 else:
-                    self.base_model.save(final_path)  # Save the base model
+                    state_to_save = self.base_model.state_dict()
+                    if state_to_save:
+                        torch.save(state_to_save, final_path)
                     self.wandb_logger.log_artifact(artifact_path=final_path, artifact_type="model", name="clt_final")
             except Exception as e:
                 print(f"Warning: Failed to save final model: {e}")
