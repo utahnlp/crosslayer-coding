@@ -1015,7 +1015,8 @@ class CLTTrainer:
                 eval_interval = self.training_config.eval_interval
                 checkpoint_interval = self.training_config.checkpoint_interval
 
-                save_checkpoint_flag = (step % checkpoint_interval == 0) or (
+                # Checkpointing only happens AFTER step 0 and at designated intervals
+                save_checkpoint_flag = (step > 0 and step % checkpoint_interval == 0) or (
                     step == self.training_config.training_steps - 1
                 )
                 run_eval_flag = (step % eval_interval == 0) or (step == self.training_config.training_steps - 1)
@@ -1083,41 +1084,54 @@ class CLTTrainer:
             if not self.distributed or self.rank == 0:
                 print(f"Training loop finished at step {step}.")
 
-        # --- Save final model and metrics ---
-        final_path = os.path.join(self.log_dir, "clt_final.pt")
-        final_store_path = os.path.join(self.log_dir, "activation_store_final.pt")
-
-        # Fix: Barrier before final save
+        # Sync before final save attempt
         if self.distributed:
             dist.barrier()
 
-        if not self.distributed or self.rank == 0:
-            print(f"Saving final model to {final_path}...")
-            try:
-                if self.distributed:
-                    # Use the context manager for the final save
-                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
-                        full_state_dict = self.model.state_dict()
-                    torch.save(full_state_dict, final_path)
-                    # Log final model as artifact to WandB
-                    self.wandb_logger.log_artifact(artifact_path=final_path, artifact_type="model", name="clt_final")
-                else:
-                    state_to_save = self.base_model.state_dict()
+        # Define final paths regardless of whether the loop ran
+        final_path = os.path.join(self.log_dir, "clt_final.pt")
+        final_store_path = os.path.join(self.log_dir, "activation_store_final.pt")
+
+        # Save final model and store state only if training ran for at least one step (step >= 0)
+        # And only on rank 0
+        if step >= 0:  # Check if the loop ran at least once
+            if not self.distributed or self.rank == 0:
+                print(f"Saving final model to {final_path}...")
+                try:
+                    if self.distributed:
+                        # Revert to using the context manager for gathering the full state dict
+                        save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                        with FSDP.state_dict_type(
+                            self.model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy
+                        ):
+                            state_to_save = self.model.state_dict()  # Rank 0 gets the dict, others get None
+                    else:
+                        # Use the base model's save method directly
+                        state_to_save = self.base_model.state_dict()
+
                     if state_to_save:
-                        torch.save(state_to_save, final_path)
-                    self.wandb_logger.log_artifact(artifact_path=final_path, artifact_type="model", name="clt_final")
-            except Exception as e:
-                print(f"Warning: Failed to save final model: {e}")
+                        # Only rank 0 actually saves the file
+                        if self.rank == 0:
+                            torch.save(state_to_save, final_path)
 
-            print(f"Saving final activation store state to {final_store_path}...")
-            try:
-                torch.save(self.activation_store.state_dict(), final_store_path)
-            except Exception as e:
-                print(f"Warning: Failed to save final activation store state: {e}")
+                    # Log artifact only on rank 0
+                    if self.rank == 0:
+                        self.wandb_logger.log_artifact(
+                            artifact_path=final_path, artifact_type="model", name="clt_final"
+                        )
+                except Exception as e:
+                    print(f"Warning: Failed to save final model: {e}")
 
-            print("Saving final metrics...")
-            self._save_metrics()
+                # Save store state and metrics on rank 0 if loop ran
+                if not self.distributed or self.rank == 0:
+                    print(f"Saving final activation store state to {final_store_path}...")
+                    try:
+                        torch.save(self.activation_store.state_dict(), final_store_path)
+                    except Exception as e:
+                        print(f"Warning: Failed to save final activation store state: {e}")
+
+                    print("Saving final metrics...")
+                    self._save_metrics()
 
         # Finish WandB logging (rank 0 only - handled by dummy logger for other ranks)
         self.wandb_logger.finish()
