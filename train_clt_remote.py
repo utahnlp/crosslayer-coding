@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
 Script to train a Cross-Layer Transcoder (CLT) using activations from a remote server.
-Handles configuration parsing from command-line arguments and initiates training.
+Supports distributed training with torchrun.
 """
 
 import argparse
 import torch
+import torch.distributed as dist
 from pathlib import Path
-from typing import Literal, Optional, Dict, Any  # Added Dict, Any
+from typing import Literal, Optional, Dict, Any
 import logging
 import time
 import json
+import os
 
 # Attempt to import transformers for model dimension detection
 try:
@@ -64,13 +66,28 @@ def get_model_dimensions(model_name: str) -> tuple[int, int]:
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Train a Cross-Layer Transcoder (CLT) using activations from a remote server.",
+        description="Train a Cross-Layer Transcoder (CLT) using activations from a remote server. "
+        "Supports distributed training via torchrun.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    # --- Distributed Training Parameters ---
+    dist_group = parser.add_argument_group("Distributed Training Parameters")
+    dist_group.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Enable distributed training (auto-detected if torchrun is used).",
+    )
+    dist_group.add_argument(
+        "--fsdp-policy",
+        type=str,
+        choices=["auto", "fine"],
+        default="auto",
+        help="FSDP wrapping policy: 'auto' for moderate parameter sharding, 'fine' for more aggressive sharding.",
     )
 
     # --- Core Training Parameters ---
     core_group = parser.add_argument_group("Core Training Parameters")
-    # Removed --activation-path
     core_group.add_argument(
         "--output-dir",
         type=str,
@@ -270,8 +287,11 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # --- Validation ---
-    # Server URL and dataset ID are required by argparse
+    # Auto-detect distributed mode from environment if not explicitly set
+    if not args.distributed:
+        if "WORLD_SIZE" in os.environ and int(os.environ["WORLD_SIZE"]) > 1:
+            args.distributed = True
+            logger.info("Auto-detected distributed training from torchrun environment variables.")
 
     return args
 
@@ -280,33 +300,65 @@ def main():
     """Main function to configure and run the CLTTrainer for remote activations."""
     args = parse_args()
 
-    # --- Setup Output Directory ---
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-    logger.info(f"Output directory: {output_dir.resolve()}")
+    # Initialize distributed process group if using distributed training
+    is_distributed = args.distributed
+    rank = 0
+    local_rank = 0
 
-    # Save command-line arguments
-    try:
-        with open(output_dir / "cli_args.json", "w") as f:
-            json.dump(vars(args), f, indent=2)
-    except Exception as e:
-        logger.warning(f"Could not save command-line args: {e}")
+    if is_distributed:
+        # Initialize process group if not already initialized
+        if not dist.is_initialized():
+            # Get rank and local_rank from environment (set by torchrun)
+            rank = int(os.environ.get("RANK", "0"))
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            world_size = int(os.environ.get("WORLD_SIZE", "1"))
 
-    # --- Determine Device ---
-    if args.device:
-        device = args.device
-    else:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
+            logger.info(f"Initializing process group: rank={rank}, local_rank={local_rank}, world_size={world_size}")
+            dist.init_process_group(backend="nccl")
+
+            # Set device based on local_rank
+            torch.cuda.set_device(local_rank)
+            device = f"cuda:{local_rank}"
+            logger.info(f"Process {rank}/{world_size} using device {device}")
         else:
-            device = "cpu"
-    logger.info(f"Using device: {device}")
+            # Already initialized
+            rank = dist.get_rank()
+            local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+            world_size = dist.get_world_size()
+            device = f"cuda:{local_rank}"
+            logger.info(f"Using existing process group: rank={rank}, world_size={world_size}, device={device}")
+    else:
+        # Non-distributed mode
+        if args.device:
+            device = args.device
+        else:
+            if torch.cuda.is_available():
+                device = "cuda"
+            elif torch.backends.mps.is_available():
+                device = "mps"
+            else:
+                device = "cpu"
+        logger.info(f"Using device: {device}")
+
+    # --- Setup Output Directory ---
+    # Only rank 0 needs to create the directory and save CLI args
+    output_dir = Path(args.output_dir)
+    if not is_distributed or rank == 0:
+        output_dir.mkdir(exist_ok=True, parents=True)
+        logger.info(f"Output directory: {output_dir.resolve()}")
+
+        # Save command-line arguments
+        try:
+            with open(output_dir / "cli_args.json", "w") as f:
+                json.dump(vars(args), f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save command-line args: {e}")
+
+    # Ensure all processes see the directory
+    if is_distributed:
+        dist.barrier()
 
     # --- Determine Base Model Dimensions ---
-    # Use the provided --model-name to get dimensions for the CLT config.
-    # This ensures the CLT matches the architecture activations were generated from.
     base_model_name = args.model_name
     num_layers, d_model = get_model_dimensions(base_model_name)
     if num_layers is None or d_model is None:
@@ -322,7 +374,8 @@ def main():
         jumprelu_threshold=args.jumprelu_threshold,
         clt_dtype=args.clt_dtype,
     )
-    logger.info(f"CLT Config: {clt_config}")
+    if not is_distributed or rank == 0:
+        logger.info(f"CLT Config: {clt_config}")
 
     # --- Create Training Configuration ---
     # Handle 'none' scheduler case
@@ -339,32 +392,33 @@ def main():
         "prefetch_batches": args.remote_prefetch_batches,
     }
 
-    # --- Determine WandB Run Name ---
+    # Determine WandB Run Name (only needed for rank 0)
     if args.wandb_run_name:
         wandb_run_name = args.wandb_run_name
     else:
-        # Construct the name based on the specified format
-        # Format: {width}-width-{batch_size}-batch-{slambda}-slambda-{sc}-sc
+        # Construct the name based on the specified format with distributed info
+        dist_suffix = f"-{world_size}gpus" if is_distributed else ""
         wandb_run_name = (
             f"{args.num_features}-width-"
             f"{args.train_batch_size_tokens}-batch-"
-            f"{args.sparsity_lambda:.1e}-slambda-"  # Use scientific notation for lambda
-            f"{args.sparsity_c:.1f}-sc"  # Use one decimal place for c
+            f"{args.sparsity_lambda:.1e}-slambda-"
+            f"{args.sparsity_c:.1f}-sc"
+            f"{dist_suffix}"
         )
-        logger.info(f"Generated WandB run name: {wandb_run_name}")
+        if not is_distributed or rank == 0:
+            logger.info(f"Generated WandB run name: {wandb_run_name}")
 
-    # TrainingConfig instantiation for remote source
+    # Extended TrainingConfig with distributed settings
     training_config = TrainingConfig(
         # Core Training
         learning_rate=args.learning_rate,
         training_steps=args.training_steps,
-        seed=args.seed,
+        seed=args.seed + (rank if is_distributed else 0),  # Different seed per rank
         train_batch_size_tokens=args.train_batch_size_tokens,
-        # Activation Source (hardcoded to remote)
+        # Activation Source
         activation_source="remote",
-        remote_config=remote_config_dict,  # Use the populated dict
+        remote_config=remote_config_dict,
         activation_dtype=args.activation_dtype,
-        # Removed activation_path
         # Normalization
         normalization_method=args.normalization_method,
         # Loss Coeffs
@@ -381,36 +435,51 @@ def main():
         # Dead Features
         dead_feature_window=args.dead_feature_window,
         # WandB
-        enable_wandb=args.enable_wandb,
+        enable_wandb=args.enable_wandb and (not is_distributed or rank == 0),  # Only enable WandB on rank 0
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
-        wandb_run_name=wandb_run_name,  # Use the determined name
+        wandb_run_name=wandb_run_name,
         wandb_tags=args.wandb_tags,
+        # Distributed training settings
+        distributed=is_distributed,
+        fsdp_policy=args.fsdp_policy,
     )
-    logger.info(f"Training Config: {training_config}")
+
+    if not is_distributed or rank == 0:
+        logger.info(f"Training Config: {training_config}")
 
     # --- Initialize Trainer ---
-    logger.info("Initializing CLTTrainer for remote training...")
+    if not is_distributed or rank == 0:
+        logger.info("Initializing CLTTrainer for remote training...")
     try:
         trainer = CLTTrainer(
             clt_config=clt_config,
             training_config=training_config,
             log_dir=str(output_dir),
-            device=device,
+            device=device,  # This will be overridden for distributed training
         )
     except Exception as e:
         logger.exception(f"Failed to initialize CLTTrainer: {e}")
         raise
 
     # --- Start Training ---
-    logger.info(f"Starting training from remote server {args.server_url} using dataset {args.dataset_id}...")
+    if not is_distributed or rank == 0:
+        logger.info(f"Starting training from remote server {args.server_url} using dataset {args.dataset_id}...")
+        if is_distributed:
+            logger.info(f"Training in distributed mode with {dist.get_world_size()} processes")
+
     try:
         trainer.train()
-        logger.info("Training complete!")
-        logger.info(f"Final model and logs saved in: {output_dir.resolve()}")
+        if not is_distributed or rank == 0:
+            logger.info("Training complete!")
+            logger.info(f"Final model and logs saved in: {output_dir.resolve()}")
     except Exception as e:
         logger.exception(f"Training failed: {e}")
         raise
+
+    # Clean up distributed process group
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

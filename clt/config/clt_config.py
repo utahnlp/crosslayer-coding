@@ -82,6 +82,12 @@ class TrainingConfig:
     wandb_run_name: Optional[str] = None  # WandB run name, defaults to timestamp if None
     wandb_tags: Optional[list] = field(default_factory=list)
 
+    # --- Distributed Training Parameters --- #
+    distributed: bool = False  # Enable distributed training
+    fsdp_policy: Literal["auto", "fine"] = "auto"  # FSDP wrapping policy
+    # 'auto': Moderate sharding (100K params per shard)
+    # 'fine': Aggressive sharding (25K params per shard)
+
     def __post_init__(self):
         """Validate training parameters."""
         assert self.learning_rate > 0, "Learning rate must be positive"
