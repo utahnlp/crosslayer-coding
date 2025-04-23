@@ -12,8 +12,7 @@ import datetime  # Import datetime for formatting
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-from torch.distributed.fsdp import MixedPrecision
-from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+from torch.distributed.fsdp import MixedPrecision, StateDictType, FullStateDictConfig, ShardingStrategy
 import functools
 
 from clt.config import CLTConfig, TrainingConfig
@@ -349,9 +348,13 @@ class CLTTrainer:
             else:
                 mixed_precision_config = None
 
-            # Fix: Assign FSDP wrapper to self.model
+            # Fix: Assign FSDP wrapper with SHARD_GRAD_OP strategy
             self.model = FSDP(
-                self.base_model, auto_wrap_policy=auto_wrap_policy, mixed_precision=mixed_precision_config
+                self.base_model,
+                auto_wrap_policy=auto_wrap_policy,
+                mixed_precision=mixed_precision_config,
+                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,  # Keep params replicated, shard grads/opt states
+                device_id=self.local_rank,  # Specify device ID for FSDP
             )
 
             # Expose attribute methods of base_model through the FSDP wrapper
@@ -368,7 +371,7 @@ class CLTTrainer:
                     setattr(self.model, _attr, getattr(self.base_model, _attr))
 
             if self.rank == 0:
-                logger.info(f"Initialized FSDP model with wrap policy: {fsdp_policy}")
+                logger.info(f"Initialized FSDP model with wrap policy: {fsdp_policy}, strategy: SHARD_GRAD_OP")
 
         # Initialize optimizer - uses self.model (which might be FSDP wrapper)
         if training_config.optimizer == "adam":
@@ -694,9 +697,9 @@ class CLTTrainer:
             model_checkpoint_path = os.path.join(self.log_dir, f"clt_checkpoint_{step}.pt")
             try:
                 if self.distributed:
-                    # FSDP-specific save using context manager
-                    save_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_cfg):
+                    # Use the context manager to get the full state dict
+                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
                         full_state_dict = self.model.state_dict()
                     torch.save(full_state_dict, model_checkpoint_path)
                 else:
@@ -725,9 +728,9 @@ class CLTTrainer:
 
             try:
                 if self.distributed:
-                    # FSDP-specific save for latest using context manager
-                    save_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_cfg):
+                    # Use the context manager for the latest save as well
+                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
                         full_state_dict = self.model.state_dict()
                     torch.save(full_state_dict, latest_model_path)
                 else:
@@ -758,16 +761,20 @@ class CLTTrainer:
             return
         try:
             if self.distributed:
-                # Load state dict context for FSDP
-                save_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                if self.rank == 0:
-                    state_dict = torch.load(checkpoint_path, map_location="cpu")
-                else:
-                    state_dict = None
-                with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_cfg):
-                    self.model.load_state_dict(state_dict)
+                # Use FSDP's load_state_dict context manager
+                # When loading a FULL_STATE_DICT, all ranks receive it
+                load_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=False)
+                with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=load_policy):
+                    # Load the state_dict on rank 0, FSDP handles broadcast/scatter
+                    if self.rank == 0:
+                        cpu_state_dict = torch.load(checkpoint_path, map_location="cpu")
+                        self.model.load_state_dict(cpu_state_dict)
+                    else:
+                        # Non-rank 0 loads an empty dict, FSDP handles it
+                        self.model.load_state_dict({})
+
                 print(f"Loaded FSDP model checkpoint from {checkpoint_path} (rank {self.rank})")
-                dist.barrier()
+                dist.barrier()  # Ensure all ranks have loaded before proceeding
             else:
                 self.base_model.load(checkpoint_path)
                 print(f"Loaded model checkpoint from {checkpoint_path}")
@@ -1080,9 +1087,9 @@ class CLTTrainer:
             print(f"Saving final model to {final_path}...")
             try:
                 if self.distributed:
-                    # FSDP-specific save for final model using context manager
-                    save_cfg = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
-                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, save_cfg):
+                    # Use the context manager for the final save
+                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(self.model, StateDictType.FULL_STATE_DICT, state_dict_config=save_policy):
                         full_state_dict = self.model.state_dict()
                     torch.save(full_state_dict, final_path)
                     # Log final model as artifact to WandB
