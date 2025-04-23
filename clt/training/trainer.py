@@ -1013,7 +1013,7 @@ class CLTTrainer:
 
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
-                checkpoint_interval = self.training_interval.checkpoint_interval
+                checkpoint_interval = self.training_config.checkpoint_interval
 
                 save_checkpoint_flag = (step % checkpoint_interval == 0) or (
                     step == self.training_config.training_steps - 1
