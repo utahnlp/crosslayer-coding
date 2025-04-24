@@ -10,7 +10,7 @@ import sys
 import logging  # Add logging import
 import datetime  # Import datetime for formatting
 import torch.distributed as dist
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, CPUOffload
 from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
 from torch.distributed.fsdp import MixedPrecision, StateDictType, FullStateDictConfig, ShardingStrategy
 import functools
@@ -348,13 +348,14 @@ class CLTTrainer:
             else:
                 mixed_precision_config = None
 
-            # Fix: Assign FSDP wrapper with SHARD_GRAD_OP strategy
+            # Fix: Assign FSDP wrapper with FULL_SHARD strategy
             self.model = FSDP(
                 self.base_model,
                 auto_wrap_policy=auto_wrap_policy,
+                sharding_strategy=ShardingStrategy.FULL_SHARD,
+                cpu_offload=CPUOffload(offload_params=False),
                 mixed_precision=mixed_precision_config,
-                sharding_strategy=ShardingStrategy.SHARD_GRAD_OP,  # Keep params replicated, shard grads/opt states
-                device_id=self.local_rank,  # Specify device ID for FSDP
+                device_id=self.local_rank,
             )
 
             # Expose attribute methods of base_model through the FSDP wrapper
@@ -371,7 +372,7 @@ class CLTTrainer:
                     setattr(self.model, _attr, getattr(self.base_model, _attr))
 
             if self.rank == 0:
-                logger.info(f"Initialized FSDP model with wrap policy: {fsdp_policy}, strategy: SHARD_GRAD_OP")
+                logger.info(f"Initialized FSDP model with wrap policy: {fsdp_policy}, strategy: FULL_SHARD")
 
         # Initialize optimizer - uses self.model (which might be FSDP wrapper)
         if training_config.optimizer == "adam":
