@@ -37,10 +37,17 @@ def setup_distributed(backend="nccl" if torch.cuda.is_available() else "gloo"):
             os.environ["MASTER_PORT"] = "29501"  # Adjust if needed
 
         print(f"Initializing DDP: Rank {RANK}/{WORLD_SIZE} on local rank {LOCAL_RANK} backend {backend}...")
+        # Determine device_id based on backend
+        device_id_to_pass = None
+        if backend == "nccl" and torch.cuda.is_available():
+            device_id_to_pass = torch.device(f"cuda:{LOCAL_RANK}")
+
         dist.init_process_group(
             backend=backend,
             rank=RANK,
             world_size=WORLD_SIZE,
+            # Pass the determined device object or None
+            device_id=device_id_to_pass,  # Pass device object or None
         )
         print("DDP Initialized.")
         if torch.cuda.is_available():
