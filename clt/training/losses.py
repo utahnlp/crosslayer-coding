@@ -34,18 +34,12 @@ class LossManager:
         """
         total_loss = torch.tensor(
             0.0,
-            device=(
-                next(iter(predicted.values())).device
-                if predicted
-                else torch.device("cpu")
-            ),
+            device=(next(iter(predicted.values())).device if predicted else torch.device("cpu")),
         )
         num_layers = 0
         for layer_idx in predicted:
             if layer_idx in target:
-                layer_loss = self.reconstruction_loss_fn(
-                    predicted[layer_idx], target[layer_idx]
-                )
+                layer_loss = self.reconstruction_loss_fn(predicted[layer_idx], target[layer_idx])
                 total_loss += layer_loss
                 num_layers += 1
 
@@ -70,6 +64,12 @@ class LossManager:
         Returns:
             Tuple of (sparsity penalty loss, current lambda)
         """
+        # --- TEMPORARILY DISABLED FOR DEBUGGING TP --- #
+        # Return zero loss and lambda to isolate reconstruction loss issues
+        if True:
+            return torch.tensor(0.0, device=model.device), 0.0
+        # --- ORIGINAL CODE BELOW --- #
+
         if not activations:
             return torch.tensor(0.0), 0.0
 
@@ -131,9 +131,7 @@ class LossManager:
         penalty = lambda_factor * total_penalty
         return penalty, lambda_factor
 
-    def compute_preactivation_loss(
-        self, model: CrossLayerTranscoder, inputs: Dict[int, torch.Tensor]
-    ) -> torch.Tensor:
+    def compute_preactivation_loss(self, model: CrossLayerTranscoder, inputs: Dict[int, torch.Tensor]) -> torch.Tensor:
         """Compute pre-activation loss to prevent dead features.
 
         Args:
@@ -205,9 +203,7 @@ class LossManager:
 
         # Compute loss components
         reconstruction_loss = self.compute_reconstruction_loss(predictions, targets)
-        sparsity_penalty, current_lambda = self.compute_sparsity_penalty(
-            model, activations, current_step, total_steps
-        )
+        sparsity_penalty, current_lambda = self.compute_sparsity_penalty(model, activations, current_step, total_steps)
         self.current_sparsity_lambda = current_lambda  # Store the lambda
         preactivation_loss = self.compute_preactivation_loss(model, inputs)
 
