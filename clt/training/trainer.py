@@ -489,9 +489,13 @@ class CLTTrainer:
         """
         activation_source = self.training_config.activation_source
 
-        # Use rank and world size from trainer attributes
-        rank = self.rank
-        world = self.world_size
+        shard_data = False  # add a flag if you like
+        row_rank = 0 if shard_data is False else self.rank
+        row_world = 1 if shard_data is False else self.world_size
+
+        # Temporary fix to stop sharding data
+        rank = row_rank
+        world = row_world
 
         # Fix: Declare store with Base type hint
         store: BaseActivationStore
