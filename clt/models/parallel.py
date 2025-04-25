@@ -95,26 +95,52 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
     if world_size == 1:
         return input_
 
+    rank = dist.get_rank(process_group)
+
     # Ensure input is contiguous
     input_ = input_.contiguous()
+
+    # --- Debug Print 1: Input Info --- #
+    print(
+        f"Rank {rank}/{world_size} _gather: Input shape={input_.shape}, dtype={input_.dtype}, device={input_.device}, dim={dim}, full_dim_size={full_dim_size}"
+    )
+    if input_.numel() > 0:
+        print(f"  Rank {rank}/{world_size} _gather: Input data (start): {input_.flatten()[:5]}")
 
     # Prepare the output list. Ensure the *local* entry is the actual input tensor so that
     # autograd can propagate gradients back to the original computation graph.  Using a
     # newly-allocated tensor (as we did before) breaks the gradient path because it is
     # not connected to `input_`.
-
-    rank = dist.get_rank(process_group)
-
     gathered_list = [torch.empty_like(input_) for _ in range(world_size)]
     gathered_list[rank] = input_  # keep reference to maintain gradient flow
     dist.all_gather(gathered_list, input_, group=process_group)
+    dist.barrier()  # Sync after gather for debugging prints
+
+    # --- Debug Print 2: After AllGather --- #
+    print(f"Rank {rank}/{world_size} _gather: After all_gather:")
+    for i, t in enumerate(gathered_list):
+        print(
+            f"  Rank {rank}/{world_size} _gather:   gathered_list[{i}] shape={t.shape}, dtype={t.dtype}, device={t.device}"
+        )
+        if t.numel() > 0:
+            print(f"    Rank {rank}/{world_size} _gather:     gathered_list[{i}] data (start): {t.flatten()[:5]}")
+
     output = torch.cat(gathered_list, dim=dim)
+
+    # --- Debug Print 3: After Cat --- #
+    print(f"Rank {rank}/{world_size} _gather: Output shape after cat={output.shape}")
+    if output.numel() > 0:
+        print(f"  Rank {rank}/{world_size} _gather: Output data after cat (start): {output.flatten()[:5]}")
 
     # Truncate the gathered output if the original dimension was not divisible
     if full_dim_size is not None and output.shape[dim] > full_dim_size:
+        # --- Debug Print 4: Before Truncate --- #
+        print(f"Rank {rank}/{world_size} _gather: Truncating dim {dim} from {output.shape[dim]} to {full_dim_size}")
         indices = [slice(None)] * output.dim()
         indices[dim] = slice(0, full_dim_size)
         output = output[tuple(indices)]
+        # --- Debug Print 5: After Truncate --- #
+        print(f"Rank {rank}/{world_size} _gather: Output shape after truncate={output.shape}")
 
     return output
 
