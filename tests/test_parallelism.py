@@ -340,15 +340,34 @@ def test_encoder_preactivations(
         if layer_idx == 0:
             print(f"Rank {RANK}: Performing manual calculation test for layer {layer_idx}...")
             input_clone = identical_input_data.clone()
-            # Get weights again (already verified)
-            single_weight_data = single_params_dict[single_encoder_weight_name].data.to(device)
-            multi_weight_shard_data = multi_params_dict[multi_encoder_weight_name].data.to(device)
+            # Get parameters
+            single_weight_full = single_params_dict[single_encoder_weight_name].data.to(device)
+            multi_weight_shard = multi_params_dict[multi_encoder_weight_name].data.to(device)
+
+            # --- Re-verify parameters right before manual use --- #
+            if RANK == 0:
+                print(f"Rank {RANK}: RE-VERIFYING parameters for layer {layer_idx} INSIDE manual calc...")
+                out_features = single_weight_full.shape[0]
+                local_out_features_padded = math.ceil(out_features / WORLD_SIZE)
+                expected_weight_shard = single_weight_full[:local_out_features_padded, :]
+                assert (
+                    multi_weight_shard.shape == expected_weight_shard.shape
+                ), f"RE-VERIFY Weight shape mismatch layer {layer_idx}"
+                assert torch.equal(
+                    multi_weight_shard, expected_weight_shard
+                ), f"RE-VERIFY Weight content mismatch layer {layer_idx}"
+                print(f"Rank {RANK}: RE-VERIFICATION PASSED.")
+            if dist.is_initialized():
+                dist.barrier()
+            # --- End Re-verify ---
 
             # Single GPU manual calculation
-            single_out_manual = F.linear(input_clone, single_weight_data)  # Bias is False
+            # Bias is False for encoders
+            single_out_manual = F.linear(input_clone, single_weight_full)
 
             # Multi GPU manual calculation (local matmul + gather)
-            multi_out_local_manual = F.linear(input_clone, multi_weight_shard_data)  # Bias is False
+            # Bias is False for encoders
+            multi_out_local_manual = F.linear(input_clone, multi_weight_shard)
             multi_out_manual_gathered = _gather(
                 multi_out_local_manual.contiguous(), dist.group.WORLD, dim=-1, full_dim_size=base_config.num_features
             )
@@ -359,10 +378,9 @@ def test_encoder_preactivations(
                 print(
                     f"  Manual Single shape={single_out_manual.shape}, Manual Multi shape={multi_out_manual_gathered.shape}"
                 )
-                assert torch.allclose(single_out_manual, multi_out_manual_gathered, atol=1e-5, rtol=1e-4), (
-                    f"MANUAL CALCULATION Mismatch for layer {layer_idx}."
-                    f"\nMax diff: {(single_out_manual - multi_out_manual_gathered).abs().max()}"
-                )
+                assert torch.allclose(
+                    single_out_manual, multi_out_manual_gathered, atol=1e-5, rtol=1e-4
+                ), f"MANUAL CALCULATION Mismatch for layer {layer_idx}. Max diff: {(single_out_manual - multi_out_manual_gathered).abs().max()}"
                 print("MANUAL CALCULATION check PASSED.")
             if dist.is_initialized():
                 dist.barrier()
