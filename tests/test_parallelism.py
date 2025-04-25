@@ -10,7 +10,7 @@ import torch.nn as nn  # Add nn for Linear layer
 # from clt.config import TrainingConfig # Assuming these are needed later -> remove for now
 from clt.config import CLTConfig, TrainingConfig  # Add TrainingConfig back
 from clt.models.clt import CrossLayerTranscoder
-from clt.models.parallel import ColumnParallelLinear  # Import ColumnParallelLinear
+from clt.models.parallel import ColumnParallelLinear, RowParallelLinear  # Import both
 
 # from clt.models.parallel import ColumnParallelLinear, RowParallelLinear # Unused for now
 from clt.training.losses import LossManager  # Import LossManager
@@ -1036,6 +1036,87 @@ def test_column_parallel_linear_forward(
             single_output, multi_output, atol=1e-5, rtol=1e-4
         ), f"Mismatch between nn.Linear and ColumnParallelLinear output.\nMax diff: {(single_output - multi_output).abs().max()}"
         print("  ColumnParallelLinear output matches nn.Linear output.")
+
+
+def test_row_parallel_linear_forward(
+    base_config: CLTConfig,  # Need base_config for init args
+    device: torch.device,
+):
+    """Test RowParallelLinear forward pass against nn.Linear."""
+    if WORLD_SIZE <= 1:
+        pytest.skip("Skipping RowParallelLinear test (WORLD_SIZE <= 1)")
+
+    # Note: For RowParallel, input features are sharded.
+    # Output features remain the full dimension.
+    in_features = 64  # Feature dim (sharded)
+    out_features = 32  # Model dim (full)
+    batch_tokens = 128
+    seed = 42 + RANK
+
+    test_device = device
+    print(f"Rank {RANK}: Running RPL test on device: {test_device}")
+
+    # 1. Create standard nn.Linear layer (broadcast weights)
+    torch.manual_seed(seed)
+    single_layer = nn.Linear(in_features, out_features, bias=True).to(test_device)
+    if dist.is_initialized():
+        dist.broadcast(single_layer.weight.data, src=0)
+        dist.broadcast(single_layer.bias.data, src=0)
+        dist.barrier()
+    print(f"Rank {RANK}: Single nn.Linear layer created and weights broadcasted.")
+
+    # 2. Create RowParallelLinear layer
+    torch.manual_seed(seed)
+    multi_layer = RowParallelLinear(
+        in_features=in_features,
+        out_features=out_features,
+        bias=True,
+        process_group=dist.group.WORLD,
+        input_is_parallel=False,  # Mimic usage in decode - layer handles split
+        d_model_for_init=base_config.d_model,  # Need d_model for init bounds
+        num_layers_for_init=base_config.num_layers,  # Need num_layers for init bounds
+        device=test_device,
+    )
+    multi_layer.eval()
+    print(f"Rank {RANK}: RowParallelLinear created.")
+
+    # 3. Copy weights/bias from single_layer to multi_layer
+    print(f"Rank {RANK}: Scattering/copying weights/bias to RowParallelLinear...")
+    with torch.no_grad():
+        # Scatter weight (partition_dim=1 for RowParallel)
+        scatter_full_parameter(single_layer.weight.data, multi_layer.weight, partition_dim=1)
+        # Copy bias directly (it's replicated, not sharded in RowParallelLinear)
+        if multi_layer.bias_param is not None:
+            multi_layer.bias_param.data.copy_(single_layer.bias.data.to(test_device))
+    if dist.is_initialized():
+        dist.barrier()
+    print(f"Rank {RANK}: Scatter/copy complete.")
+
+    # 4. Create identical *full* input data (input_is_parallel=False)
+    torch.manual_seed(42)
+    input_data = torch.randn(batch_tokens, in_features, device=test_device)
+    if dist.is_initialized():
+        dist.broadcast(input_data, src=0)
+        dist.barrier()
+    print(f"Rank {RANK}: Input data created and broadcasted.")
+
+    # 5. Run forward passes
+    with torch.no_grad():
+        single_output = single_layer(input_data.clone())
+        # RowParallel handles split and reduce internally
+        multi_output = multi_layer(input_data.clone())
+
+    # 6. Compare outputs on Rank 0
+    if RANK == 0:
+        print("\nComparing RowParallelLinear outputs (Rank 0):")
+        print(f"  Single output shape: {single_output.shape}")
+        print(f"  Multi output shape: {multi_output.shape}")
+        assert single_output.shape == multi_output.shape, "Output shapes mismatch"
+        # Increase tolerance slightly due to _reduce (SUM) potentially causing more diffs
+        assert torch.allclose(
+            single_output, multi_output, atol=1e-5, rtol=1e-4
+        ), f"Mismatch between nn.Linear and RowParallelLinear output.\nMax diff: {(single_output - multi_output).abs().max()}"
+        print("  RowParallelLinear output matches nn.Linear output.")
 
 
 # Add more tests here for:
