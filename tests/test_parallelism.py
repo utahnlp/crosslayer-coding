@@ -256,6 +256,10 @@ def multi_gpu_model(
     if dist.is_initialized():
         dist.barrier()
 
+    # Add extra barrier just in case
+    if dist.is_initialized():
+        dist.barrier()
+
     print(f"Rank {RANK}: Multi-GPU model created and weights copied from single GPU model.")
     return model
 
