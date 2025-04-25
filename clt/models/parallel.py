@@ -115,7 +115,15 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
 
 
 def _reduce(input_, process_group):
-    """All-reduce the input tensor across the process group and average."""
+    """All-reduce the input tensor across the process group (SUM, no additional scaling).
+
+    For row-parallel layers each rank holds a slice of the input-feature dimension and the
+    local matmul produces the *partial* output.  These partial outputs must be **summed**
+    across ranks to obtain the final result.  Dividing by `world_size` here incorrectly
+    rescales the forward activations (and thus the gradients) leading to loss explosions
+    and broken optimisation.  The caller can always divide afterwards if an average is
+    truly desired, but for the core TP math we need the raw sum.
+    """
     if process_group is None or not dist.is_initialized():
         return input_  # No-op if not distributed
 
@@ -126,13 +134,11 @@ def _reduce(input_, process_group):
     # Ensure input is contiguous
     input_ = input_.contiguous()
 
-    # Perform the all-reduce with SUM operation
+    # Perform the all-reduce with **SUM** operation (the correct aggregation for TP)
     dist.all_reduce(input_, op=dist.ReduceOp.SUM, group=process_group)
 
-    # Divide the result by world_size to get the average
-    output = input_ / world_size
-
-    return output
+    # No extra scaling — return the summed tensor
+    return input_
 
 
 def _split(input_, process_group, dim=-1):
