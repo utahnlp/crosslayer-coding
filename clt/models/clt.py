@@ -94,7 +94,7 @@ class CrossLayerTranscoder(BaseTranscoder):
     def __init__(
         self,
         config: CLTConfig,
-        process_group: Optional[ProcessGroup],  # Allow None for non-distributed
+        process_group: Optional["ProcessGroup"],  # Allow None for non-distributed
         device: Optional[torch.device] = None,
     ):
         """Initialize the Cross-Layer Transcoder.
