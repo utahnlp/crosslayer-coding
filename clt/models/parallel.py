@@ -22,6 +22,7 @@ class _ParallelLinear(nn.Module):
         keep_master_weight: bool = False,  # Not used yet, for future optimizations
         d_model_for_init: Optional[int] = None,  # Add d_model for row parallel init
         num_layers_for_init: Optional[int] = None,  # Add num_layers for row parallel init
+        device: Optional[torch.device] = None,  # Add device argument
     ):
         super().__init__()
         self.process_group = process_group
@@ -46,17 +47,17 @@ class _ParallelLinear(nn.Module):
             # Calculate padded size for uniform distribution
             self.local_out_features = math.ceil(out_features / self.world_size)
             self.local_in_features = in_features
-            self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features))
+            self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
             if bias:
-                self.bias_param = nn.Parameter(torch.empty(self.local_out_features))
+                self.bias_param = nn.Parameter(torch.empty(self.local_out_features, device=device))
         elif partition_dim == 1:  # Row Parallelism (Input features sharded)
             # Calculate padded size for uniform distribution
             self.local_in_features = math.ceil(in_features / self.world_size)
             self.local_out_features = out_features
-            self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features))
+            self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
             if bias:
                 # Bias is added *after* the all-reduce, so it's not sharded
-                self.bias_param = nn.Parameter(torch.empty(out_features))
+                self.bias_param = nn.Parameter(torch.empty(out_features, device=device))
         else:
             raise ValueError("partition_dim must be 0 or 1")
 
@@ -180,6 +181,7 @@ class ColumnParallelLinear(_ParallelLinear):
         process_group: Optional[ProcessGroup],  # Allow None
         init_method: Callable = nn.init.xavier_uniform_,
         keep_master_weight: bool = False,
+        device: Optional[torch.device] = None,
     ):
         super().__init__(
             in_features=in_features,
@@ -193,6 +195,7 @@ class ColumnParallelLinear(_ParallelLinear):
             # Pass None for row parallel init args
             d_model_for_init=None,
             num_layers_for_init=None,
+            device=device,
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
@@ -228,6 +231,7 @@ class RowParallelLinear(_ParallelLinear):
         # Require d_model and num_layers for initialization
         d_model_for_init: int,
         num_layers_for_init: int,
+        device: Optional[torch.device] = None,
     ):
         super().__init__(
             in_features=in_features,
@@ -241,6 +245,7 @@ class RowParallelLinear(_ParallelLinear):
             # Pass specific init args
             d_model_for_init=d_model_for_init,
             num_layers_for_init=num_layers_for_init,
+            device=device,
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:

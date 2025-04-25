@@ -9,9 +9,7 @@ from clt.config import CLTConfig
 from clt.models.base import BaseTranscoder
 from clt.models.parallel import ColumnParallelLinear, RowParallelLinear  # Import parallel layers
 
-# Type hint for ProcessGroup only during static analysis
-if TYPE_CHECKING:
-    from torch.distributed import ProcessGroup
+from torch.distributed import ProcessGroup
 
 # Configure logging (or use existing logger if available)
 logger = logging.getLogger(__name__)
@@ -129,6 +127,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                     out_features=config.num_features,
                     bias=False,
                     process_group=self.process_group,  # Pass potentially None group
+                    device=self.device,  # Pass device
                 )
                 for _ in range(config.num_layers)
             ]
@@ -146,6 +145,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                     # Pass model dims needed for init
                     d_model_for_init=config.d_model,
                     num_layers_for_init=config.num_layers,
+                    device=self.device,  # Pass device
                 )
                 for src_layer in range(config.num_layers)
                 for tgt_layer in range(src_layer, config.num_layers)

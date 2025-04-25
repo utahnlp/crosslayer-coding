@@ -255,6 +255,7 @@ try:
         training_config=training_config,
         log_dir=log_dir,
         device=device,
+        distributed=False,  # Explicitly set for tutorial
     )
     print("CLTTrainer instance created successfully.")
 except Exception as e:
@@ -312,8 +313,12 @@ loaded_clt_config = CLTConfig(
 )
 
 # 2. Load the model structure and state dict
-loaded_clt_model = CrossLayerTranscoder(loaded_clt_config)
-loaded_clt_model.load(final_model_path, device=torch.device(device))
+loaded_clt_model = CrossLayerTranscoder(
+    config=loaded_clt_config,
+    process_group=None,  # Non-distributed loading
+    device=torch.device(device),  # Specify device
+)
+loaded_clt_model.load(final_model_path)  # .load() doesn't take device, handled by __init__
 
 print("Model loaded successfully.")
 print(f"Loaded model is on device: {next(loaded_clt_model.parameters()).device}")
