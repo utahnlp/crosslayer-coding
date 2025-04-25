@@ -98,8 +98,10 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
     # Ensure input is contiguous
     input_ = input_.contiguous()
 
-    # --- Modification: Initialize gather list with ZEROS --- #
-    gathered_list = [torch.zeros_like(input_) for _ in range(world_size)]  # List for receiving
+    # --- Modification: Reinstate pre-assignment for autograd --- #
+    rank = dist.get_rank(process_group)  # Need rank again
+    gathered_list = [torch.empty_like(input_) for _ in range(world_size)]  # Use empty_like
+    gathered_list[rank] = input_  # Keep reference to original input for grad flow
     dist.all_gather(gathered_list, input_, group=process_group)  # Pass local tensor to gather
 
     output = torch.cat(gathered_list, dim=dim)

@@ -693,12 +693,9 @@ def test_reconstruction_loss(
     # Targets need cloning if modified by loss function (shouldn't be)
     target_dict_single = {k: v.clone() for k, v in target_dict.items()}
     # LossManager calculates loss based on model outputs and targets
-    single_recon_loss, single_recon_loss_dict = loss_manager.compute_reconstruction_loss(
-        single_gpu_outputs, target_dict_single
-    )
+    single_recon_loss = loss_manager.compute_reconstruction_loss(single_gpu_outputs, target_dict_single)
     # Check types
     assert isinstance(single_recon_loss, torch.Tensor) and single_recon_loss.numel() == 1
-    assert isinstance(single_recon_loss_dict, dict)
     print(f"\nSingle GPU Recon Loss: {single_recon_loss.item():.6f}")
 
     # --- Multi GPU Execution ---
@@ -712,12 +709,9 @@ def test_reconstruction_loss(
     # Targets need cloning
     target_dict_multi = {k: v.clone() for k, v in target_dict.items()}
     # Loss is computed locally on each rank using the full outputs/targets
-    multi_recon_loss, multi_recon_loss_dict = loss_manager.compute_reconstruction_loss(
-        multi_gpu_outputs, target_dict_multi
-    )
+    multi_recon_loss = loss_manager.compute_reconstruction_loss(multi_gpu_outputs, target_dict_multi)
     # Check types
     assert isinstance(multi_recon_loss, torch.Tensor) and multi_recon_loss.numel() == 1
-    assert isinstance(multi_recon_loss_dict, dict)
     print(f"Multi GPU Rank {RANK} Recon Loss: {multi_recon_loss.item():.6f}")
 
     # --- Comparison (only on Rank 0) ---
@@ -731,12 +725,6 @@ def test_reconstruction_loss(
         assert math.isclose(
             single_loss_val, multi_loss_val, rel_tol=1e-5, abs_tol=1e-6
         ), f"Mismatch in reconstruction loss scalar value between single ({single_loss_val}) and multi-GPU ({multi_loss_val})."
-
-        # Compare the loss dictionary contents (optional, but good check)
-        # assert single_recon_loss_dict.keys() == multi_recon_loss_dict.keys()
-        # for key in single_recon_loss_dict:
-        #     assert math.isclose(single_recon_loss_dict[key], multi_recon_loss_dict[key], rel_tol=1e-5, abs_tol=1e-6), \
-        #         f"Mismatch in reconstruction loss dict key '{key}'"
 
 
 # Test 6: Sparsity Loss Calculation (via total loss)
