@@ -330,37 +330,58 @@ def test_encoder_preactivations(
     single_params_dict = dict(single_gpu_model.named_parameters())
     multi_params_dict = dict(multi_gpu_model.named_parameters())
 
+    # Accumulate failures across layers
+    total_failures = torch.tensor(0, device=device, dtype=torch.int)
+    failure_messages = []  # Collect messages on Rank 0
+
     for layer_idx in range(base_config.num_layers):
         print(f"\n--- Testing Layer {layer_idx} --- ")
+        layer_failures = torch.tensor(0, device=device, dtype=torch.int)
+
         # 1. Verify Parameters for this layer just before use
         single_encoder_weight_name = f"encoders.{layer_idx}.weight"
         multi_encoder_weight_name = f"encoders.{layer_idx}.weight"
 
         if RANK == 0:
             print(f"Rank {RANK}: Verifying parameters for layer {layer_idx}...")
-            # Get full params from single model
-            single_weight = single_params_dict[single_encoder_weight_name].data.to(device)
-            # Get corresponding shard from multi model
-            multi_weight_shard = multi_params_dict[multi_encoder_weight_name].data.to(device)
+            try:
+                # Get full params from single model
+                single_weight = single_params_dict[single_encoder_weight_name].data.to(device)
+                # Get corresponding shard from multi model
+                multi_weight_shard = multi_params_dict[multi_encoder_weight_name].data.to(device)
 
-            # Calculate the expected shard shape based on single model param
-            out_features = single_weight.shape[0]
-            local_out_features_padded = math.ceil(out_features / WORLD_SIZE)
-            expected_weight_shard = single_weight[:local_out_features_padded, :]
+                # Calculate the expected shard shape based on single model param
+                out_features = single_weight.shape[0]
+                local_out_features_padded = math.ceil(out_features / WORLD_SIZE)
+                expected_weight_shard = single_weight[:local_out_features_padded, :]
 
-            # Check shapes match
-            assert multi_weight_shard.shape == expected_weight_shard.shape, f"Weight shape mismatch layer {layer_idx}"
+                # Check shapes match
+                assert (
+                    multi_weight_shard.shape == expected_weight_shard.shape
+                ), f"Weight shape mismatch layer {layer_idx}"
 
-            # Check content matches (using torch.equal for exact match after copy)
-            assert torch.equal(multi_weight_shard, expected_weight_shard), f"Weight content mismatch layer {layer_idx}"
-            print(f"Rank {RANK}: Parameters for layer {layer_idx} verified.")
-        # Barrier to ensure rank 0 finishes verification before others proceed (optional)
+                # Check content matches (using torch.equal for exact match after copy)
+                assert torch.equal(
+                    multi_weight_shard, expected_weight_shard
+                ), f"Weight content mismatch layer {layer_idx}"
+                print(f"Rank {RANK}: Parameters for layer {layer_idx} verified.")
+            except AssertionError as e:
+                print(f"Rank {RANK}: Parameter verification FAILED for layer {layer_idx}: {e}")
+                layer_failures += 1
+                failure_messages.append(f"Parameter verification failed layer {layer_idx}: {e}")
+
+        # Synchronize failure status before barrier
         if dist.is_initialized():
+            dist.all_reduce(layer_failures, op=dist.ReduceOp.SUM)
             dist.barrier()
+        if layer_failures.item() > 0:
+            total_failures += layer_failures  # Accumulate and continue to next layer test if possible, or fail fast
+            # Decide whether to continue or fail here. Let's accumulate and fail at the end.
 
         # --- MANUAL CALCULATION TEST for Layer 0 --- #
         if layer_idx == 0:
             print(f"Rank {RANK}: Performing manual calculation test for layer {layer_idx}...")
+            manual_calc_failures = torch.tensor(0, device=device, dtype=torch.int)
             input_clone = identical_input_data.clone()
             # Get parameters
             single_weight_full = single_params_dict[single_encoder_weight_name].data.to(device)
@@ -369,19 +390,29 @@ def test_encoder_preactivations(
             # --- Re-verify parameters right before manual use --- #
             if RANK == 0:
                 print(f"Rank {RANK}: RE-VERIFYING parameters for layer {layer_idx} INSIDE manual calc...")
-                out_features = single_weight_full.shape[0]
-                local_out_features_padded = math.ceil(out_features / WORLD_SIZE)
-                expected_weight_shard = single_weight_full[:local_out_features_padded, :]
-                assert (
-                    multi_weight_shard.shape == expected_weight_shard.shape
-                ), f"RE-VERIFY Weight shape mismatch layer {layer_idx}"
-                assert torch.equal(
-                    multi_weight_shard, expected_weight_shard
-                ), f"RE-VERIFY Weight content mismatch layer {layer_idx}"
-                print(f"Rank {RANK}: RE-VERIFICATION PASSED.")
+                try:
+                    out_features = single_weight_full.shape[0]
+                    local_out_features_padded = math.ceil(out_features / WORLD_SIZE)
+                    expected_weight_shard = single_weight_full[:local_out_features_padded, :]
+                    assert (
+                        multi_weight_shard.shape == expected_weight_shard.shape
+                    ), f"RE-VERIFY Weight shape mismatch layer {layer_idx}"
+                    assert torch.equal(
+                        multi_weight_shard, expected_weight_shard
+                    ), f"RE-VERIFY Weight content mismatch layer {layer_idx}"
+                    print(f"Rank {RANK}: RE-VERIFICATION PASSED.")
+                except AssertionError as e:
+                    print(f"Rank {RANK}: RE-VERIFICATION FAILED: {e}")
+                    manual_calc_failures += 1
+                    failure_messages.append(f"Manual calc re-verify failed layer {layer_idx}: {e}")
+
+            # Synchronize re-verify failure before barrier
             if dist.is_initialized():
+                dist.all_reduce(manual_calc_failures, op=dist.ReduceOp.SUM)
                 dist.barrier()
-            # --- End Re-verify ---
+            if manual_calc_failures.item() > 0:
+                total_failures += manual_calc_failures
+                # Continue to next check even if re-verify failed
 
             # Single GPU manual calculation
             # Bias is False for encoders
@@ -390,6 +421,7 @@ def test_encoder_preactivations(
             # Multi GPU manual calculation (local matmul + gather)
             # Bias is False for encoders
             multi_out_local_manual = F.linear(input_clone, multi_weight_shard)
+            # --- Perform gather on all ranks ---
             multi_out_manual_gathered = _gather(
                 multi_out_local_manual.contiguous(), dist.group.WORLD, dim=-1, full_dim_size=base_config.num_features
             )
@@ -400,42 +432,76 @@ def test_encoder_preactivations(
                 print(
                     f"  Manual Single shape={single_out_manual.shape}, Manual Multi shape={multi_out_manual_gathered.shape}"
                 )
-                assert torch.allclose(
-                    single_out_manual, multi_out_manual_gathered, atol=1e-5, rtol=1e-4
-                ), f"MANUAL CALCULATION Mismatch for layer {layer_idx}. Max diff: {(single_out_manual - multi_out_manual_gathered).abs().max()}"
-                print("MANUAL CALCULATION check PASSED.")
+                try:
+                    assert torch.allclose(
+                        single_out_manual, multi_out_manual_gathered, atol=1e-5, rtol=1e-4
+                    ), f"MANUAL CALCULATION Mismatch for layer {layer_idx}. Max diff: {(single_out_manual - multi_out_manual_gathered).abs().max()}"
+                    print("MANUAL CALCULATION check PASSED.")
+                except AssertionError as e:
+                    print(f"MANUAL CALCULATION check FAILED: {e}")
+                    manual_calc_failures += 1  # Already reduced, just update local count for message
+                    failure_messages.append(f"Manual calculation mismatch layer {layer_idx}: {e}")
+
+            # Synchronize manual calc comparison failure before barrier
+            # Need to reduce again if comparison failed
             if dist.is_initialized():
-                dist.barrier()
+                # Create a temporary flag for this specific check
+                manual_compare_failure = torch.tensor(0, device=device, dtype=torch.int)
+                if (
+                    RANK == 0 and "MANUAL CALCULATION check FAILED" in failure_messages[-1]
+                ):  # Check if last message indicates failure
+                    manual_compare_failure += 1
+                dist.all_reduce(manual_compare_failure, op=dist.ReduceOp.SUM)
+                dist.barrier()  # Barrier after collective
+                if manual_compare_failure.item() > 0:
+                    total_failures += manual_compare_failure  # Accumulate failure
+
         # --- END MANUAL CALCULATION TEST --- #
 
         # 2. Run Forward Passes for this layer
+        # All ranks run forward pass
         with torch.no_grad():
             single_gpu_output = single_gpu_model.get_preactivations(identical_input_data.clone(), layer_idx)
             multi_gpu_output = multi_gpu_model.get_preactivations(identical_input_data.clone(), layer_idx)
 
-            # Sanity checks (as before)
+            # Sanity checks (as before) - Perform on all ranks
             expected_shape = (identical_input_data.shape[0], base_config.num_features)
             assert single_gpu_output.shape == expected_shape
             assert multi_gpu_output.shape == expected_shape
-            assert single_gpu_output.device == device
-            # Note: multi_gpu_output should be on rank's specific device
-            assert multi_gpu_output.device == device  # device fixture already resolves to rank's device
+            assert single_gpu_output.device == device  # single uses rank's device fixture
+            assert multi_gpu_output.device == device  # multi uses rank's device fixture
 
         # 3. Compare Outputs (Rank 0)
+        layer_output_failures = torch.tensor(0, device=device, dtype=torch.int)
         if RANK == 0:
             print(f"Comparing Encoder Pre-activations for Layer {layer_idx} (Rank 0):")
-            single_out = single_gpu_output.to(multi_gpu_output.device)
-            multi_out = multi_gpu_output
+            single_out = single_gpu_output.to(device)  # Ensure comparison on correct device
+            multi_out = multi_gpu_output.to(device)
 
             print(f"  Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-            assert torch.allclose(single_out, multi_out, atol=1e-6), (
-                f"Mismatch in pre-activations for layer {layer_idx} between single and multi-GPU."
-                f"\nMax diff: {(single_out - multi_out).abs().max()}"
-            )
-            print(f"  Layer {layer_idx} Pre-activation Check PASSED.")
-        # Barrier before next layer (ensures prints are ordered)
+            try:
+                assert torch.allclose(single_out, multi_out, atol=1e-6), (
+                    f"Mismatch in pre-activations for layer {layer_idx} between single and multi-GPU."
+                    f"\nMax diff: {(single_out - multi_out).abs().max()}"
+                )
+                print(f"  Layer {layer_idx} Pre-activation Check PASSED.")
+            except AssertionError as e:
+                print(f"  Layer {layer_idx} Pre-activation Check FAILED: {e}")
+                layer_output_failures += 1
+                failure_messages.append(f"Pre-activation mismatch layer {layer_idx}: {e}")
+
+        # Synchronize output comparison failure before final layer barrier
         if dist.is_initialized():
-            dist.barrier()
+            dist.all_reduce(layer_output_failures, op=dist.ReduceOp.SUM)
+            dist.barrier()  # Barrier before next layer
+        if layer_output_failures.item() > 0:
+            total_failures += layer_output_failures
+
+    # Final check after loop
+    if total_failures.item() > 0:
+        pytest.fail(
+            f"Test failed with {total_failures.item()} errors. Messages (Rank 0):\n" + "\n".join(failure_messages)
+        )
 
 
 # Test 2: Feature Activations (encode)
@@ -448,9 +514,10 @@ def test_feature_activations(
 ):
     """Compare feature activation outputs (after nonlinearity) between single and multi-GPU."""
 
-    # --- Single GPU Execution ---
+    # --- Single GPU Execution --- #
+    # Run on all ranks to avoid potential mismatches in setup if skipped
+    single_gpu_outputs = {}
     with torch.no_grad():
-        single_gpu_outputs = {}
         for layer_idx in range(base_config.num_layers):
             single_gpu_outputs[layer_idx] = single_gpu_model.encode(identical_input_data.clone(), layer_idx)
             # Sanity check output shape
@@ -462,7 +529,7 @@ def test_feature_activations(
                 single_gpu_outputs[layer_idx].device == device
             ), f"Single GPU encode layer {layer_idx} output device mismatch: {single_gpu_outputs[layer_idx].device} != {device}"
 
-    # --- Multi GPU Execution ---
+    # --- Multi GPU Execution --- #
     if multi_gpu_model is None:
         pytest.skip("Multi-GPU model not available.")
         return
@@ -486,7 +553,9 @@ def test_feature_activations(
                 multi_gpu_output.device == device
             ), f"Multi GPU Rank {RANK} encode layer {layer_idx} output device mismatch: {multi_gpu_output.device} != {device}"
 
-    # --- Comparison (only on Rank 0) ---
+    # --- Comparison --- #
+    total_failures = torch.tensor(0, device=device, dtype=torch.int)
+    failure_messages = []
     if RANK == 0:
         print("\nComparing Feature Activations (Rank 0):")
         for layer_idx in range(base_config.num_layers):
@@ -495,10 +564,28 @@ def test_feature_activations(
             single_out = single_out.to(multi_out.device)
 
             print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-            assert torch.allclose(single_out, multi_out, atol=1e-6), (
-                f"Mismatch in feature activations for layer {layer_idx} between single and multi-GPU."
-                f"\nMax diff: {(single_out - multi_out).abs().max()}"
-            )
+            try:
+                assert torch.allclose(single_out, multi_out, atol=1e-6), (
+                    f"Mismatch in feature activations for layer {layer_idx} between single and multi-GPU."
+                    f"\nMax diff: {(single_out - multi_out).abs().max()}"
+                )
+            except AssertionError as e:
+                print(f"  Layer {layer_idx} Feature Activation Check FAILED: {e}")
+                total_failures += 1  # Accumulate failures locally on Rank 0
+                failure_messages.append(f"Feature activation mismatch layer {layer_idx}: {e}")
+
+    # Synchronize failure status after the loop
+    if dist.is_initialized():
+        dist.all_reduce(total_failures, op=dist.ReduceOp.SUM)
+        dist.barrier()  # Barrier after collective
+
+    # Check failure status on all ranks after synchronization
+    if total_failures.item() > 0:
+        # Only Rank 0 prints the detailed messages
+        fail_msg = f"Test failed with {total_failures.item()} errors."
+        if RANK == 0:
+            fail_msg += " Messages (Rank 0):\n" + "\n".join(failure_messages)
+        pytest.fail(fail_msg)
 
 
 # Test 3: Decoder Forward Pass (decode)
