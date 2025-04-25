@@ -107,11 +107,8 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
     if input_.numel() > 0:
         print(f"  Rank {rank}/{world_size} _gather: Input data (start): {input_.flatten()[:5]}")
 
-    # Prepare the output list. Ensure the *local* entry is the actual input tensor so that
-    # autograd can propagate gradients back to the original computation graph.  Using a
-    # newly-allocated tensor (as we did before) breaks the gradient path because it is
-    # not connected to `input_`.
-    gathered_list = [torch.empty_like(input_) for _ in range(world_size)]  # List for receiving
+    # --- Modification: Initialize gather list with ZEROS --- #
+    gathered_list = [torch.zeros_like(input_) for _ in range(world_size)]  # List for receiving
     dist.all_gather(gathered_list, input_, group=process_group)  # Pass local tensor to gather
     dist.barrier()  # Sync after gather for debugging prints
 
