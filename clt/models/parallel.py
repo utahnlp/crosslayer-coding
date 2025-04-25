@@ -115,7 +115,7 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
 
 
 def _reduce(input_, process_group):
-    """All-reduce the input tensor across the process group."""
+    """All-reduce the input tensor across the process group and average."""
     if process_group is None or not dist.is_initialized():
         return input_  # No-op if not distributed
 
@@ -126,8 +126,13 @@ def _reduce(input_, process_group):
     # Ensure input is contiguous
     input_ = input_.contiguous()
 
-    dist.all_reduce(input_, group=process_group)
-    return input_
+    # Perform the all-reduce with SUM operation
+    dist.all_reduce(input_, op=dist.ReduceOp.SUM, group=process_group)
+
+    # Divide the result by world_size to get the average
+    output = input_ / world_size
+
+    return output
 
 
 def _split(input_, process_group, dim=-1):
