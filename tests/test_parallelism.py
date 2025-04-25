@@ -1017,6 +1017,11 @@ def test_gradient_calculation(
                 # If other parameter types exist, add specific checks or fail
                 pytest.fail(f"Unhandled parameter type for gradient check: {name}")
 
+    # --- Final Barrier --- #
+    # Ensure all ranks wait until Rank 0 finishes comparisons before proceeding
+    if dist.is_initialized():
+        dist.barrier()
+
 
 # --- Isolated Layer Tests ---
 
