@@ -4,6 +4,7 @@ import pytest
 import os
 import math
 from typing import Optional
+import torch.nn.functional as F  # Add F for padding
 
 # from clt.config import TrainingConfig # Assuming these are needed later -> remove for now
 from clt.config import CLTConfig, TrainingConfig  # Add TrainingConfig back
@@ -126,6 +127,70 @@ def loss_manager(training_config: TrainingConfig) -> LossManager:
     return LossManager(training_config)
 
 
+# --- Helper to Scatter Full Parameter to Shards ---
+def scatter_full_parameter(full_param: torch.Tensor, model_param: torch.nn.Parameter, partition_dim: int):
+    """Splits a full parameter tensor and loads the correct shard onto the current rank."""
+    if WORLD_SIZE <= 1 or not dist.is_initialized():
+        # Single GPU: model_param should already hold the full_param data (or be assigned)
+        # This might require ensuring the single_gpu_model fixture runs first if we copy this way.
+        # Let's assume direct assignment works if needed, but focus on multi-GPU case.
+        if model_param.shape == full_param.shape:
+            model_param.data.copy_(full_param)
+        else:
+            # This case shouldn't happen if WORLD_SIZE <=1
+            print(f"Warning: Mismatched shapes in scatter for single GPU: {model_param.shape} vs {full_param.shape}")
+        return
+
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    full_dim_size = full_param.size(partition_dim)
+    local_dim_padded = math.ceil(full_dim_size / world_size)
+
+    # Calculate start/end index for this rank's shard in the full tensor
+    start_index = rank * local_dim_padded
+    # Use the actual model parameter's dimension size for the end index calculation
+    # This accounts for the padding applied during model creation
+    local_dim_actual = model_param.size(partition_dim)
+    end_index = start_index + local_dim_actual  # Use actual shard size
+
+    # Ensure end_index doesn't exceed the original full dimension
+    end_index = min(end_index, full_dim_size)
+    actual_local_dim_size = max(0, end_index - start_index)
+
+    if actual_local_dim_size > 0:
+        # Create slice objects
+        indices = [slice(None)] * full_param.dim()
+        indices[partition_dim] = slice(start_index, end_index)
+
+        # Extract the shard from the full parameter
+        param_shard = full_param[tuple(indices)].clone()
+
+        # --- Padding (if necessary) ---
+        # If the model parameter shard is larger due to padding during creation,
+        # we need to pad the shard extracted from the single_gpu_model before copying.
+        pad_amount = model_param.size(partition_dim) - param_shard.size(partition_dim)
+        if pad_amount > 0:
+            pad_dims = [0, 0] * model_param.dim()
+            # Determine padding side based on partition_dim relative to tensor dims
+            # Example: For 2D weight [out, in] partitioned along dim 0 (column), pad on the right of dim 0.
+            # Example: For 2D weight [out, in] partitioned along dim 1 (row), pad on the right of dim 1.
+            # F.pad takes pads in reverse order of dimensions: (pad_left_dimN, pad_right_dimN, pad_left_dimN-1, ...)
+            pad_idx = model_param.dim() - 1 - partition_dim
+            pad_dims[2 * pad_idx + 1] = pad_amount  # Pad right for the partition dimension
+            param_shard = F.pad(param_shard, tuple(pad_dims))
+        # --- End Padding ---
+
+        # Copy the (potentially padded) shard data to the model parameter on the current rank
+        if model_param.shape == param_shard.shape:
+            model_param.data.copy_(param_shard.to(model_param.device, model_param.dtype))
+        else:
+            # This indicates an error in slicing or padding logic
+            print(
+                f"Rank {rank} scatter ERROR: Shape mismatch {model_param.shape} != {param_shard.shape} for dim {partition_dim}"
+            )
+            # Fallback: maybe zero pad? Or fail? Let's print and maybe fail test later.
+
+
 # --- Model Fixtures ---
 @pytest.fixture(scope="module")
 def single_gpu_model(base_config: CLTConfig, device: torch.device) -> CrossLayerTranscoder:
@@ -137,24 +202,61 @@ def single_gpu_model(base_config: CLTConfig, device: torch.device) -> CrossLayer
 
 
 @pytest.fixture(scope="module")
-def multi_gpu_model(base_config: CLTConfig, device: torch.device) -> Optional[CrossLayerTranscoder]:
-    """Create a distributed CLT model if WORLD_SIZE > 1."""
+def multi_gpu_model(
+    single_gpu_model: CrossLayerTranscoder,  # Add single_gpu_model as dependency
+    base_config: CLTConfig,
+    device: torch.device,
+) -> Optional[CrossLayerTranscoder]:
+    """Create a distributed CLT model if WORLD_SIZE > 1, copying weights from single_gpu_model."""
     if WORLD_SIZE <= 1:
         pytest.skip("Skipping multi-GPU model creation (WORLD_SIZE <= 1)")
-        return None  # Should not be reached due to skip
+        return None
 
-    # Ensure process group exists before creating the model
     if not dist.is_initialized():
         pytest.fail("Distributed environment not initialized for multi-GPU model fixture.")
 
+    # Create the multi-GPU model (initializes its own parameters/shards)
     model = CrossLayerTranscoder(base_config, process_group=dist.group.WORLD, device=device)
-    model.eval()  # Set to eval mode
+    model.eval()
 
-    # Barrier to ensure model initialization is complete on all ranks before returning
+    # --- Copy weights from single_gpu_model to multi_gpu_model shards ---
+    print(f"Rank {RANK}: Copying weights from single GPU model to multi-GPU model shards...")
+    single_params_dict = dict(single_gpu_model.named_parameters())
+    with torch.no_grad():
+        for name, multi_param in model.named_parameters():
+            if name not in single_params_dict:
+                print(f"Rank {RANK}: Warning - Parameter {name} not found in single_gpu_model.")
+                continue
+
+            single_param = single_params_dict[name]
+            single_param_data = single_param.data.to(device)  # Ensure data is on correct device
+
+            # Identify parameter type and scatter/copy accordingly
+            if name == "log_threshold":  # Replicated parameter
+                multi_param.data.copy_(single_param_data)
+            elif "encoders." in name and ".weight" in name:
+                # Encoder weights are ColumnParallelLinear (partition_dim=0)
+                scatter_full_parameter(single_param_data, multi_param, partition_dim=0)
+            elif "decoders." in name and ".weight" in name:
+                # Decoder weights are RowParallelLinear (partition_dim=1)
+                scatter_full_parameter(single_param_data, multi_param, partition_dim=1)
+            elif "encoders." in name and ".bias" in name:
+                # Encoder bias is ColumnParallelLinear (partition_dim=0)
+                scatter_full_parameter(single_param_data, multi_param, partition_dim=0)
+            elif "decoders." in name and ".bias" in name:
+                # Decoder bias is RowParallelLinear (replicated, not sharded)
+                multi_param.data.copy_(single_param_data)
+            else:
+                print(f"Rank {RANK}: Warning - Unhandled parameter type for weight copying: {name}")
+                # Attempt direct copy for any other unexpected params
+                if multi_param.shape == single_param.shape:
+                    multi_param.data.copy_(single_param_data)
+
+    # Barrier to ensure copying is complete on all ranks
     if dist.is_initialized():
         dist.barrier()
 
-    print(f"Rank {RANK}: Multi-GPU model created (NO broadcast sync).")
+    print(f"Rank {RANK}: Multi-GPU model created and weights copied from single GPU model.")
     return model
 
 
