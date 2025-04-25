@@ -222,7 +222,9 @@ class ColumnParallelLinear(_ParallelLinear):
 
         # Gather output across ranks: [..., full_out_features] (truncated)
         # Pass the original full dimension size for potential truncation
-        gathered_output = _gather(local_output, self.process_group, dim=-1, full_dim_size=self.full_out_features)
+        gathered_output = _gather(
+            local_output.contiguous(), self.process_group, dim=-1, full_dim_size=self.full_out_features
+        )
 
         return gathered_output
 
