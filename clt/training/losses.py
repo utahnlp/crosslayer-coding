@@ -53,7 +53,11 @@ class LossManager:
         current_step: int,
         total_steps: int,
     ) -> Tuple[torch.Tensor, float]:
-        """Compute the sparsity penalty for the feature activations.
+        """Compute the sparsity penalty for the feature activations and the weight regularization.
+
+        We combine two complementary penalties:
+        1. The standard tanh on (decoder_norm*activation) for standard feature sparsity
+        2. A direct regularization on decoder weight norms to prevent weight explosion
 
         Args:
             model: CLT model
@@ -79,6 +83,14 @@ class LossManager:
 
         device = next(iter(activations.values())).device
         total_penalty = torch.tensor(0.0, device=device)
+
+        # Calculate direct regularization term on the decoder norms themselves to prevent weight explosion
+        weight_reg_penalty = torch.tensor(0.0, device=device)
+        for layer_idx in range(decoder_norms.shape[0]):
+            # Simple L2 regularization on decoder norms (squared)
+            # This dampens weight growth that otherwise overcompensates for scaling issues
+            weight_reg_penalty += (decoder_norms[layer_idx] ** 2).sum()
+
         for layer_idx, layer_activations in activations.items():
             try:
                 # Get effective weight for each feature based on decoder norms
@@ -124,8 +136,14 @@ class LossManager:
                     f"Feature weights shape: {feature_weights.shape}."
                 )
 
-        penalty = lambda_factor * total_penalty
-        return penalty, lambda_factor
+        # Main sparsity penalty (tanh on activations) plus weight regularization
+        # The weight regularization term scales with lambda^2 to be stronger early and still increase over time
+        # This helps compensate for the tanh saturation at high activation*weight values
+        main_penalty = lambda_factor * total_penalty
+        weight_penalty = 0.01 * (lambda_factor**2) * weight_reg_penalty  # scaling coefficient to balance magnitudes
+
+        combined_penalty = main_penalty + weight_penalty
+        return combined_penalty, lambda_factor
 
     def compute_preactivation_loss(self, model: CrossLayerTranscoder, inputs: Dict[int, torch.Tensor]) -> torch.Tensor:
         """Compute pre-activation loss to prevent dead features.
