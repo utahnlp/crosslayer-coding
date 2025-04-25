@@ -1023,10 +1023,30 @@ class CLTTrainer:
                         )
                 else:
                     try:
-                        loss = loss / self.world_size
+                        # loss = loss / self.world_size # Removed: Don't scale loss, average gradients instead
                         loss.backward()
-                        # --- Gradient clipping --- # (Applied to local gradients)
+
+                        # --- Average gradients for REPLICATED parameters --- #
+                        if self.distributed and self.world_size > 1:
+                            # Identify replicated parameters (bias in RowParallelLinear, log_threshold in CLT)
+                            # A more robust method might be needed (e.g., tagging parameters)
+                            replicated_params = []
+                            for name, param in self.model.named_parameters():
+                                if param.requires_grad and param.grad is not None:
+                                    # Simple name-based check for now
+                                    if "bias" in name or "log_threshold" in name:
+                                        replicated_params.append(param)
+
+                            if replicated_params:
+                                # Pack gradients into a single tensor for efficiency (optional but good practice)
+                                # This requires grads to be contiguous and on the same device
+                                # Alternatively, loop and all_reduce individually
+                                for param in replicated_params:
+                                    dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=self.process_group)
+
+                        # --- Gradient clipping --- # (Applied after potential gradient averaging)
                         if self.training_config.gradient_clip_val is not None:
+                            # Clip norms *after* averaging to ensure consistent clipping threshold effect
                             torch.nn.utils.clip_grad_norm_(
                                 self.model.parameters(),
                                 self.training_config.gradient_clip_val,
