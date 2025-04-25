@@ -98,8 +98,16 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
     # Ensure input is contiguous
     input_ = input_.contiguous()
 
-    # Prepare the output list. Each tensor must have the same shape.
+    # Prepare the output list. Ensure the *local* entry is the actual input tensor so that
+    # autograd can propagate gradients back to the original computation graph.  Using a
+    # newly-allocated tensor (as we did before) breaks the gradient path because it is
+    # not connected to `input_`.
+
+    rank = dist.get_rank(process_group)
+
     gathered_list = [torch.empty_like(input_) for _ in range(world_size)]
+    gathered_list[rank] = input_  # Preserve alias to maintain gradient flow.
+
     dist.all_gather(gathered_list, input_, group=process_group)
 
     # Concatenate along the specified dimension
