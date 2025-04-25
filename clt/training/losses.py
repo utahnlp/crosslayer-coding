@@ -64,11 +64,7 @@ class LossManager:
         Returns:
             Tuple of (sparsity penalty loss, current lambda)
         """
-        # --- TEMPORARILY DISABLED FOR DEBUGGING TP --- #
-        # Return zero loss and lambda to isolate reconstruction loss issues
-        if True:
-            return torch.tensor(0.0, device=model.device), 0.0
-        # --- ORIGINAL CODE BELOW --- #
+        # --- Sparsity penalty calculation restored --- #
 
         if not activations:
             return torch.tensor(0.0), 0.0

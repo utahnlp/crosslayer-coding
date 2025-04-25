@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Optional, Union, Tuple, TYPE_CHECKING, cast
+from typing import Dict, Optional, Union, Tuple, cast
 import logging  # Import logging
 import torch.distributed as dist
 
@@ -506,7 +506,8 @@ class CrossLayerTranscoder(BaseTranscoder):
 
             # Reduce the accumulated squared norms across all ranks
             if self.process_group is not None and dist.is_initialized():
-                dist.all_reduce(local_norms_sq_accum, op=dist.ReduceOp.SUM, group=self.process_group)
+                # Use AVG instead of SUM for decoder norms used in sparsity penalty
+                dist.all_reduce(local_norms_sq_accum, op=dist.ReduceOp.AVG, group=self.process_group)
 
             # Now take the square root and store in the final tensor (cast back to model dtype)
             full_decoder_norms[src_layer] = torch.sqrt(local_norms_sq_accum).to(self.dtype)
