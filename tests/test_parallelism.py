@@ -5,10 +5,12 @@ import os
 import math
 from typing import Optional
 import torch.nn.functional as F  # Add F for padding
+import torch.nn as nn  # Add nn for Linear layer
 
 # from clt.config import TrainingConfig # Assuming these are needed later -> remove for now
 from clt.config import CLTConfig, TrainingConfig  # Add TrainingConfig back
 from clt.models.clt import CrossLayerTranscoder
+from clt.models.parallel import ColumnParallelLinear  # Import ColumnParallelLinear
 
 # from clt.models.parallel import ColumnParallelLinear, RowParallelLinear # Unused for now
 from clt.training.losses import LossManager  # Import LossManager
@@ -940,5 +942,101 @@ def test_gradient_calculation(
                 pytest.fail(f"Unhandled parameter type for gradient check: {name}")
 
 
+# --- Isolated Layer Tests ---
+
+
+def test_column_parallel_linear_forward(
+    device: torch.device,
+):
+    """Test ColumnParallelLinear forward pass against nn.Linear."""
+    if WORLD_SIZE <= 1:
+        pytest.skip("Skipping ColumnParallelLinear test (WORLD_SIZE <= 1)")
+
+    in_features = 32
+    out_features = 64  # Must be divisible by WORLD_SIZE for simpler testing?
+    # Using 64 / 2 = 32 works.
+    batch_tokens = 128
+    seed = 42 + RANK  # Use different seed per rank initially
+
+    # Ensure layers are created on the correct device for the rank
+    test_device = device
+    print(f"Rank {RANK}: Running CPL test on device: {test_device}")
+
+    # 1. Create standard nn.Linear layer (on rank 0, then broadcast)
+    torch.manual_seed(seed)  # Seed for consistency if needed
+    single_layer = nn.Linear(in_features, out_features, bias=True).to(test_device)
+    # Broadcast Rank 0's weights/bias to ensure all ranks start comparison from same base
+    if dist.is_initialized():
+        dist.broadcast(single_layer.weight.data, src=0)
+        dist.broadcast(single_layer.bias.data, src=0)
+        dist.barrier()
+    print(f"Rank {RANK}: Single nn.Linear layer created and weights broadcasted.")
+
+    # 2. Create ColumnParallelLinear layer
+    torch.manual_seed(seed)  # Re-seed *before* creating multi_layer if its init needs to differ
+    multi_layer = ColumnParallelLinear(
+        in_features=in_features,
+        out_features=out_features,
+        bias=True,
+        process_group=dist.group.WORLD,
+        device=test_device,
+    )
+    multi_layer.eval()
+    print(f"Rank {RANK}: ColumnParallelLinear created.")
+
+    # 3. Copy weights/bias from single_layer to multi_layer shards
+    print(f"Rank {RANK}: Scattering weights/bias to ColumnParallelLinear...")
+    with torch.no_grad():
+        scatter_full_parameter(single_layer.weight.data, multi_layer.weight, partition_dim=0)
+        scatter_full_parameter(single_layer.bias.data, multi_layer.bias_param, partition_dim=0)
+    if dist.is_initialized():
+        dist.barrier()
+    print(f"Rank {RANK}: Scatter complete.")
+
+    # --- Optional: Verify scattered weights/bias --- #
+    # (Add prints here to compare slices if needed)
+    if RANK == 0:
+        print(f"Rank {RANK}: Checking scattered weights/bias (first few elements):")
+        # Calculate expected shard for rank 0
+        local_out_features = math.ceil(out_features / WORLD_SIZE)
+        expected_weight_shard = single_layer.weight.data[:local_out_features, :]
+        expected_bias_shard = single_layer.bias.data[:local_out_features]
+        print(f"  Rank 0: multi.weight shape {multi_layer.weight.shape}, expected {expected_weight_shard.shape}")
+        print(f"  Rank 0: multi.bias shape {multi_layer.bias_param.shape}, expected {expected_bias_shard.shape}")
+        if not torch.equal(multi_layer.weight.data, expected_weight_shard):
+            print(
+                f"  Rank 0: WARNING - Scattered weight mismatch! Max diff: {(multi_layer.weight.data - expected_weight_shard).abs().max()}"
+            )
+        if not torch.equal(multi_layer.bias_param.data, expected_bias_shard):
+            print(
+                f"  Rank 0: WARNING - Scattered bias mismatch! Max diff: {(multi_layer.bias_param.data - expected_bias_shard).abs().max()}"
+            )
+    # --- End Verify --- #
+
+    # 4. Create identical input data
+    torch.manual_seed(42)  # Fixed seed for input data
+    input_data = torch.randn(batch_tokens, in_features, device=test_device)
+    if dist.is_initialized():
+        dist.broadcast(input_data, src=0)
+        dist.barrier()
+    print(f"Rank {RANK}: Input data created and broadcasted.")
+
+    # 5. Run forward passes
+    with torch.no_grad():
+        single_output = single_layer(input_data.clone())
+        multi_output = multi_layer(input_data.clone())  # Should perform gather internally
+
+    # 6. Compare outputs on Rank 0
+    if RANK == 0:
+        print("\nComparing ColumnParallelLinear outputs (Rank 0):")
+        print(f"  Single output shape: {single_output.shape}")
+        print(f"  Multi output shape: {multi_output.shape}")
+        assert single_output.shape == multi_output.shape, "Output shapes mismatch"
+        assert torch.allclose(
+            single_output, multi_output, atol=1e-5, rtol=1e-4
+        ), f"Mismatch between nn.Linear and ColumnParallelLinear output.\nMax diff: {(single_output - multi_output).abs().max()}"
+        print("  ColumnParallelLinear output matches nn.Linear output.")
+
+
 # Add more tests here for:
-# 9. Parameter Updates
+# - RowParallelLinear
