@@ -150,14 +150,11 @@ def multi_gpu_model(base_config: CLTConfig, device: torch.device) -> Optional[Cr
     model = CrossLayerTranscoder(base_config, process_group=dist.group.WORLD, device=device)
     model.eval()  # Set to eval mode
 
-    # --- Synchronization: Ensure weights are identical across ranks ---
-    # By default, initialization uses random seeds which differ across ranks.
-    # We broadcast Rank 0's weights to ensure all models start identically.
-    with torch.no_grad():
-        for param in model.parameters():
-            dist.broadcast(param.data, src=0, group=dist.group.WORLD)
-    dist.barrier()  # Ensure broadcast is complete
-    print(f"Rank {RANK}: Multi-GPU model created and weights synchronized.")
+    # Barrier to ensure model initialization is complete on all ranks before returning
+    if dist.is_initialized():
+        dist.barrier()
+
+    print(f"Rank {RANK}: Multi-GPU model created (NO broadcast sync).")
     return model
 
 
