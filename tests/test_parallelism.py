@@ -934,7 +934,6 @@ def test_gradient_calculation(
     single_total_loss.backward()
     single_gpu_grads = {name: p.grad.clone() for name, p in single_gpu_model.named_parameters() if p.grad is not None}
     single_gpu_model.eval()  # Back to eval mode
-    print(f"\nSingle GPU Backward Pass Completed. Found {len(single_gpu_grads)} grads.")
 
     # --- Multi GPU Backward Pass ---
     if multi_gpu_model is None:
@@ -961,77 +960,86 @@ def test_gradient_calculation(
     multi_gpu_model.eval()  # Back to eval mode
     print(f"Multi GPU Rank {RANK} Backward Pass Completed. Found {len(multi_gpu_local_grads)} local grads.")
 
-    # --- Comparison (only on Rank 0) ---
+    # --- Barrier before comparison loop --- #
+    if dist.is_initialized():
+        dist.barrier()
+
+    # --- Comparison Loop (All Ranks Participate in Gathering) --- #
+    # Moved loop outside Rank 0 check
+    # Ensure same parameters have gradients (check on rank 0 only)
     if RANK == 0:
         print("\nComparing Gradients (Rank 0):")
-        # Ensure same parameters have gradients
         assert (
             single_gpu_grads.keys() == multi_gpu_local_grads.keys()
         ), f"Gradient keys differ: {single_gpu_grads.keys()} vs {multi_gpu_local_grads.keys()}"
 
-        multi_gpu_params_dict = dict(multi_gpu_model.named_parameters())
+    multi_gpu_params_dict = dict(multi_gpu_model.named_parameters())
 
-        for name, single_grad in single_gpu_grads.items():
-            local_grad = multi_gpu_local_grads[name]
-            param = multi_gpu_params_dict[name]
-
-            # --- Perform Gathering on ALL ranks if sharded --- #
-            full_multi_grad = None  # Initialize for Rank != 0
-            is_sharded = False
-            partition_dim = -1
-
-            if "encoders." in name and ".weight" in name:
-                is_sharded = True
-                partition_dim = 0
-            elif "decoders." in name and ".weight" in name:
-                is_sharded = True
-                partition_dim = 1
-            # Add other sharded types here (e.g., encoder bias if ColumnParallel)
-            elif "encoders." in name and ".bias" in name:  # Check if bias is sharded (depends on ColumnParallel impl)
-                # Check if bias_param actually exists for this layer
-                if hasattr(multi_gpu_model.encoders[int(name.split(".")[1])], "bias_param"):
-                    is_sharded = True
-                    partition_dim = 0  # ColumnParallel bias is sharded along output features
-
-            if is_sharded:
-                # All ranks participate in the gather
-                # gather_sharded_gradient returns the full tensor only on Rank 0
-                full_multi_grad = gather_sharded_gradient(local_grad, param, single_grad.shape, partition_dim)
-
-            # --- Comparison (only on Rank 0) --- #
+    for name, single_grad in single_gpu_grads.items():
+        if name not in multi_gpu_local_grads:
+            # This case should be caught by the key check on Rank 0, but good practice
             if RANK == 0:
-                print(f"  Comparing grad for: {name} (shape {single_grad.shape})")
-                single_grad = single_grad.to(local_grad.device)
+                print(f"Warning: Grad for {name} missing in multi-GPU model.")
+            continue
 
-                # Identify parameter type (replicated or sharded)
-                if name == "log_threshold":  # Replicated parameter
-                    print("    Type: Replicated")
-                    # Gradient should be identical after averaging
+        local_grad = multi_gpu_local_grads[name]
+        param = multi_gpu_params_dict[name]
+
+        # --- Perform Gathering on ALL ranks if sharded --- #
+        full_multi_grad = None  # Initialize for Rank != 0
+        is_sharded = False
+        partition_dim = -1
+
+        if "encoders." in name and ".weight" in name:
+            is_sharded = True
+            partition_dim = 0
+        elif "decoders." in name and ".weight" in name:
+            is_sharded = True
+            partition_dim = 1
+        # Add other sharded types here (e.g., encoder bias if ColumnParallel)
+        elif "encoders." in name and ".bias" in name:  # Check if bias is sharded (depends on ColumnParallel impl)
+            # Encoders have bias=False, this branch should not be hit
+            if hasattr(multi_gpu_model.encoders[int(name.split(".")[1])], "bias_param"):
+                is_sharded = True
+                partition_dim = 0  # ColumnParallel bias is sharded along output features
+
+        if is_sharded:
+            # All ranks participate in the gather
+            # gather_sharded_gradient returns the full tensor only on Rank 0
+            full_multi_grad = gather_sharded_gradient(local_grad, param, single_grad.shape, partition_dim)
+
+        # --- Comparison (only on Rank 0) --- #
+        if RANK == 0:
+            print(f"  Comparing grad for: {name} (shape {single_grad.shape})")
+            single_grad = single_grad.to(local_grad.device)
+
+            # Identify parameter type (replicated or sharded)
+            if name == "log_threshold":  # Replicated parameter
+                print("    Type: Replicated")
+                assert torch.allclose(
+                    single_grad, local_grad, atol=1e-4, rtol=1e-4
+                ), f"Mismatch in replicated gradient for '{name}'. Max diff: {(single_grad - local_grad).abs().max()}"
+
+            elif is_sharded:
+                # Access the gathered gradient computed above
+                print(f"    Type: Sharded (partition_dim={partition_dim})")
+                if full_multi_grad is not None:
                     assert torch.allclose(
-                        single_grad, local_grad, atol=1e-4, rtol=1e-4  # Increased atol to 1e-4
-                    ), f"Mismatch in replicated gradient for '{name}'. Max diff: {(single_grad - local_grad).abs().max()}"
-
-                elif is_sharded:
-                    # Access the gathered gradient computed above
-                    print(f"    Type: Sharded (partition_dim={partition_dim})")
-                    if full_multi_grad is not None:
-                        assert torch.allclose(
-                            single_grad, full_multi_grad, atol=1e-5, rtol=1e-4
-                        ), f"Mismatch in gathered sharded gradient for '{name}'. Max diff: {(single_grad - full_multi_grad).abs().max()}"
-                    else:
-                        pytest.fail(f"Failed to gather gradient for sharded parameter {name} on Rank 0")
-
-                # Handle non-sharded, non-log_threshold parameters (e.g., RowParallelLinear bias)
-                elif "decoders." in name and ".bias" in name:
-                    # Bias for RowParallelLinear should be replicated
-                    print("    Type: Replicated (Decoder Bias)")
-                    assert torch.allclose(
-                        single_grad, local_grad, atol=1e-5, rtol=1e-4
-                    ), f"Mismatch in replicated gradient for '{name}'. Max diff: {(single_grad - local_grad).abs().max()}"
+                        single_grad, full_multi_grad, atol=1e-5, rtol=1e-4
+                    ), f"Mismatch in gathered sharded gradient for '{name}'. Max diff: {(single_grad - full_multi_grad).abs().max()}"
                 else:
-                    print("    Type: Unknown/Unhandled")
-                    # If other parameter types exist, add specific checks or fail
-                    pytest.fail(f"Unhandled parameter type for gradient check: {name}")
+                    pytest.fail(f"Failed to gather gradient for sharded parameter {name} on Rank 0")
+
+            # Handle non-sharded, non-log_threshold parameters (e.g., RowParallelLinear bias)
+            elif "decoders." in name and ".bias" in name:
+                # Bias for RowParallelLinear should be replicated
+                print("    Type: Replicated (Decoder Bias)")
+                assert torch.allclose(
+                    single_grad, local_grad, atol=1e-5, rtol=1e-4
+                ), f"Mismatch in replicated gradient for '{name}'. Max diff: {(single_grad - local_grad).abs().max()}"
+            else:
+                print("    Type: Unknown/Unhandled")
+                pytest.fail(f"Unhandled parameter type for gradient check: {name}")
 
     # --- Final Barrier --- #
     # Ensure all ranks wait until Rank 0 finishes comparisons before proceeding
