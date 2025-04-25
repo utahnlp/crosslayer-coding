@@ -298,57 +298,78 @@ def test_encoder_preactivations(
 ):
     """Compare encoder pre-activation outputs between single and multi-GPU."""
 
-    # --- Single GPU Execution ---
-    with torch.no_grad():
-        single_gpu_outputs = {}
-        for layer_idx in range(base_config.num_layers):
-            single_gpu_outputs[layer_idx] = single_gpu_model.get_preactivations(identical_input_data.clone(), layer_idx)
-            # Sanity check output shape
-            expected_shape = (identical_input_data.shape[0], base_config.num_features)
-            assert (
-                single_gpu_outputs[layer_idx].shape == expected_shape
-            ), f"Single GPU layer {layer_idx} output shape mismatch: {single_gpu_outputs[layer_idx].shape} != {expected_shape}"
-            assert (
-                single_gpu_outputs[layer_idx].device == device
-            ), f"Single GPU layer {layer_idx} output device mismatch: {single_gpu_outputs[layer_idx].device} != {device}"
-
-    # --- Multi GPU Execution ---
+    # --- Single GPU Execution --- # Moved multi-GPU model check earlier
     if multi_gpu_model is None:
         pytest.skip("Multi-GPU model not available.")
         return  # Should not be reached
 
-    multi_gpu_outputs = {}
-    with torch.no_grad():
-        for layer_idx in range(base_config.num_layers):
-            # get_preactivations uses ColumnParallelLinear -> should return the *full* tensor
-            # after an internal all_gather.
+    # --- Check parameters and run forward layer by layer --- #
+    single_params_dict = dict(single_gpu_model.named_parameters())
+    multi_params_dict = dict(multi_gpu_model.named_parameters())
+
+    for layer_idx in range(base_config.num_layers):
+        print(f"\n--- Testing Layer {layer_idx} --- ")
+        # 1. Verify Parameters for this layer just before use
+        single_encoder_weight_name = f"encoders.{layer_idx}.weight"
+        single_encoder_bias_name = f"encoders.{layer_idx}.bias_param"
+        multi_encoder_weight_name = f"encoders.{layer_idx}.weight"
+        multi_encoder_bias_name = f"encoders.{layer_idx}.bias_param"
+
+        if RANK == 0:
+            print(f"Rank {RANK}: Verifying parameters for layer {layer_idx}...")
+            # Get full params from single model
+            single_weight = single_params_dict[single_encoder_weight_name].data.to(device)
+            single_bias = single_params_dict[single_encoder_bias_name].data.to(device)
+            # Get corresponding shard from multi model
+            multi_weight_shard = multi_params_dict[multi_encoder_weight_name].data.to(device)
+            multi_bias_shard = multi_params_dict[multi_encoder_bias_name].data.to(device)
+
+            # Calculate the expected shard shape based on single model param
+            out_features = single_weight.shape[0]
+            local_out_features_padded = math.ceil(out_features / WORLD_SIZE)
+            expected_weight_shard = single_weight[:local_out_features_padded, :]
+            expected_bias_shard = single_bias[:local_out_features_padded]
+
+            # Check shapes match
+            assert multi_weight_shard.shape == expected_weight_shard.shape, f"Weight shape mismatch layer {layer_idx}"
+            assert multi_bias_shard.shape == expected_bias_shard.shape, f"Bias shape mismatch layer {layer_idx}"
+
+            # Check content matches (using torch.equal for exact match after copy)
+            assert torch.equal(multi_weight_shard, expected_weight_shard), f"Weight content mismatch layer {layer_idx}"
+            assert torch.equal(multi_bias_shard, expected_bias_shard), f"Bias content mismatch layer {layer_idx}"
+            print(f"Rank {RANK}: Parameters for layer {layer_idx} verified.")
+        # Barrier to ensure rank 0 finishes verification before others proceed (optional)
+        if dist.is_initialized():
+            dist.barrier()
+
+        # 2. Run Forward Passes for this layer
+        with torch.no_grad():
+            single_gpu_output = single_gpu_model.get_preactivations(identical_input_data.clone(), layer_idx)
             multi_gpu_output = multi_gpu_model.get_preactivations(identical_input_data.clone(), layer_idx)
-            multi_gpu_outputs[layer_idx] = multi_gpu_output
 
-            # Sanity check output shape (should be full shape on all ranks)
+            # Sanity checks (as before)
             expected_shape = (identical_input_data.shape[0], base_config.num_features)
-            assert (
-                multi_gpu_output.shape == expected_shape
-            ), f"Multi GPU Rank {RANK} layer {layer_idx} output shape mismatch: {multi_gpu_output.shape} != {expected_shape}"
-            assert (
-                multi_gpu_output.device == device
-            ), f"Multi GPU Rank {RANK} layer {layer_idx} output device mismatch: {multi_gpu_output.device} != {device}"
+            assert single_gpu_output.shape == expected_shape
+            assert multi_gpu_output.shape == expected_shape
+            assert single_gpu_output.device == device
+            # Note: multi_gpu_output should be on rank's specific device
+            assert multi_gpu_output.device == device  # device fixture already resolves to rank's device
 
-    # --- Comparison (only on Rank 0) ---
-    if RANK == 0:
-        print("\nComparing Encoder Pre-activations (Rank 0):")
-        for layer_idx in range(base_config.num_layers):
-            single_out = single_gpu_outputs[layer_idx]
-            multi_out = multi_gpu_outputs[layer_idx]
-            # Ensure tensors are on the same device for comparison if single_gpu ran on CPU/different GPU
-            single_out = single_out.to(multi_out.device)
+        # 3. Compare Outputs (Rank 0)
+        if RANK == 0:
+            print(f"Comparing Encoder Pre-activations for Layer {layer_idx} (Rank 0):")
+            single_out = single_gpu_output.to(multi_gpu_output.device)
+            multi_out = multi_gpu_output
 
-            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-            # Use torch.allclose for floating point comparison
+            print(f"  Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
             assert torch.allclose(single_out, multi_out, atol=1e-6), (
                 f"Mismatch in pre-activations for layer {layer_idx} between single and multi-GPU."
                 f"\nMax diff: {(single_out - multi_out).abs().max()}"
-            )  # f"\nSingle:\n{single_out}\nMulti:\n{multi_out}" # Uncomment for verbose diff
+            )
+            print(f"  Layer {layer_idx} Pre-activation Check PASSED.")
+        # Barrier before next layer (ensures prints are ordered)
+        if dist.is_initialized():
+            dist.barrier()
 
 
 # Test 2: Feature Activations (encode)
