@@ -1066,25 +1066,25 @@ class CLTTrainer:
                 )
                 run_eval_flag = (step % eval_interval == 0) or (step == self.training_config.training_steps - 1)
 
-                # --- Evaluation (Rank 0 only for now) ---
-                # TODO: Adapt evaluation for TP if metrics require sharded states or collective computation
+                # --- Evaluation (all ranks participate to match collectives) ---
+                # In tensor-parallel mode the model forward includes collective ops (all_reduce/all_gather).
+                # If only rank 0 performed the forward pass these collectives would block on the other ranks
+                # resulting in NCCL timeouts.  Therefore, *every* rank must execute the evaluation forward pass.
+                # We still only log / store the resulting metrics on rank 0.
                 if run_eval_flag:
                     if self.distributed:
-                        dist.barrier()  # Sync before eval
+                        dist.barrier()  # Sync before evaluation starts so that all ranks enter together
+
+                    # Compute evaluation metrics on all ranks to keep collective ops aligned
+                    current_dead_mask = self.dead_neurons_mask.detach().clone()
+                    eval_metrics = self.evaluator.compute_metrics(
+                        inputs,
+                        targets,
+                        dead_neuron_mask=current_dead_mask,
+                    )
 
                     if not self.distributed or self.rank == 0:
-                        # Detach mask for evaluator, which runs with no_grad
-                        current_dead_mask = self.dead_neurons_mask.detach().clone()
-
-                        # Use the evaluator - may need adaptation for TP model
-                        # It currently takes self.model - does it gather state or work locally? Assume local for now.
-                        eval_metrics = self.evaluator.compute_metrics(
-                            inputs,  # Rank 0's inputs
-                            targets,  # Rank 0's targets
-                            dead_neuron_mask=current_dead_mask,
-                        )
-
-                        # Store evaluation metrics (for saving to JSON) - Only Rank 0
+                        # Store evaluation metrics (for saving to JSON)
                         self.metrics["eval_metrics"].append({"step": step, **eval_metrics})
 
                         # --- Update Progress Bar Postfix ---
@@ -1105,7 +1105,7 @@ class CLTTrainer:
                         # --- Save metrics JSON after evaluation ---
                         self._save_metrics()
 
-                    # Barrier after eval if distributed, before potential checkpoint
+                    # Ensure all ranks finish evaluation before proceeding
                     if self.distributed:
                         dist.barrier()
 
