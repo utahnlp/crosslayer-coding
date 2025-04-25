@@ -1,0 +1,841 @@
+import torch
+import torch.distributed as dist
+import pytest
+import os
+import math
+from typing import Optional
+
+# from clt.config import TrainingConfig # Assuming these are needed later -> remove for now
+from clt.config import CLTConfig, TrainingConfig  # Add TrainingConfig back
+from clt.models.clt import CrossLayerTranscoder
+
+# from clt.models.parallel import ColumnParallelLinear, RowParallelLinear # Unused for now
+from clt.training.losses import LossManager  # Import LossManager
+
+# Environment variable to simulate world size if not run with torchrun
+# Example: `TP_WORLD_SIZE=2 pytest tests/test_parallelism.py`
+# Default to 1 if not set (single GPU/CPU mode)
+DEFAULT_WORLD_SIZE = 1
+WORLD_SIZE = int(os.environ.get("WORLD_SIZE", DEFAULT_WORLD_SIZE))
+RANK = int(os.environ.get("RANK", 0))
+LOCAL_RANK = int(os.environ.get("LOCAL_RANK", 0))
+
+
+# --- Distributed Setup Helper ---
+def setup_distributed(backend="nccl" if torch.cuda.is_available() else "gloo"):
+    """Initializes the distributed environment."""
+    if WORLD_SIZE > 1 and not dist.is_initialized():
+        # These env vars are typically set by torchrun
+        if "MASTER_ADDR" not in os.environ:
+            os.environ["MASTER_ADDR"] = "localhost"
+        if "MASTER_PORT" not in os.environ:
+            # Find a free port dynamically? For now, use a default.
+            os.environ["MASTER_PORT"] = "29501"  # Adjust if needed
+
+        print(f"Initializing DDP: Rank {RANK}/{WORLD_SIZE} on local rank {LOCAL_RANK} backend {backend}...")
+        dist.init_process_group(
+            backend=backend,
+            rank=RANK,
+            world_size=WORLD_SIZE,
+        )
+        print("DDP Initialized.")
+        if torch.cuda.is_available():
+            torch.cuda.set_device(LOCAL_RANK)  # Crucial for multi-GPU per node
+
+    # Barrier to ensure all processes are initialized
+    if dist.is_initialized():
+        dist.barrier()
+
+
+def cleanup_distributed():
+    """Cleans up the distributed environment."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def distributed_fixture():
+    """Pytest fixture to setup/teardown distributed environment."""
+    setup_distributed()
+    yield
+    cleanup_distributed()
+
+
+# --- Test Configuration ---
+@pytest.fixture(scope="module")
+def base_config() -> CLTConfig:
+    """Base CLT configuration for tests."""
+    return CLTConfig(
+        d_model=32,  # Small hidden size
+        num_features=64,  # Number of CLT features (keep power of 2 for TP)
+        num_layers=4,  # Number of layers
+        activation_fn="jumprelu",
+        jumprelu_threshold=0.01,
+        clt_dtype="float32",  # Use float32 for easier comparison
+    )
+
+
+@pytest.fixture(scope="module")
+def device() -> torch.device:
+    """Determine the device based on availability and distributed setup."""
+    if WORLD_SIZE > 1 and torch.cuda.is_available():
+        return torch.device(f"cuda:{LOCAL_RANK}")
+    elif torch.cuda.is_available():
+        # Single GPU test case, use cuda:0
+        # Note: Ensure tests run on a machine with at least one GPU if CUDA is intended
+        return torch.device("cuda:0")
+    else:
+        return torch.device("cpu")
+
+
+@pytest.fixture(scope="module")
+def training_config() -> TrainingConfig:
+    """Base Training configuration for loss tests."""
+    return TrainingConfig(
+        # Required basic params
+        learning_rate=1e-4,
+        training_steps=100,
+        train_batch_size_tokens=1024,  # From default
+        # Activation source (placeholders, but required)
+        activation_source="local_manifest",
+        activation_path="dummy",
+        # Loss specific params (using correct names from definition)
+        sparsity_lambda=0.01,
+        sparsity_c=1.0,
+        preactivation_coef=0.0,  # Disable preactivation loss for simplicity
+        # Optional params with defaults used in LossManager or Trainer
+        log_interval=10,
+        eval_interval=20,
+        checkpoint_interval=50,
+        optimizer="adamw",
+        lr_scheduler=None,
+        seed=42,
+        activation_dtype="float32",
+        # Normalization - set to none to avoid dependency on stats files/estimation
+        normalization_method="none",
+        # Other defaults that might be relevant
+        n_batches_in_buffer=16,
+        dead_feature_window=1000,
+        enable_wandb=False,
+    )
+
+
+@pytest.fixture(scope="module")
+def loss_manager(training_config: TrainingConfig) -> LossManager:
+    """Create a LossManager instance."""
+    return LossManager(training_config)
+
+
+# --- Model Fixtures ---
+@pytest.fixture(scope="module")
+def single_gpu_model(base_config: CLTConfig, device: torch.device) -> CrossLayerTranscoder:
+    """Create a standard, non-distributed CLT model."""
+    # Pass process_group=None for single GPU/CPU
+    model = CrossLayerTranscoder(base_config, process_group=None, device=device)
+    model.eval()  # Set to eval mode
+    return model
+
+
+@pytest.fixture(scope="module")
+def multi_gpu_model(base_config: CLTConfig, device: torch.device) -> Optional[CrossLayerTranscoder]:
+    """Create a distributed CLT model if WORLD_SIZE > 1."""
+    if WORLD_SIZE <= 1:
+        pytest.skip("Skipping multi-GPU model creation (WORLD_SIZE <= 1)")
+        return None  # Should not be reached due to skip
+
+    # Ensure process group exists before creating the model
+    if not dist.is_initialized():
+        pytest.fail("Distributed environment not initialized for multi-GPU model fixture.")
+
+    model = CrossLayerTranscoder(base_config, process_group=dist.group.WORLD, device=device)
+    model.eval()  # Set to eval mode
+
+    # --- Synchronization: Ensure weights are identical across ranks ---
+    # By default, initialization uses random seeds which differ across ranks.
+    # We broadcast Rank 0's weights to ensure all models start identically.
+    with torch.no_grad():
+        for param in model.parameters():
+            dist.broadcast(param.data, src=0, group=dist.group.WORLD)
+    dist.barrier()  # Ensure broadcast is complete
+    print(f"Rank {RANK}: Multi-GPU model created and weights synchronized.")
+    return model
+
+
+# --- Test Data ---
+@pytest.fixture(scope="module")
+def identical_input_data(base_config: CLTConfig, device: torch.device) -> torch.Tensor:
+    """Create identical input data across all ranks."""
+    # Use a fixed seed for reproducibility IF testing initialization is sensitive.
+    # For forward pass comparison, just ensuring identical data is key.
+    # torch.manual_seed(42) # Optional: If needed
+    batch_size = 4
+    seq_len = 16  # Or just batch_tokens
+    input_tensor = torch.randn(batch_size * seq_len, base_config.d_model, device=device, dtype=torch.float32)
+
+    # Ensure all ranks have the exact same tensor if distributed
+    if WORLD_SIZE > 1 and dist.is_initialized():
+        dist.broadcast(input_tensor, src=0)
+        dist.barrier()  # Ensure broadcast is complete
+
+    return input_tensor
+
+
+# --- Test Cases ---
+
+
+# Test 1: Encoder Pre-activations (get_preactivations)
+def test_encoder_preactivations(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    base_config: CLTConfig,
+    device: torch.device,
+):
+    """Compare encoder pre-activation outputs between single and multi-GPU."""
+
+    # --- Single GPU Execution ---
+    with torch.no_grad():
+        single_gpu_outputs = {}
+        for layer_idx in range(base_config.num_layers):
+            single_gpu_outputs[layer_idx] = single_gpu_model.get_preactivations(identical_input_data.clone(), layer_idx)
+            # Sanity check output shape
+            expected_shape = (identical_input_data.shape[0], base_config.num_features)
+            assert (
+                single_gpu_outputs[layer_idx].shape == expected_shape
+            ), f"Single GPU layer {layer_idx} output shape mismatch: {single_gpu_outputs[layer_idx].shape} != {expected_shape}"
+            assert (
+                single_gpu_outputs[layer_idx].device == device
+            ), f"Single GPU layer {layer_idx} output device mismatch: {single_gpu_outputs[layer_idx].device} != {device}"
+
+    # --- Multi GPU Execution ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return  # Should not be reached
+
+    multi_gpu_outputs = {}
+    with torch.no_grad():
+        for layer_idx in range(base_config.num_layers):
+            # get_preactivations uses ColumnParallelLinear -> should return the *full* tensor
+            # after an internal all_gather.
+            multi_gpu_output = multi_gpu_model.get_preactivations(identical_input_data.clone(), layer_idx)
+            multi_gpu_outputs[layer_idx] = multi_gpu_output
+
+            # Sanity check output shape (should be full shape on all ranks)
+            expected_shape = (identical_input_data.shape[0], base_config.num_features)
+            assert (
+                multi_gpu_output.shape == expected_shape
+            ), f"Multi GPU Rank {RANK} layer {layer_idx} output shape mismatch: {multi_gpu_output.shape} != {expected_shape}"
+            assert (
+                multi_gpu_output.device == device
+            ), f"Multi GPU Rank {RANK} layer {layer_idx} output device mismatch: {multi_gpu_output.device} != {device}"
+
+    # --- Comparison (only on Rank 0) ---
+    if RANK == 0:
+        print("\nComparing Encoder Pre-activations (Rank 0):")
+        for layer_idx in range(base_config.num_layers):
+            single_out = single_gpu_outputs[layer_idx]
+            multi_out = multi_gpu_outputs[layer_idx]
+            # Ensure tensors are on the same device for comparison if single_gpu ran on CPU/different GPU
+            single_out = single_out.to(multi_out.device)
+
+            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+            # Use torch.allclose for floating point comparison
+            assert torch.allclose(single_out, multi_out, atol=1e-6), (
+                f"Mismatch in pre-activations for layer {layer_idx} between single and multi-GPU."
+                f"\nMax diff: {(single_out - multi_out).abs().max()}"
+            )  # f"\nSingle:\n{single_out}\nMulti:\n{multi_out}" # Uncomment for verbose diff
+
+
+# Test 2: Feature Activations (encode)
+def test_feature_activations(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    base_config: CLTConfig,
+    device: torch.device,
+):
+    """Compare feature activation outputs (after nonlinearity) between single and multi-GPU."""
+
+    # --- Single GPU Execution ---
+    with torch.no_grad():
+        single_gpu_outputs = {}
+        for layer_idx in range(base_config.num_layers):
+            single_gpu_outputs[layer_idx] = single_gpu_model.encode(identical_input_data.clone(), layer_idx)
+            # Sanity check output shape
+            expected_shape = (identical_input_data.shape[0], base_config.num_features)
+            assert (
+                single_gpu_outputs[layer_idx].shape == expected_shape
+            ), f"Single GPU encode layer {layer_idx} output shape mismatch: {single_gpu_outputs[layer_idx].shape} != {expected_shape}"
+            assert (
+                single_gpu_outputs[layer_idx].device == device
+            ), f"Single GPU encode layer {layer_idx} output device mismatch: {single_gpu_outputs[layer_idx].device} != {device}"
+
+    # --- Multi GPU Execution ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return
+
+    multi_gpu_outputs = {}
+    with torch.no_grad():
+        for layer_idx in range(base_config.num_layers):
+            # encode() applies nonlinearity to the full preactivation tensor
+            # returned by get_preactivations (which uses ColumnParallelLinear).
+            # The nonlinearity uses the replicated log_threshold.
+            # Result should be the full activation tensor on all ranks.
+            multi_gpu_output = multi_gpu_model.encode(identical_input_data.clone(), layer_idx)
+            multi_gpu_outputs[layer_idx] = multi_gpu_output
+
+            # Sanity check output shape (should be full shape on all ranks)
+            expected_shape = (identical_input_data.shape[0], base_config.num_features)
+            assert (
+                multi_gpu_output.shape == expected_shape
+            ), f"Multi GPU Rank {RANK} encode layer {layer_idx} output shape mismatch: {multi_gpu_output.shape} != {expected_shape}"
+            assert (
+                multi_gpu_output.device == device
+            ), f"Multi GPU Rank {RANK} encode layer {layer_idx} output device mismatch: {multi_gpu_output.device} != {device}"
+
+    # --- Comparison (only on Rank 0) ---
+    if RANK == 0:
+        print("\nComparing Feature Activations (Rank 0):")
+        for layer_idx in range(base_config.num_layers):
+            single_out = single_gpu_outputs[layer_idx]
+            multi_out = multi_gpu_outputs[layer_idx]
+            single_out = single_out.to(multi_out.device)
+
+            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+            assert torch.allclose(single_out, multi_out, atol=1e-6), (
+                f"Mismatch in feature activations for layer {layer_idx} between single and multi-GPU."
+                f"\nMax diff: {(single_out - multi_out).abs().max()}"
+            )
+
+
+# Test 3: Decoder Forward Pass (decode)
+def test_decoder_decode(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    base_config: CLTConfig,
+    device: torch.device,
+):
+    """Compare decoder reconstruction outputs (decode method) between single and multi-GPU."""
+
+    # --- Generate Feature Activations (using single GPU model for simplicity) ---
+    # We need the full activations for the decode input dictionary.
+    # Using the single_gpu_model ensures we have a consistent starting point.
+    feature_activations = {}
+    with torch.no_grad():
+        for layer_idx in range(base_config.num_layers):
+            # Use encode, which gives full activations after nonlinearity
+            feature_activations[layer_idx] = single_gpu_model.encode(identical_input_data.clone(), layer_idx)
+            # Ensure they are on the test device
+            feature_activations[layer_idx] = feature_activations[layer_idx].to(device)
+
+    # --- Single GPU Execution ---
+    single_gpu_reconstructions = {}
+    with torch.no_grad():
+        for layer_idx in range(base_config.num_layers):
+            # Create input dict with activations up to the current layer
+            current_activations = {k: v.clone() for k, v in feature_activations.items() if k <= layer_idx}
+            single_gpu_reconstructions[layer_idx] = single_gpu_model.decode(current_activations, layer_idx)
+            # Sanity check output shape
+            expected_shape = (identical_input_data.shape[0], base_config.d_model)
+            assert (
+                single_gpu_reconstructions[layer_idx].shape == expected_shape
+            ), f"Single GPU decode layer {layer_idx} output shape mismatch: {single_gpu_reconstructions[layer_idx].shape} != {expected_shape}"
+            assert (
+                single_gpu_reconstructions[layer_idx].device == device
+            ), f"Single GPU decode layer {layer_idx} output device mismatch: {single_gpu_reconstructions[layer_idx].device} != {device}"
+
+    # --- Multi GPU Execution ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return
+
+    multi_gpu_reconstructions = {}
+    with torch.no_grad():
+        for layer_idx in range(base_config.num_layers):
+            # Prepare the same input dict for the multi-GPU model
+            # The activations are full tensors, RowParallelLinear splits them internally
+            current_activations_multi = {k: v.clone() for k, v in feature_activations.items() if k <= layer_idx}
+
+            # decode() uses RowParallelLinear -> should return the *full* tensor
+            # after internal split, matmul, and all_reduce.
+            multi_gpu_output = multi_gpu_model.decode(current_activations_multi, layer_idx)
+            multi_gpu_reconstructions[layer_idx] = multi_gpu_output
+
+            # Sanity check output shape (should be full shape on all ranks)
+            expected_shape = (identical_input_data.shape[0], base_config.d_model)
+            assert (
+                multi_gpu_output.shape == expected_shape
+            ), f"Multi GPU Rank {RANK} decode layer {layer_idx} output shape mismatch: {multi_gpu_output.shape} != {expected_shape}"
+            assert (
+                multi_gpu_output.device == device
+            ), f"Multi GPU Rank {RANK} decode layer {layer_idx} output device mismatch: {multi_gpu_output.device} != {device}"
+
+    # --- Comparison (only on Rank 0) ---
+    if RANK == 0:
+        print("\nComparing Decoder Outputs (Rank 0):")
+        for layer_idx in range(base_config.num_layers):
+            single_out = single_gpu_reconstructions[layer_idx]
+            multi_out = multi_gpu_reconstructions[layer_idx]
+            single_out = single_out.to(multi_out.device)
+
+            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+            # Check if shapes match before comparison
+            if single_out.shape != multi_out.shape:
+                pytest.fail(f"Shape mismatch for layer {layer_idx}: Single={single_out.shape}, Multi={multi_out.shape}")
+
+            # Use torch.allclose for floating point comparison
+            # Increase tolerance slightly for decode due to potential floating point differences in all_reduce sum
+            assert torch.allclose(single_out, multi_out, atol=1e-5, rtol=1e-4), (
+                f"Mismatch in decoder outputs for layer {layer_idx} between single and multi-GPU."
+                f"\nMax diff: {(single_out - multi_out).abs().max()}"
+            )
+
+
+# Test 4: Full Forward Pass (forward)
+def test_full_forward_pass(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    base_config: CLTConfig,
+    device: torch.device,
+):
+    """Compare the full forward pass outputs between single and multi-GPU."""
+
+    # --- Prepare Input Dictionary ---
+    # The forward method expects a dictionary mapping layer index to input tensor.
+    # For this test, we'll use the same identical_input_data for all layers.
+    input_dict = {}
+    for layer_idx in range(base_config.num_layers):
+        input_dict[layer_idx] = identical_input_data.clone()
+
+    # --- Single GPU Execution ---
+    single_gpu_outputs = {}
+    with torch.no_grad():
+        single_gpu_outputs = single_gpu_model(input_dict)
+        # Sanity check output shapes and devices
+        for layer_idx, output in single_gpu_outputs.items():
+            expected_shape = (identical_input_data.shape[0], base_config.d_model)
+            assert (
+                output.shape == expected_shape
+            ), f"Single GPU forward layer {layer_idx} output shape mismatch: {output.shape} != {expected_shape}"
+            assert (
+                output.device == device
+            ), f"Single GPU forward layer {layer_idx} output device mismatch: {output.device} != {device}"
+
+    # --- Multi GPU Execution ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return
+
+    multi_gpu_outputs = {}
+    with torch.no_grad():
+        # Input dict needs cloning for each model if modified internally (shouldn't be)
+        input_dict_multi = {k: v.clone() for k, v in input_dict.items()}
+        multi_gpu_outputs = multi_gpu_model(input_dict_multi)
+
+        # Sanity check output shapes and devices (should be full shape on all ranks)
+        for layer_idx, output in multi_gpu_outputs.items():
+            expected_shape = (identical_input_data.shape[0], base_config.d_model)
+            assert (
+                output.shape == expected_shape
+            ), f"Multi GPU Rank {RANK} forward layer {layer_idx} output shape mismatch: {output.shape} != {expected_shape}"
+            assert (
+                output.device == device
+            ), f"Multi GPU Rank {RANK} forward layer {layer_idx} output device mismatch: {output.device} != {device}"
+
+    # --- Comparison (only on Rank 0) ---
+    if RANK == 0:
+        print("\nComparing Full Forward Pass Outputs (Rank 0):")
+        assert (
+            single_gpu_outputs.keys() == multi_gpu_outputs.keys()
+        ), f"Output dictionary keys differ: {single_gpu_outputs.keys()} vs {multi_gpu_outputs.keys()}"
+
+        for layer_idx in single_gpu_outputs.keys():
+            single_out = single_gpu_outputs[layer_idx]
+            multi_out = multi_gpu_outputs[layer_idx]
+            single_out = single_out.to(multi_out.device)
+
+            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+            # Check shapes
+            if single_out.shape != multi_out.shape:
+                pytest.fail(
+                    f"Shape mismatch forward layer {layer_idx}: Single={single_out.shape}, Multi={multi_out.shape}"
+                )
+
+            # Use torch.allclose (using slightly increased tolerance from decode)
+            assert torch.allclose(single_out, multi_out, atol=1e-5, rtol=1e-4), (
+                f"Mismatch in full forward pass outputs for layer {layer_idx} between single and multi-GPU."
+                f"\nMax diff: {(single_out - multi_out).abs().max()}"
+            )
+
+
+# Test 5: Reconstruction Loss Calculation
+def test_reconstruction_loss(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    loss_manager: LossManager,
+    base_config: CLTConfig,
+    device: torch.device,
+):
+    """Compare the reconstruction loss component between single and multi-GPU."""
+
+    # --- Prepare Inputs & Targets ---
+    # Use the same input data for all layers as source
+    input_dict = {}
+    # Create dummy target tensors (e.g., slightly modified inputs)
+    target_dict = {}
+    for layer_idx in range(base_config.num_layers):
+        input_tensor = identical_input_data.clone()
+        input_dict[layer_idx] = input_tensor
+        # Create targets with the same shape as model outputs (d_model)
+        target_tensor = (
+            torch.randn_like(input_tensor[:, : base_config.d_model]) * 0.5 + input_tensor[:, : base_config.d_model]
+        )
+        target_dict[layer_idx] = target_tensor.to(device)
+
+    # --- Single GPU Execution ---
+    single_gpu_outputs = single_gpu_model(input_dict)
+    # Targets need cloning if modified by loss function (shouldn't be)
+    target_dict_single = {k: v.clone() for k, v in target_dict.items()}
+    # LossManager calculates loss based on model outputs and targets
+    single_recon_loss, single_recon_loss_dict = loss_manager.compute_reconstruction_loss(
+        single_gpu_outputs, target_dict_single
+    )
+    # Check types
+    assert isinstance(single_recon_loss, torch.Tensor) and single_recon_loss.numel() == 1
+    assert isinstance(single_recon_loss_dict, dict)
+    print(f"\nSingle GPU Recon Loss: {single_recon_loss.item():.6f}")
+
+    # --- Multi GPU Execution ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return
+
+    # Input dict needs cloning for each model if modified internally
+    input_dict_multi = {k: v.clone() for k, v in input_dict.items()}
+    multi_gpu_outputs = multi_gpu_model(input_dict_multi)
+    # Targets need cloning
+    target_dict_multi = {k: v.clone() for k, v in target_dict.items()}
+    # Loss is computed locally on each rank using the full outputs/targets
+    multi_recon_loss, multi_recon_loss_dict = loss_manager.compute_reconstruction_loss(
+        multi_gpu_outputs, target_dict_multi
+    )
+    # Check types
+    assert isinstance(multi_recon_loss, torch.Tensor) and multi_recon_loss.numel() == 1
+    assert isinstance(multi_recon_loss_dict, dict)
+    print(f"Multi GPU Rank {RANK} Recon Loss: {multi_recon_loss.item():.6f}")
+
+    # --- Comparison (only on Rank 0) ---
+    # Reconstruction loss should be identical on all ranks as inputs/targets/model outputs are identical
+    if RANK == 0:
+        print("\nComparing Reconstruction Loss (Rank 0):")
+        single_loss_val = single_recon_loss.item()
+        multi_loss_val = multi_recon_loss.item()
+
+        # Compare scalar loss values
+        assert math.isclose(
+            single_loss_val, multi_loss_val, rel_tol=1e-5, abs_tol=1e-6
+        ), f"Mismatch in reconstruction loss scalar value between single ({single_loss_val}) and multi-GPU ({multi_loss_val})."
+
+        # Compare the loss dictionary contents (optional, but good check)
+        # assert single_recon_loss_dict.keys() == multi_recon_loss_dict.keys()
+        # for key in single_recon_loss_dict:
+        #     assert math.isclose(single_recon_loss_dict[key], multi_recon_loss_dict[key], rel_tol=1e-5, abs_tol=1e-6), \
+        #         f"Mismatch in reconstruction loss dict key '{key}'"
+
+
+# Test 6: Sparsity Loss Calculation (via total loss)
+def test_sparsity_loss(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    loss_manager: LossManager,
+    base_config: CLTConfig,
+    training_config: TrainingConfig,  # Need training config for total_steps
+    device: torch.device,
+):
+    """Compare the sparsity loss component (extracted from total loss) between single and multi-GPU."""
+
+    # --- Prepare Inputs & Targets ---
+    # Reusing setup from reconstruction loss test
+    input_dict = {}
+    target_dict = {}
+    for layer_idx in range(base_config.num_layers):
+        input_tensor = identical_input_data.clone()
+        input_dict[layer_idx] = input_tensor
+        target_tensor = (
+            torch.randn_like(input_tensor[:, : base_config.d_model]) * 0.5 + input_tensor[:, : base_config.d_model]
+        )
+        target_dict[layer_idx] = target_tensor.to(device)
+
+    # --- Single GPU Execution ---
+    # Calculate total loss
+    target_dict_single = {k: v.clone() for k, v in target_dict.items()}
+    _, single_loss_dict = loss_manager.compute_total_loss(
+        single_gpu_model,
+        input_dict,  # Use original input dict
+        target_dict_single,
+        current_step=0,  # Use step 0 for simplicity
+        total_steps=training_config.training_steps,  # Use total steps from config
+    )
+    # Extract sparsity loss
+    single_sparsity_loss_val = single_loss_dict.get("sparsity", 0.0)
+    print(f"\nSingle GPU Sparsity Loss (from total): {single_sparsity_loss_val:.6f}")
+
+    # --- Multi GPU Execution ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return
+
+    # Calculate total loss
+    input_dict_multi = {k: v.clone() for k, v in input_dict.items()}
+    target_dict_multi = {k: v.clone() for k, v in target_dict.items()}
+    _, multi_loss_dict = loss_manager.compute_total_loss(
+        multi_gpu_model, input_dict_multi, target_dict_multi, current_step=0, total_steps=training_config.training_steps
+    )
+    # Extract sparsity loss
+    multi_sparsity_loss_val = multi_loss_dict.get("sparsity", 0.0)
+    print(f"Multi GPU Rank {RANK} Sparsity Loss (from total): {multi_sparsity_loss_val:.6f}")
+
+    # --- Comparison (only on Rank 0) ---
+    # Sparsity loss might have slight differences due to all_reduce in get_decoder_norms
+    if RANK == 0:
+        print("\nComparing Sparsity Loss (Rank 0):")
+        # Compare scalar loss values (allow slightly larger tolerance)
+        assert math.isclose(
+            single_sparsity_loss_val, multi_sparsity_loss_val, rel_tol=1e-4, abs_tol=1e-5
+        ), f"Mismatch in sparsity loss scalar value between single ({single_sparsity_loss_val}) and multi-GPU ({multi_sparsity_loss_val})."
+
+
+# Test 7: Total Loss Calculation
+def test_total_loss(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    loss_manager: LossManager,
+    base_config: CLTConfig,
+    training_config: TrainingConfig,
+    device: torch.device,
+):
+    """Compare the total loss value between single and multi-GPU."""
+
+    # --- Prepare Inputs & Targets ---
+    input_dict = {}
+    target_dict = {}
+    for layer_idx in range(base_config.num_layers):
+        input_tensor = identical_input_data.clone()
+        input_dict[layer_idx] = input_tensor
+        target_tensor = (
+            torch.randn_like(input_tensor[:, : base_config.d_model]) * 0.5 + input_tensor[:, : base_config.d_model]
+        )
+        target_dict[layer_idx] = target_tensor.to(device)
+
+    # --- Single GPU Execution ---
+    target_dict_single = {k: v.clone() for k, v in target_dict.items()}
+    single_total_loss, _ = loss_manager.compute_total_loss(
+        single_gpu_model, input_dict, target_dict_single, current_step=0, total_steps=training_config.training_steps
+    )
+    single_total_loss_val = single_total_loss.item()
+    print(f"\nSingle GPU Total Loss: {single_total_loss_val:.6f}")
+
+    # --- Multi GPU Execution ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return
+
+    input_dict_multi = {k: v.clone() for k, v in input_dict.items()}
+    target_dict_multi = {k: v.clone() for k, v in target_dict.items()}
+    multi_total_loss, _ = loss_manager.compute_total_loss(
+        multi_gpu_model, input_dict_multi, target_dict_multi, current_step=0, total_steps=training_config.training_steps
+    )
+    multi_total_loss_val = multi_total_loss.item()
+    print(f"Multi GPU Rank {RANK} Total Loss: {multi_total_loss_val:.6f}")
+
+    # --- Comparison (only on Rank 0) ---
+    # Total loss combines reconstruction and sparsity, use tolerance from sparsity
+    if RANK == 0:
+        print("\nComparing Total Loss (Rank 0):")
+        assert math.isclose(
+            single_total_loss_val, multi_total_loss_val, rel_tol=1e-4, abs_tol=1e-5
+        ), f"Mismatch in total loss scalar value between single ({single_total_loss_val}) and multi-GPU ({multi_total_loss_val})."
+
+
+# --- Helper for Gradient Averaging (mirrors trainer logic) ---
+def average_replicated_grads(model: CrossLayerTranscoder):
+    if WORLD_SIZE <= 1 or not dist.is_initialized():
+        return
+
+    world_size = dist.get_world_size()
+    # Identify replicated parameters (currently just log_threshold)
+    # Assumes bias terms in parallel layers are handled by TP logic (added after reduce/before gather)
+    # If other parameters were replicated, add them here.
+    replicated_params = [model.log_threshold]
+
+    for p in replicated_params:
+        if p.grad is not None:
+            dist.all_reduce(p.grad.data, op=dist.ReduceOp.SUM, group=dist.group.WORLD)
+            p.grad.data /= world_size
+
+
+# --- Helper to Gather Sharded Gradients ---
+def gather_sharded_gradient(
+    local_grad: torch.Tensor, model_param: torch.nn.Parameter, full_param_shape: tuple, partition_dim: int
+) -> Optional[torch.Tensor]:
+    """Gathers gradient slices from all ranks for a sharded parameter."""
+    if WORLD_SIZE <= 1 or not dist.is_initialized():
+        # If single GPU, local_grad is the full gradient
+        return local_grad
+
+    # Ensure consistent device and dtype
+    gathered_grads = [torch.empty_like(local_grad) for _ in range(WORLD_SIZE)]
+    dist.all_gather(gathered_grads, local_grad, group=dist.group.WORLD)
+    dist.barrier()
+
+    # Only rank 0 needs to reconstruct the full gradient
+    if RANK == 0:
+        try:
+            full_grad = torch.cat(gathered_grads, dim=partition_dim)
+            # Truncate if necessary due to padding during sharding
+            if full_grad.shape != full_param_shape:
+                indices = [slice(None)] * full_grad.dim()
+                for dim_idx, (full_dim_size, grad_dim_size) in enumerate(zip(full_param_shape, full_grad.shape)):
+                    if grad_dim_size > full_dim_size:
+                        indices[dim_idx] = slice(0, full_dim_size)
+                full_grad = full_grad[tuple(indices)]
+
+            # Final shape check
+            if full_grad.shape != full_param_shape:
+                print(
+                    f"Warning: Reconstructed gradient shape {full_grad.shape} != expected {full_param_shape} for param {model_param.shape}"
+                )
+                return None  # Indicate failure
+            return full_grad
+        except Exception as e:
+            print(f"Error reconstructing gradient for param {model_param.shape}: {e}")
+            return None
+    else:
+        return None  # Other ranks don't need the full grad
+
+
+# Test 8: Gradient Calculation
+def test_gradient_calculation(
+    single_gpu_model: CrossLayerTranscoder,
+    multi_gpu_model: Optional[CrossLayerTranscoder],
+    identical_input_data: torch.Tensor,
+    loss_manager: LossManager,
+    base_config: CLTConfig,
+    training_config: TrainingConfig,
+    device: torch.device,
+):
+    """Compare gradients between single and multi-GPU after backward pass."""
+
+    # --- Prepare Inputs & Targets ---
+    input_dict = {}
+    target_dict = {}
+    for layer_idx in range(base_config.num_layers):
+        input_tensor = identical_input_data.clone()
+        input_dict[layer_idx] = input_tensor
+        target_tensor = (
+            torch.randn_like(input_tensor[:, : base_config.d_model]) * 0.5 + input_tensor[:, : base_config.d_model]
+        )
+        target_dict[layer_idx] = target_tensor.to(device)
+
+    # --- Single GPU Backward Pass ---
+    # Ensure model is in train mode for gradients
+    single_gpu_model.train()
+    single_gpu_model.zero_grad()
+    target_dict_single = {k: v.clone() for k, v in target_dict.items()}
+    single_total_loss, _ = loss_manager.compute_total_loss(
+        single_gpu_model, input_dict, target_dict_single, current_step=0, total_steps=training_config.training_steps
+    )
+    single_total_loss.backward()
+    single_gpu_grads = {name: p.grad.clone() for name, p in single_gpu_model.named_parameters() if p.grad is not None}
+    single_gpu_model.eval()  # Back to eval mode
+    print(f"\nSingle GPU Backward Pass Completed. Found {len(single_gpu_grads)} grads.")
+
+    # --- Multi GPU Backward Pass ---
+    if multi_gpu_model is None:
+        pytest.skip("Multi-GPU model not available.")
+        return
+
+    multi_gpu_model.train()
+    multi_gpu_model.zero_grad()
+    input_dict_multi = {k: v.clone() for k, v in input_dict.items()}
+    target_dict_multi = {k: v.clone() for k, v in target_dict.items()}
+    multi_total_loss, _ = loss_manager.compute_total_loss(
+        multi_gpu_model, input_dict_multi, target_dict_multi, current_step=0, total_steps=training_config.training_steps
+    )
+    # Simulate trainer's backward pass:
+    # 1. Backward
+    multi_total_loss.backward()
+    # 2. Average replicated grads (like in trainer)
+    average_replicated_grads(multi_gpu_model)
+    # 3. Barrier (optional but good practice)
+    if dist.is_initialized():
+        dist.barrier()
+
+    multi_gpu_local_grads = {name: p.grad for name, p in multi_gpu_model.named_parameters() if p.grad is not None}
+    multi_gpu_model.eval()  # Back to eval mode
+    print(f"Multi GPU Rank {RANK} Backward Pass Completed. Found {len(multi_gpu_local_grads)} local grads.")
+
+    # --- Comparison (only on Rank 0) ---
+    if RANK == 0:
+        print("\nComparing Gradients (Rank 0):")
+        # Ensure same parameters have gradients
+        assert (
+            single_gpu_grads.keys() == multi_gpu_local_grads.keys()
+        ), f"Gradient keys differ: {single_gpu_grads.keys()} vs {multi_gpu_local_grads.keys()}"
+
+        multi_gpu_params_dict = dict(multi_gpu_model.named_parameters())
+
+        for name, single_grad in single_gpu_grads.items():
+            print(f"  Comparing grad for: {name} (shape {single_grad.shape})")
+            local_grad = multi_gpu_local_grads[name]
+            param = multi_gpu_params_dict[name]
+            single_grad = single_grad.to(local_grad.device)
+
+            # Identify parameter type (replicated or sharded)
+            if name == "log_threshold":  # Replicated parameter
+                print("    Type: Replicated")
+                # Gradient should be identical after averaging
+                assert torch.allclose(
+                    single_grad, local_grad, atol=1e-5, rtol=1e-4
+                ), f"Mismatch in replicated gradient for '{name}'. Max diff: {(single_grad - local_grad).abs().max()}"
+
+            elif "encoders." in name and ".weight" in name:
+                # Encoder weights are ColumnParallelLinear (partition_dim=0)
+                print("    Type: Sharded (Encoder Weight, partition_dim=0)")
+                full_multi_grad = gather_sharded_gradient(local_grad, param, single_grad.shape, partition_dim=0)
+                if full_multi_grad is not None:
+                    assert torch.allclose(
+                        single_grad, full_multi_grad, atol=1e-5, rtol=1e-4
+                    ), f"Mismatch in gathered sharded gradient for '{name}'. Max diff: {(single_grad - full_multi_grad).abs().max()}"
+                else:
+                    pytest.fail(f"Failed to gather gradient for {name}")
+
+            elif "decoders." in name and ".weight" in name:
+                # Decoder weights are RowParallelLinear (partition_dim=1)
+                print("    Type: Sharded (Decoder Weight, partition_dim=1)")
+                full_multi_grad = gather_sharded_gradient(local_grad, param, single_grad.shape, partition_dim=1)
+                if full_multi_grad is not None:
+                    assert torch.allclose(
+                        single_grad, full_multi_grad, atol=1e-5, rtol=1e-4
+                    ), f"Mismatch in gathered sharded gradient for '{name}'. Max diff: {(single_grad - full_multi_grad).abs().max()}"
+                else:
+                    pytest.fail(f"Failed to gather gradient for {name}")
+
+            # Add checks for biases if they exist and are handled differently
+            # elif '.bias' in name:
+            #    # Handle bias gradients (might be replicated or sharded depending on layer type)
+            #    pass
+            else:
+                print("    Type: Unknown/Unhandled")
+                # If other parameter types exist, add specific checks or fail
+                pytest.fail(f"Unhandled parameter type for gradient check: {name}")
+
+
+# Add more tests here for:
+# 9. Parameter Updates
