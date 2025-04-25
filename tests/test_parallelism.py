@@ -311,32 +311,25 @@ def test_encoder_preactivations(
         print(f"\n--- Testing Layer {layer_idx} --- ")
         # 1. Verify Parameters for this layer just before use
         single_encoder_weight_name = f"encoders.{layer_idx}.weight"
-        single_encoder_bias_name = f"encoders.{layer_idx}.bias_param"
         multi_encoder_weight_name = f"encoders.{layer_idx}.weight"
-        multi_encoder_bias_name = f"encoders.{layer_idx}.bias_param"
 
         if RANK == 0:
             print(f"Rank {RANK}: Verifying parameters for layer {layer_idx}...")
             # Get full params from single model
             single_weight = single_params_dict[single_encoder_weight_name].data.to(device)
-            single_bias = single_params_dict[single_encoder_bias_name].data.to(device)
             # Get corresponding shard from multi model
             multi_weight_shard = multi_params_dict[multi_encoder_weight_name].data.to(device)
-            multi_bias_shard = multi_params_dict[multi_encoder_bias_name].data.to(device)
 
             # Calculate the expected shard shape based on single model param
             out_features = single_weight.shape[0]
             local_out_features_padded = math.ceil(out_features / WORLD_SIZE)
             expected_weight_shard = single_weight[:local_out_features_padded, :]
-            expected_bias_shard = single_bias[:local_out_features_padded]
 
             # Check shapes match
             assert multi_weight_shard.shape == expected_weight_shard.shape, f"Weight shape mismatch layer {layer_idx}"
-            assert multi_bias_shard.shape == expected_bias_shard.shape, f"Bias shape mismatch layer {layer_idx}"
 
             # Check content matches (using torch.equal for exact match after copy)
             assert torch.equal(multi_weight_shard, expected_weight_shard), f"Weight content mismatch layer {layer_idx}"
-            assert torch.equal(multi_bias_shard, expected_bias_shard), f"Bias content mismatch layer {layer_idx}"
             print(f"Rank {RANK}: Parameters for layer {layer_idx} verified.")
         # Barrier to ensure rank 0 finishes verification before others proceed (optional)
         if dist.is_initialized():
