@@ -111,9 +111,8 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
     # autograd can propagate gradients back to the original computation graph.  Using a
     # newly-allocated tensor (as we did before) breaks the gradient path because it is
     # not connected to `input_`.
-    gathered_list = [torch.empty_like(input_) for _ in range(world_size)]
-    gathered_list[rank] = input_  # keep reference to maintain gradient flow
-    dist.all_gather(gathered_list, input_, group=process_group)
+    gathered_list = [torch.empty_like(input_) for _ in range(world_size)]  # List for receiving
+    dist.all_gather(gathered_list, input_, group=process_group)  # Pass local tensor to gather
     dist.barrier()  # Sync after gather for debugging prints
 
     # --- Debug Print 2: After AllGather --- #
