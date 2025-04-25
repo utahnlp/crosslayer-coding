@@ -951,6 +951,29 @@ class CLTTrainer:
             print("\n>>> TRAINING PHASE <<<")
             sys.stdout.flush()
 
+        # After the existing startup messages
+        if self.distributed:
+            print(f"\n!!! DIAGNOSTIC INFO !!!")
+            print(f"Rank {self.rank}: Process group type: {type(self.process_group)}")
+            print(f"Rank {self.rank}: RowParallelLinear _reduce does NOT divide by world_size")
+            print(f"Rank {self.rank}: Using weight regularization in sparsity penalty")
+            print(f"Rank {self.rank}: Averaging replicated parameter gradients")
+            print(
+                f"Rank {self.rank}: Data sharding: rank={self.activation_store.rank}, world={self.activation_store.world}"
+            )
+            print(f"Rank {self.rank}: Batch size tokens: {self.training_config.train_batch_size_tokens}")
+            print(f"Rank {self.rank}: Sparsity lambda: {self.training_config.sparsity_lambda}")
+
+            # Check if activation store actually loaded correctly
+            batch_avail = next(iter(self.activation_store), None)
+            print(f"Rank {self.rank}: First batch available: {batch_avail is not None}")
+
+            # Force torch to compile/execute our code by running a tiny forward/backward pass
+            dummy = torch.ones(1, device=self.device, requires_grad=True)
+            dummy_out = dummy * 2
+            dummy_out.backward()
+            print(f"!!! END DIAGNOSTIC !!!\n")
+
         # Create progress bar only on rank 0
         pbar: Union[tqdm, range]
         if not self.distributed or self.rank == 0:
