@@ -106,11 +106,8 @@ def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
     rank = dist.get_rank(process_group)
 
     gathered_list = [torch.empty_like(input_) for _ in range(world_size)]
-    gathered_list[rank] = input_  # Preserve alias to maintain gradient flow.
-
+    gathered_list[rank] = input_  # keep reference to maintain gradient flow
     dist.all_gather(gathered_list, input_, group=process_group)
-
-    # Concatenate along the specified dimension
     output = torch.cat(gathered_list, dim=dim)
 
     # Truncate the gathered output if the original dimension was not divisible

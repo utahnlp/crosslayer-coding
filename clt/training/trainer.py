@@ -896,6 +896,25 @@ class CLTTrainer:
                 f"Warning: Activation store checkpoint path not found or specified: {store_checkpoint_path}. Store state not loaded."
             )
 
+    def _average_shared_parameter_grads(self):
+        """Average gradients of parameters that are **replicated** across ranks.
+
+        Tensor-parallel layers shard their weights so those gradients must **not** be
+        synchronised.  However parameters that are kept identical on every rank –
+        e.g. the JumpReLU `log_threshold` vector (shape `[num_features]`) and any
+        unsharded bias vectors – must have their gradients reduced or they will
+        diverge between ranks.
+        """
+        if not self.distributed or self.world_size == 1:
+            return
+
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            if p.dim() == 1:  # replicated vectors
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad /= self.world_size
+
     def train(self, eval_every: int = 1000) -> CrossLayerTranscoder:
         """Train the CLT model.
 
@@ -1024,6 +1043,9 @@ class CLTTrainer:
                 else:
                     try:
                         loss.backward()
+
+                        # --- Synchronise gradients of replicated parameters --- #
+                        self._average_shared_parameter_grads()
 
                         # --- Gradient clipping --- #
                         if self.training_config.gradient_clip_val is not None:
