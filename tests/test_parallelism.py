@@ -872,7 +872,6 @@ def gather_sharded_gradient(
     # Ensure consistent device and dtype
     gathered_grads = [torch.empty_like(local_grad) for _ in range(WORLD_SIZE)]
     dist.all_gather(gathered_grads, local_grad, group=dist.group.WORLD)
-    dist.barrier()
 
     # Only rank 0 needs to reconstruct the full gradient
     if RANK == 0:
