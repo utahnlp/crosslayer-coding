@@ -11,6 +11,7 @@ import torch.nn as nn  # Add nn for Linear layer
 from clt.config import CLTConfig, TrainingConfig  # Add TrainingConfig back
 from clt.models.clt import CrossLayerTranscoder
 from clt.models.parallel import ColumnParallelLinear, RowParallelLinear  # Import both
+from clt.models.parallel import _gather  # Import _gather specifically
 
 # from clt.models.parallel import ColumnParallelLinear, RowParallelLinear # Unused for now
 from clt.training.losses import LossManager  # Import LossManager
@@ -334,6 +335,38 @@ def test_encoder_preactivations(
         # Barrier to ensure rank 0 finishes verification before others proceed (optional)
         if dist.is_initialized():
             dist.barrier()
+
+        # --- MANUAL CALCULATION TEST for Layer 0 --- #
+        if layer_idx == 0:
+            print(f"Rank {RANK}: Performing manual calculation test for layer {layer_idx}...")
+            input_clone = identical_input_data.clone()
+            # Get weights again (already verified)
+            single_weight_data = single_params_dict[single_encoder_weight_name].data.to(device)
+            multi_weight_shard_data = multi_params_dict[multi_encoder_weight_name].data.to(device)
+
+            # Single GPU manual calculation
+            single_out_manual = F.linear(input_clone, single_weight_data)  # Bias is False
+
+            # Multi GPU manual calculation (local matmul + gather)
+            multi_out_local_manual = F.linear(input_clone, multi_weight_shard_data)  # Bias is False
+            multi_out_manual_gathered = _gather(
+                multi_out_local_manual.contiguous(), dist.group.WORLD, dim=-1, full_dim_size=base_config.num_features
+            )
+
+            # Compare on Rank 0
+            if RANK == 0:
+                print("Comparing MANUAL Calculation Outputs (Rank 0):")
+                print(
+                    f"  Manual Single shape={single_out_manual.shape}, Manual Multi shape={multi_out_manual_gathered.shape}"
+                )
+                assert torch.allclose(single_out_manual, multi_out_manual_gathered, atol=1e-5, rtol=1e-4), (
+                    f"MANUAL CALCULATION Mismatch for layer {layer_idx}."
+                    f"\nMax diff: {(single_out_manual - multi_out_manual_gathered).abs().max()}"
+                )
+                print("MANUAL CALCULATION check PASSED.")
+            if dist.is_initialized():
+                dist.barrier()
+        # --- END MANUAL CALCULATION TEST --- #
 
         # 2. Run Forward Passes for this layer
         with torch.no_grad():
