@@ -1023,6 +1023,7 @@ class CLTTrainer:
                         )
                 else:
                     try:
+                        loss = loss / self.world_size
                         loss.backward()
                         # --- Gradient clipping --- # (Applied to local gradients)
                         if self.training_config.gradient_clip_val is not None:

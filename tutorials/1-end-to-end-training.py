@@ -171,7 +171,8 @@ training_config = TrainingConfig(
     dead_feature_window=200,  # Reduced window for tutorial
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-tutorial",
+    wandb_project="clt-multi-gpu-test",
+    wandb_run_name="single-gpu-baseline",
     # Fields removed (now in ActivationConfig or implicitly handled):
     # model_name, model_dtype, mlp_*, dataset_*, streaming, context_size,
     # inference_batch_size, prepend_bos, exclude_special_tokens, cache_path,
