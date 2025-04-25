@@ -197,10 +197,32 @@ def scatter_full_parameter(full_param: torch.Tensor, model_param: torch.nn.Param
 # --- Model Fixtures ---
 @pytest.fixture(scope="module")
 def single_gpu_model(base_config: CLTConfig, device: torch.device) -> CrossLayerTranscoder:
-    """Create a standard, non-distributed CLT model."""
+    """Create a standard, non-distributed CLT model.
+
+    Ensures parameters are identical across all ranks if running in distributed mode
+    by broadcasting from Rank 0.
+    """
+    # Ensure consistent initialization state across ranks *before* creating the model
+    # (Optional but good practice, broadcasting below is the main sync point)
+    torch.manual_seed(42)  # Use a fixed global seed
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(42)
+
+    # Create the model instance
     # Pass process_group=None for single GPU/CPU
     model = CrossLayerTranscoder(base_config, process_group=None, device=device)
     model.eval()  # Set to eval mode
+
+    # --- Broadcast from Rank 0 to ensure identical reference model --- #
+    if WORLD_SIZE > 1 and dist.is_initialized():
+        print(f"Rank {RANK}: Broadcasting single_gpu_model parameters from Rank 0...")
+        with torch.no_grad():
+            for param in model.parameters():
+                dist.broadcast(param.data, src=0)
+        dist.barrier()  # Ensure broadcast is complete
+        print(f"Rank {RANK}: single_gpu_model broadcast complete.")
+    # --- End Broadcast --- #
+
     return model
 
 
