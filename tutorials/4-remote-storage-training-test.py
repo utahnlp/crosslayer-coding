@@ -231,6 +231,7 @@ try:
         training_config=training_config,
         log_dir=log_dir,
         device=device,
+        distributed=False,
     )
     print("CLTTrainer instance created successfully.")
 

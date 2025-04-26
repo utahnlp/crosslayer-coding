@@ -171,7 +171,8 @@ training_config = TrainingConfig(
     dead_feature_window=200,  # Reduced window for tutorial
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-tutorial",
+    wandb_project="clt-multi-gpu-test",
+    wandb_run_name="single-gpu-baseline",
     # Fields removed (now in ActivationConfig or implicitly handled):
     # model_name, model_dtype, mlp_*, dataset_*, streaming, context_size,
     # inference_batch_size, prepend_bos, exclude_special_tokens, cache_path,
@@ -255,6 +256,7 @@ try:
         training_config=training_config,
         log_dir=log_dir,
         device=device,
+        distributed=False,  # Explicitly set for tutorial
     )
     print("CLTTrainer instance created successfully.")
 except Exception as e:
@@ -312,8 +314,12 @@ loaded_clt_config = CLTConfig(
 )
 
 # 2. Load the model structure and state dict
-loaded_clt_model = CrossLayerTranscoder(loaded_clt_config)
-loaded_clt_model.load(final_model_path, device=torch.device(device))
+loaded_clt_model = CrossLayerTranscoder(
+    config=loaded_clt_config,
+    process_group=None,  # Non-distributed loading
+    device=torch.device(device),  # Specify device
+)
+loaded_clt_model.load(final_model_path)  # .load() doesn't take device, handled by __init__
 
 print("Model loaded successfully.")
 print(f"Loaded model is on device: {next(loaded_clt_model.parameters()).device}")

@@ -9,6 +9,12 @@ import importlib.util
 import sys
 import logging  # Add logging import
 import datetime  # Import datetime for formatting
+import torch.distributed as dist  # Import torch.distributed
+from torch.distributed import ProcessGroup  # Import ProcessGroup
+from torch.distributed.checkpoint.state_dict_saver import save_state_dict
+from torch.distributed.checkpoint.state_dict_loader import load_state_dict
+from torch.distributed.checkpoint.default_planner import DefaultSavePlanner, DefaultLoadPlanner
+from torch.distributed.checkpoint.filesystem import FileSystemWriter, FileSystemReader  # Storage for checkpointing
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
@@ -42,6 +48,21 @@ def _format_elapsed_time(seconds: float) -> str:
         return f"{td.days * 24 + hours:02d}:{minutes:02d}:{seconds:02d}"
     else:
         return f"{minutes:02d}:{seconds:02d}"
+
+
+# Define the dummy logger class explicitly for better type checking
+class DummyWandBLogger:
+    def log_step(self, *args, **kwargs):
+        pass
+
+    def log_evaluation(self, *args, **kwargs):
+        pass
+
+    def log_artifact(self, *args, **kwargs):
+        pass
+
+    def finish(self, *args, **kwargs):
+        pass
 
 
 class WandBLogger:
@@ -233,7 +254,11 @@ class WandBLogger:
 
         # Create and log artifact
         artifact = wandb.Artifact(name=name, type=artifact_type)
-        artifact.add_file(artifact_path)
+        # Check if it's a directory (for sharded checkpoints)
+        if os.path.isdir(artifact_path):
+            artifact.add_dir(artifact_path)
+        else:
+            artifact.add_file(artifact_path)
         wandb.log_artifact(artifact)
 
     def finish(self):
@@ -251,6 +276,8 @@ class CLTTrainer:
 
     # Add type hint for the activation store attribute
     activation_store: BaseActivationStore
+    # Model type hint
+    model: CrossLayerTranscoder
 
     def __init__(
         self,
@@ -258,6 +285,7 @@ class CLTTrainer:
         training_config: TrainingConfig,
         log_dir: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
+        distributed: bool = False,  # Add distributed flag
     ):
         """Initialize the CLT trainer.
 
@@ -265,26 +293,59 @@ class CLTTrainer:
             clt_config: Configuration for the CLT model
             training_config: Configuration for training
             log_dir: Directory to save logs and checkpoints
-            device: Device to use for training
+            device: Device to use for training (ignored if distributed)
+            distributed: Whether to use distributed training
         """
         self.clt_config = clt_config
         self.training_config = training_config
+        self.distributed = distributed
 
-        # Ensure self.device is a torch.device object
-        _device_input = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-        self.device = torch.device(_device_input) if isinstance(_device_input, str) else _device_input
+        # Initialize distributed training if enabled
+        self.rank = 0
+        self.world_size = 1
+        self.local_rank = 0
+        self.process_group: Optional[ProcessGroup] = None  # For tensor parallelism
 
-        # Set up log directory
+        if self.distributed:
+            if not dist.is_initialized():
+                # Default backend, consider NCCL for NVIDIA GPUs
+                dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+            self.rank = dist.get_rank()
+            self.world_size = dist.get_world_size()
+            self.local_rank = int(os.environ.get("LOCAL_RANK", self.rank))  # Get local rank if available
+
+            # Set device based on local_rank when distributed
+            if torch.cuda.is_available():
+                self.device = torch.device(f"cuda:{self.local_rank}")
+                torch.cuda.set_device(self.device)
+            else:
+                # Fallback for CPU distributed testing (not typical)
+                self.device = torch.device("cpu")
+                logger.warning("Distributed training requested but CUDA not available. Using CPU.")
+            # Set the process group for tensor parallelism (using WORLD for now)
+            self.process_group = dist.group.WORLD
+        else:
+            # Original device handling for non-distributed case
+            _device_input = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+            self.device = torch.device(_device_input) if isinstance(_device_input, str) else _device_input
+            # Process group is None when not distributed
+            self.process_group = None
+
+        # Set up log directory - only rank 0 creates it
         self.log_dir = log_dir or f"clt_train_{int(time.time())}"
-        os.makedirs(self.log_dir, exist_ok=True)
+        if not self.distributed or self.rank == 0:
+            os.makedirs(self.log_dir, exist_ok=True)
 
         # Record start time
         self.start_time = time.time()
 
-        # Initialize model, passing device for direct initialization
-        self.model = CrossLayerTranscoder(clt_config, device=self.device)
+        # Initialize model, passing device and process group for direct initialization
+        # self.process_group is correctly set to None if not distributed
+        self.model = CrossLayerTranscoder(
+            clt_config, process_group=self.process_group, device=self.device  # Pass the potentially None group
+        )
 
-        # Initialize optimizer
+        # Initialize optimizer - works on local parameters
         if training_config.optimizer == "adam":
             self.optimizer: Any = optim.Adam(self.model.parameters(), lr=training_config.learning_rate)
         else:  # "adamw"
@@ -314,7 +375,7 @@ class CLTTrainer:
                 **final_params,  # Pass start_factor, end_factor, etc.
             )
             logger.info(
-                f"Using LinearLR scheduler with params: {final_params}, total_iters={training_config.training_steps}"
+                f"Rank {self.rank}: Using LinearLR scheduler with params: {final_params}, total_iters={training_config.training_steps}"
             )
 
         elif scheduler_type == "cosine":
@@ -331,7 +392,9 @@ class CLTTrainer:
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=t_max, **final_params  # Pass eta_min, etc.
             )
-            logger.info(f"Using CosineAnnealingLR scheduler with params: {final_params}, T_max={t_max}")
+            logger.info(
+                f"Rank {self.rank}: Using CosineAnnealingLR scheduler with params: {final_params}, T_max={t_max}"
+            )
 
         elif scheduler_type == "linear_final20":
             # This scheduler keeps LR constant for the initial fraction of training
@@ -352,7 +415,8 @@ class CLTTrainer:
 
             self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
             logger.info(
-                "Using linear_final20 LR scheduler with decay_start_frac=%s (start step %d of %d)",
+                "Rank %d: Using linear_final20 LR scheduler with decay_start_frac=%s (start step %d of %d)",
+                self.rank,
                 decay_start_frac,
                 decay_start_step,
                 total_steps,
@@ -360,31 +424,41 @@ class CLTTrainer:
 
         # Add elif blocks here for other potential schedulers
 
-        # Initialize activation store based on config
-        # Note: The extractor is now created inside the StreamingActivationStore if needed
+        # Initialize activation store based on config - uses self.rank/world_size now
         self.activation_store = self._create_activation_store(self.start_time)
 
         # Initialize loss manager
         self.loss_manager = LossManager(training_config)
 
-        # Initialize Evaluator
+        # Initialize Evaluator - only on rank 0? Evaluation might be complex with TP
+        # For now, assume evaluator can handle the full model state if needed,
+        # or adapt evaluator later. Pass base model logic might break.
+        # Pass self.model (which is the parallel version). Evaluator needs adjustment if it relies
+        # on specific non-parallel structures or needs to gather states.
+        # TODO: Review evaluator logic for TP compatibility.
         self.evaluator = CLTEvaluator(self.model, self.device, self.start_time)
 
-        # Initialize dead neuron counters
+        # Initialize dead neuron counters (replicated for now, consider sharding later if needed)
         self.n_forward_passes_since_fired = torch.zeros(
             (clt_config.num_layers, clt_config.num_features),
             device=self.device,
             dtype=torch.long,
         )
 
-        # Training metrics
+        # Training metrics (only rank 0 saves, but others might need local copies for some logic)
         self.metrics: Dict[str, list] = {
             "train_losses": [],
             "eval_metrics": [],
         }
 
-        # Initialize WandB logger
-        self.wandb_logger = WandBLogger(training_config=training_config, clt_config=clt_config, log_dir=self.log_dir)
+        # Initialize WandB logger - only on rank 0
+        if not self.distributed or self.rank == 0:
+            self.wandb_logger: Union[WandBLogger, DummyWandBLogger] = WandBLogger(
+                training_config=training_config, clt_config=clt_config, log_dir=self.log_dir
+            )
+        else:
+            # Dummy logger for non-rank-0 processes
+            self.wandb_logger = DummyWandBLogger()
 
     @property
     def dead_neurons_mask(self) -> torch.Tensor:
@@ -415,12 +489,28 @@ class CLTTrainer:
         """
         activation_source = self.training_config.activation_source
 
-        # Determine rank and world size for distributed training, default to 0/1
-        # These might come from environment variables or a distributed library setup
-        rank = int(os.environ.get("RANK", 0))
-        world = int(os.environ.get("WORLD_SIZE", 1))
+        shard_data = False  # add a flag if you like
+        row_rank = 0 if shard_data is False else self.rank
+        row_world = 1 if shard_data is False else self.world_size
+
+        # Temporary fix to stop sharding data
+        rank = row_rank
+        world = row_world
+
+        # Fix: Declare store with Base type hint
+        store: BaseActivationStore
 
         if activation_source == "generate":
+            if self.distributed:
+                # Activation generation with NNsight doesn't easily support multi-GPU generation
+                # without more complex setup (e.g., one rank generates, others receive).
+                # For simplicity, disable generation in distributed mode for now.
+                raise NotImplementedError(
+                    "On-the-fly activation generation ('generate') is not currently supported "
+                    "in distributed training mode. Please pre-generate activations using "
+                    "'local_manifest' or 'remote' source."
+                )
+
             logger.info("Using StreamingActivationStore (generating on-the-fly).")
             # --- Validate required config dicts --- #
             gen_cfg = self.training_config.generation_config
@@ -475,7 +565,7 @@ class CLTTrainer:
             logger.info("  Uses internal estimation, DOES NOT use norm_stats.json.")
         # Use the new LocalActivationStore for manifest-based local datasets
         elif activation_source == "local_manifest":
-            logger.info("Using LocalActivationStore (reading local manifest/chunks).")
+            logger.info(f"Rank {rank}: Using LocalActivationStore (reading local manifest/chunks).")
             if not self.training_config.activation_path:
                 raise ValueError(
                     "activation_path must be set in TrainingConfig when activation_source is 'local_manifest'."
@@ -485,17 +575,21 @@ class CLTTrainer:
                 train_batch_size_tokens=self.training_config.train_batch_size_tokens,
                 device=self.device,
                 dtype=self.training_config.activation_dtype,  # Use explicit dtype from config
-                rank=rank,
-                world=world,
+                rank=rank,  # Use trainer's rank
+                world=world,  # Use trainer's world size
                 seed=self.training_config.seed,
             )
-            logger.info(f"Initialized LocalActivationStore from path: {store.dataset_path}")
-            if store.apply_normalization:
-                logger.info("  Normalization ENABLED using loaded norm_stats.json.")
-            else:
-                logger.warning("  Normalization DISABLED (norm_stats.json not found or failed to load).")
+            # Fix: Check instance type before accessing subclass-specific attributes
+            if isinstance(store, LocalActivationStore):
+                logger.info(f"Rank {rank}: Initialized LocalActivationStore from path: {store.dataset_path}")
+                if store.apply_normalization:
+                    logger.info(f"Rank {rank}:   Normalization ENABLED using loaded norm_stats.json.")
+                else:
+                    logger.warning(
+                        f"Rank {rank}:   Normalization DISABLED (norm_stats.json not found or failed to load)."
+                    )
         elif activation_source == "remote":
-            logger.info("Using RemoteActivationStore (remote slice server).")
+            logger.info(f"Rank {rank}: Using RemoteActivationStore (remote slice server).")
             remote_cfg = self.training_config.remote_config
             if remote_cfg is None:
                 raise ValueError("remote_config dict must be set in TrainingConfig when activation_source is 'remote'.")
@@ -510,16 +604,20 @@ class CLTTrainer:
                 train_batch_size_tokens=self.training_config.train_batch_size_tokens,
                 device=self.device,
                 dtype=self.training_config.activation_dtype,  # Use explicit dtype from config
-                rank=rank,
-                world=world,
+                rank=rank,  # Use trainer's rank
+                world=world,  # Use trainer's world size
                 seed=self.training_config.seed,
                 timeout=remote_cfg.get("timeout", 60),
             )
-            logger.info(f"Initialized RemoteActivationStore for dataset: {store.did_raw}")
-            if store.apply_normalization:
-                logger.info("  Normalization ENABLED using fetched norm_stats.json.")
-            else:
-                logger.warning("  Normalization DISABLED (norm_stats.json not found on server or failed to load).")
+            # Fix: Check instance type before accessing subclass-specific attributes
+            if isinstance(store, RemoteActivationStore):
+                logger.info(f"Rank {rank}: Initialized RemoteActivationStore for dataset: {store.did_raw}")
+                if store.apply_normalization:
+                    logger.info(f"Rank {rank}:   Normalization ENABLED using fetched norm_stats.json.")
+                else:
+                    logger.warning(
+                        f"Rank {rank}:   Normalization DISABLED (norm_stats.json not found on server or failed to load)."
+                    )
         else:
             raise ValueError(
                 f"Unknown activation_source: {activation_source}. Valid options: 'generate', 'local_manifest', 'remote'."
@@ -528,151 +626,294 @@ class CLTTrainer:
         return store
 
     def _log_metrics(self, step: int, loss_dict: Dict[str, float]):
-        """Log training metrics, including current LR and lambda.
+        """Log training metrics, including current LR and lambda. Only Rank 0 logs to WandB/file."""
 
-        Args:
-            step: Current training step
-            loss_dict: Dictionary of loss values from LossManager
-        """
-        # Add step to training loss record (for saving to JSON)
+        # Add step to training loss record (for saving to JSON) - all ranks might need this locally?
+        # Let's keep it local for now. Rank 0 will save the full history.
         self.metrics["train_losses"].append({"step": step, **loss_dict})
 
-        # --- Gather additional metrics for logging --- #
-        current_lr = None
-        if self.scheduler is not None:
-            # Assuming one parameter group
-            current_lr = self.scheduler.get_last_lr()[0]
+        # Only log to WandB/File from rank 0
+        if not self.distributed or self.rank == 0:
+            # --- Gather additional metrics for logging --- #
+            current_lr = None
+            if self.scheduler is not None:
+                # Assuming one parameter group
+                current_lr = self.scheduler.get_last_lr()[0]
 
-        current_lambda = self.loss_manager.get_current_sparsity_lambda()
+            current_lambda = self.loss_manager.get_current_sparsity_lambda()
 
-        # --- Log to WandB --- #
-        # Note: Dead features from trainer window are no longer logged here.
-        # We use the dead feature count calculated during evaluation step.
+            # Calculate total tokens processed (global perspective)
+            total_tokens_processed = self.training_config.train_batch_size_tokens * self.world_size * (step + 1)
 
-        # Calculate total tokens processed
-        total_tokens_processed = self.training_config.train_batch_size_tokens * (step + 1)
+            # Use the wandb_logger which handles the dummy case
+            self.wandb_logger.log_step(
+                step,
+                loss_dict,
+                lr=current_lr,
+                sparsity_lambda=current_lambda,
+                total_tokens_processed=total_tokens_processed,
+            )
 
-        self.wandb_logger.log_step(
-            step,
-            loss_dict,
-            lr=current_lr,
-            sparsity_lambda=current_lambda,
-            total_tokens_processed=total_tokens_processed,
-        )
-
-        # --- Save metrics periodically --- #
-        log_interval = self.training_config.log_interval
-        if step % log_interval == 0:
-            self._save_metrics()
+            # --- Save metrics periodically --- #
+            log_interval = self.training_config.log_interval
+            if step % log_interval == 0:
+                self._save_metrics()
 
     def _save_metrics(self):
-        """Save training metrics to disk."""
+        """Save training metrics to disk - only on rank 0 when distributed."""
+        if self.distributed and self.rank != 0:
+            return
+
         metrics_path = os.path.join(self.log_dir, "metrics.json")
         try:
             with open(metrics_path, "w") as f:
                 # Use default=str to handle potential non-serializable types
                 json.dump(self.metrics, f, indent=2, default=str)
         except Exception as e:
-            print(f"Warning: Failed to save metrics to {metrics_path}: {e}")
+            print(f"Rank {self.rank}: Warning: Failed to save metrics to {metrics_path}: {e}")
 
     def _save_checkpoint(self, step: int):
-        """Save a checkpoint of the model and activation store state.
+        """Save a distributed checkpoint of the model and activation store state.
+
+        Uses torch.distributed.checkpoint to save sharded state directly.
 
         Args:
             step: Current training step
         """
-        # Ensure log directory exists
-        os.makedirs(self.log_dir, exist_ok=True)
+        if not self.distributed:  # Non-distributed save
+            os.makedirs(self.log_dir, exist_ok=True)
+            model_checkpoint_path = os.path.join(self.log_dir, f"clt_checkpoint_{step}.pt")
+            latest_model_path = os.path.join(self.log_dir, "clt_checkpoint_latest.pt")
+            store_checkpoint_path = os.path.join(self.log_dir, f"activation_store_checkpoint_{step}.pt")
+            latest_store_path = os.path.join(self.log_dir, "activation_store_checkpoint_latest.pt")
 
-        # Save model checkpoint
-        model_checkpoint_path = os.path.join(self.log_dir, f"clt_checkpoint_{step}.pt")
+            try:
+                # In non-distributed, model state_dict is the full dict
+                torch.save(self.model.state_dict(), model_checkpoint_path)
+                torch.save(self.model.state_dict(), latest_model_path)
+                # Log checkpoint as artifact to WandB
+                self.wandb_logger.log_artifact(
+                    artifact_path=model_checkpoint_path, artifact_type="model", name=f"clt_checkpoint_{step}"
+                )
+                torch.save(self.activation_store.state_dict(), store_checkpoint_path)
+                torch.save(self.activation_store.state_dict(), latest_store_path)
+            except Exception as e:
+                print(f"Warning: Failed to save non-distributed checkpoint at step {step}: {e}")
+            return
 
+        # --- Distributed Save ---
+        # Define checkpoint directory for this step
+        checkpoint_dir = os.path.join(self.log_dir, f"step_{step}")
+        latest_checkpoint_dir = os.path.join(self.log_dir, "latest")
+
+        # Save model state dict using distributed checkpointing
+        # All ranks participate in saving their shard
         try:
-            self.model.save(model_checkpoint_path)
-            # Log checkpoint as artifact to WandB
-            self.wandb_logger.log_artifact(
-                artifact_path=model_checkpoint_path,
-                artifact_type="model",
-                name=f"clt_checkpoint_{step}",
+            model_state_dict = self.model.state_dict()
+            save_state_dict(
+                state_dict=model_state_dict,
+                storage_writer=FileSystemWriter(checkpoint_dir),
+                planner=DefaultSavePlanner(),
+                no_dist=False,  # Ensure distributed save
+            )
+            # Also save latest (overwrites previous latest) - maybe link instead?
+            # For simplicity, save again. Rank 0 can handle linking later if needed.
+            save_state_dict(
+                state_dict=model_state_dict,
+                storage_writer=FileSystemWriter(latest_checkpoint_dir),
+                planner=DefaultSavePlanner(),
+                no_dist=False,
             )
         except Exception as e:
-            print(f"Warning: Failed to save model checkpoint to " f"{model_checkpoint_path}: {e}")
+            print(f"Rank {self.rank}: Warning: Failed to save distributed model checkpoint at step {step}: {e}")
 
-        # Save activation store state
-        store_checkpoint_path = os.path.join(self.log_dir, f"activation_store_checkpoint_{step}.pt")
-        try:
-            torch.save(self.activation_store.state_dict(), store_checkpoint_path)
-        except Exception as e:
-            print(f"Warning: Failed to save activation store state to " f"{store_checkpoint_path}: {e}")
+        # Save activation store state (only rank 0)
+        if self.rank == 0:
+            store_checkpoint_path = os.path.join(checkpoint_dir, "activation_store.pt")  # Save inside step dir
+            latest_store_path = os.path.join(latest_checkpoint_dir, "activation_store.pt")
+            try:
+                torch.save(self.activation_store.state_dict(), store_checkpoint_path)
+                torch.save(self.activation_store.state_dict(), latest_store_path)
+            except Exception as e:
+                print(f"Rank 0: Warning: Failed to save activation store state at step {step}: {e}")
 
-        # Also save a copy as latest
-        latest_model_path = os.path.join(self.log_dir, "clt_checkpoint_latest.pt")
-        latest_store_path = os.path.join(self.log_dir, "activation_store_checkpoint_latest.pt")
-        try:
-            self.model.save(latest_model_path)
-        except Exception as e:
-            print(f"Warning: Failed to save latest model checkpoint: {e}")
-        try:
-            torch.save(self.activation_store.state_dict(), latest_store_path)
-        except Exception as e:
-            print(f"Warning: Failed to save latest activation store state: {e}")
+            # Log checkpoint directory as artifact to WandB (only rank 0)
+            self.wandb_logger.log_artifact(
+                artifact_path=checkpoint_dir,  # Log the directory
+                artifact_type="model_checkpoint",
+                name=f"dist_checkpoint_{step}",
+            )
 
-    def load_checkpoint(self, checkpoint_path: str, store_checkpoint_path: Optional[str] = None):
-        """Load model and activation store checkpoint.
+        # Barrier to ensure all ranks finish saving before proceeding
+        dist.barrier()
+
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load a distributed checkpoint for model and activation store state.
 
         Args:
-            checkpoint_path: Path to model checkpoint
-            store_checkpoint_path: Path to activation store checkpoint
-                (if None, derived from checkpoint_path)
+            checkpoint_path: Path to the *directory* containing the sharded checkpoint.
+                             This should be the directory saved by _save_checkpoint (e.g., .../step_N).
         """
-        # Load model checkpoint
+        if not os.path.isdir(checkpoint_path):
+            print(
+                f"Error: Checkpoint path {checkpoint_path} is not a directory. Distributed checkpoints are saved as directories."
+            )
+            # Check if it's a non-distributed .pt file for backward compatibility or single GPU runs
+            if os.path.isfile(checkpoint_path) and checkpoint_path.endswith(".pt") and not self.distributed:
+                print("Attempting to load as non-distributed checkpoint file...")
+                self._load_non_distributed_checkpoint(checkpoint_path)
+                return
+            else:
+                return
+
+        if not self.distributed:
+            print("Attempting to load a distributed checkpoint directory in non-distributed mode.")
+            print("Loading only rank 0 state from the directory (if possible)...")
+            # Attempt to load rank 0 shard if structure is known, or just load store state
+            # model_state_dict: Dict[str, Any] = {} # Placeholder - not used
+            # Try loading rank 0 shard - needs specific knowledge of file structure inside dir
+            # load_state_dict(model_state_dict, storage_reader=FileSystemReader(checkpoint_path)) # This might not work easily for single shard
+            try:
+                # Create an empty state dict matching the *full* model structure
+                # Ensure the model is on the correct device before getting state_dict
+                self.model.to(self.device)
+                state_dict_to_load = self.model.state_dict()  # Non-dist model has full state dict
+                load_state_dict(
+                    state_dict=state_dict_to_load,
+                    storage_reader=FileSystemReader(checkpoint_path),
+                    planner=DefaultLoadPlanner(),  # Standard planner might reconstruct
+                    no_dist=True,  # Key flag: Treat the checkpoint as containing a full state dict
+                )
+                # state_dict_to_load is modified in-place by load_state_dict
+                print(
+                    f"Successfully loaded and reconstructed full model state from sharded checkpoint {checkpoint_path}"
+                )
+            except Exception as e:
+                print(f"Error loading distributed checkpoint into non-distributed model from {checkpoint_path}: {e}")
+                print(
+                    "This might indicate that the checkpoint format requires manual reconstruction or saving the full state dict separately on rank 0 during distributed save."
+                )
+                # Fallback or error handling could go here
+                return  # Stop if model load failed
+
+            # Load activation store (if exists)
+            store_checkpoint_path = os.path.join(checkpoint_path, "activation_store.pt")
+            if os.path.exists(store_checkpoint_path):
+                try:
+                    store_state = torch.load(store_checkpoint_path, map_location=self.device)
+                    if hasattr(self, "activation_store") and self.activation_store is not None:
+                        self.activation_store.load_state_dict(store_state)
+                        print(f"Loaded activation store state from {store_checkpoint_path}")
+                    else:
+                        print("Warning: Activation store not initialized. Cannot load state.")
+                except Exception as e:
+                    print(f"Warning: Failed to load activation store state from {store_checkpoint_path}: {e}")
+            else:
+                print(f"Warning: Activation store checkpoint not found in {checkpoint_path}")
+            # Model loading in non-dist from dist checkpoint is complex, skipping full implementation here.
+            print("Warning: Loading sharded model parameters into non-distributed model is not fully implemented.")
+            return
+
+        # --- Distributed Load ---
+        # Load model state dict using distributed checkpointing
+        try:
+            # Create an empty state dict matching the *local* shard structure
+            state_dict_to_load = self.model.state_dict()
+            load_state_dict(
+                state_dict=state_dict_to_load,
+                storage_reader=FileSystemReader(checkpoint_path),
+                planner=DefaultLoadPlanner(),
+                no_dist=False,  # Ensure distributed load
+            )
+            # state_dict_to_load is modified in-place
+            print(f"Rank {self.rank}: Loaded distributed model checkpoint from {checkpoint_path}")
+        except Exception as e:
+            print(f"Rank {self.rank}: Error loading distributed model checkpoint from {checkpoint_path}: {e}")
+            # Barrier even on error? Maybe not, let ranks fail individually.
+            return
+
+        # Load activation store state (only rank 0 needs it, but load happens on rank 0)
+        if self.rank == 0:
+            store_checkpoint_path = os.path.join(checkpoint_path, "activation_store.pt")
+            if os.path.exists(store_checkpoint_path):
+                try:
+                    store_state = torch.load(store_checkpoint_path, map_location=self.device)  # Load to rank 0's device
+                    if hasattr(self, "activation_store") and self.activation_store is not None:
+                        self.activation_store.load_state_dict(store_state)
+                        print(f"Rank 0: Loaded activation store state from {store_checkpoint_path}")
+                    else:
+                        print("Rank 0: Warning: Activation store not initialized. Cannot load state.")
+                except Exception as e:
+                    print(f"Rank 0: Warning: Failed to load activation store state from {store_checkpoint_path}: {e}")
+            else:
+                print(f"Rank 0: Warning: Activation store checkpoint not found in {checkpoint_path}")
+
+        # Barrier to ensure all ranks have loaded before proceeding
+        dist.barrier()
+
+    # Helper for backward compatibility / non-distributed runs
+    def _load_non_distributed_checkpoint(self, checkpoint_path: str, store_checkpoint_path: Optional[str] = None):
+        """Loads a standard single-file model checkpoint."""
+        if self.distributed:
+            print("Error: Attempting to load non-distributed checkpoint in distributed mode.")
+            return
+
         if not os.path.exists(checkpoint_path):
             print(f"Error: Model checkpoint not found at {checkpoint_path}")
             return
         try:
-            self.model.load(checkpoint_path)
-            print(f"Loaded model checkpoint from {checkpoint_path}")
+            full_state_dict = torch.load(checkpoint_path, map_location=self.device)
+            self.model.load_state_dict(full_state_dict)  # Assumes model has standard load_state_dict
+            print(f"Loaded non-distributed model checkpoint from {checkpoint_path}")
         except Exception as e:
-            print(f"Error loading model checkpoint from {checkpoint_path}: {e}")
-            return  # Don't proceed if model load fails
+            print(f"Error loading non-distributed model checkpoint from {checkpoint_path}: {e}")
+            return
 
-        # Determine store checkpoint path if not provided
+        # Determine and load store checkpoint path (same logic as before)
         if store_checkpoint_path is None:
-            # Try to derive from model checkpoint path
             dirname = os.path.dirname(checkpoint_path)
             basename = os.path.basename(checkpoint_path)
             if basename.startswith("clt_checkpoint_"):
-                # Replace "clt_checkpoint_" with "activation_store_checkpoint_"
                 store_basename = basename.replace("clt_checkpoint_", "activation_store_checkpoint_")
                 store_checkpoint_path = os.path.join(dirname, store_basename)
+            elif basename == "clt_checkpoint_latest.pt":
+                store_checkpoint_path = os.path.join(dirname, "activation_store_checkpoint_latest.pt")
             else:
-                # Try using _latest suffix if loading latest model
-                if basename == "clt_checkpoint_latest.pt":
-                    store_checkpoint_path = os.path.join(dirname, "activation_store_checkpoint_latest.pt")
-                else:
-                    # Fallback if naming convention doesn't match
-                    store_checkpoint_path = None
-                    print(
-                        f"Warning: Could not determine activation store checkpoint path from model path: {checkpoint_path}"
-                    )
+                store_checkpoint_path = None
 
-        # Load activation store checkpoint if available
         if store_checkpoint_path and os.path.exists(store_checkpoint_path):
             try:
                 store_state = torch.load(store_checkpoint_path, map_location=self.device)
-                # Ensure activation_store is initialized before loading state
-                if not hasattr(self, "activation_store") or self.activation_store is None:
-                    print("Warning: Activation store not initialized. Cannot load state.")
-                else:
+                if hasattr(self, "activation_store") and self.activation_store is not None:
                     self.activation_store.load_state_dict(store_state)
                     print(f"Loaded activation store state from {store_checkpoint_path}")
+                else:
+                    print("Warning: Activation store not initialized. Cannot load state.")
             except Exception as e:
-                print(f"Warning: Failed to load activation store state from " f"{store_checkpoint_path}: {e}")
+                print(f"Warning: Failed to load activation store state from {store_checkpoint_path}: {e}")
         else:
             print(
-                f"Warning: Activation store checkpoint path not found or specified: "
-                f"{store_checkpoint_path}. Store state not loaded."
+                f"Warning: Activation store checkpoint path not found or specified: {store_checkpoint_path}. Store state not loaded."
             )
+
+    def _average_shared_parameter_grads(self):
+        """Average gradients of parameters that are **replicated** across ranks.
+
+        Tensor-parallel layers shard their weights so those gradients must **not** be
+        synchronised.  However parameters that are kept identical on every rank –
+        e.g. the JumpReLU `log_threshold` vector (shape `[num_features]`) and any
+        unsharded bias vectors – must have their gradients reduced or they will
+        diverge between ranks.
+        """
+        if not self.distributed or self.world_size == 1:
+            return
+
+        for p in self.model.parameters():
+            if p.grad is None:
+                continue
+            if p.dim() == 1:  # replicated vectors
+                dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+                p.grad /= self.world_size
 
     def train(self, eval_every: int = 1000) -> CrossLayerTranscoder:
         """Train the CLT model.
@@ -681,67 +922,106 @@ class CLTTrainer:
             eval_every: Evaluate model every N steps
 
         Returns:
-            Trained CLT model
+            Trained CLT model (local shard)
         """
-        print(f"Starting CLT training on {self.device}...")
-        # Access num_features and num_layers via clt_config
-        print(
-            f"Model has {self.clt_config.num_features} features per layer " f"and {self.clt_config.num_layers} layers"
-        )
-        print(f"Training for {self.training_config.training_steps} steps.")
-        print(f"Logging to {self.log_dir}")
+        # Print startup message from rank 0 only
+        if not self.distributed or self.rank == 0:
+            print(f"Starting CLT training on {self.device}...")
+            print(
+                f"Model has {self.clt_config.num_features} features per layer "
+                f"and {self.clt_config.num_layers} layers"
+            )
+            print(f"Training for {self.training_config.training_steps} steps.")
+            print(f"Logging to {self.log_dir}")
+            if self.distributed:
+                print(f"Distributed training with {self.world_size} processes (Tensor Parallelism)")
 
-        # Check if using normalization and notify user
-        if self.training_config.normalization_method == "estimated_mean_std":
-            print("\n>>> NORMALIZATION PHASE <<<")
-            print("Normalization statistics are being estimated from dataset activations.")
-            print("This may take some time, but happens only once before training begins.")
-            print(f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n")
+            # Check if using normalization and notify user
+            if self.training_config.normalization_method == "estimated_mean_std":
+                print("\n>>> NORMALIZATION PHASE <<<")
+                print("Normalization statistics are being estimated from dataset activations.")
+                print("This may take some time, but happens only once before training begins.")
+                print(f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n")
 
-        # Make sure we flush stdout to ensure prints appear immediately,
-        # especially important in Jupyter/interactive environments
-        sys.stdout.flush()
+            # Make sure we flush stdout to ensure prints appear immediately,
+            # especially important in Jupyter/interactive environments
+            sys.stdout.flush()
+            # Wait for 1 second to ensure output is displayed before training starts
+            time.sleep(1)
+            print("\n>>> TRAINING PHASE <<<")
+            sys.stdout.flush()
 
-        # Wait for 1 second to ensure output is displayed before training starts
-        time.sleep(1)
+        # After the existing startup messages
+        if self.distributed:
+            print(f"\n!!! DIAGNOSTIC INFO !!!")
+            print(f"Rank {self.rank}: Process group type: {type(self.process_group)}")
+            print(f"Rank {self.rank}: RowParallelLinear _reduce does NOT divide by world_size")
+            print(f"Rank {self.rank}: Using weight regularization in sparsity penalty")
+            print(f"Rank {self.rank}: Averaging replicated parameter gradients")
+            print(
+                f"Rank {self.rank}: Data sharding: rank={self.activation_store.rank}, world={self.activation_store.world}"
+            )
+            print(f"Rank {self.rank}: Batch size tokens: {self.training_config.train_batch_size_tokens}")
+            print(f"Rank {self.rank}: Sparsity lambda: {self.training_config.sparsity_lambda}")
 
-        # Training loop using ActivationStore as iterator
-        print("\n>>> TRAINING PHASE <<<")
-        sys.stdout.flush()
+            # Check if activation store actually loaded correctly
+            batch_avail = next(iter(self.activation_store), None)
+            print(f"Rank {self.rank}: First batch available: {batch_avail is not None}")
 
-        # Use tqdm to create progress bar for training
-        pbar = tqdm(
-            range(self.training_config.training_steps),
-            desc="Training CLT",
-            leave=True,  # Keep progress bar after completion
-        )
+            # Force torch to compile/execute our code by running a tiny forward/backward pass
+            dummy = torch.ones(1, device=self.device, requires_grad=True)
+            dummy_out = dummy * 2
+            dummy_out.backward()
+            print(f"!!! END DIAGNOSTIC !!!\n")
+
+        # Create progress bar only on rank 0
+        pbar: Union[tqdm, range]
+        if not self.distributed or self.rank == 0:
+            pbar = tqdm(
+                range(self.training_config.training_steps),
+                desc="Training CLT",
+                leave=True,
+            )
+        else:
+            pbar = range(self.training_config.training_steps)
 
         step = 0
         try:
             for step in pbar:
-                # Force display update of progress bar
-                pbar.refresh()
+                # Refresh progress bar on rank 0
+                if isinstance(pbar, tqdm):
+                    pbar.refresh()
 
                 try:
-                    # Get batch directly from the iterator
+                    # Get batch directly from the iterator (handles distributed sampling internally)
                     inputs, targets = next(self.activation_store)
 
                 except StopIteration:
-                    print("Activation store exhausted. Training finished early.")
+                    # Rank 0 prints message
+                    if not self.distributed or self.rank == 0:
+                        print("Activation store exhausted. Training finished early.")
+                    if self.distributed:
+                        dist.barrier()  # Ensure all ranks see this
                     break  # Exit training loop if data runs out
                 except Exception as e:
-                    print(f"\nError getting batch at step {step}: {e}. Skipping step.")
-                    continue  # Skip this step if batch fetching fails
-
-                # --- Check for empty batch --- (Optional but good practice)
-                if not inputs or not targets or not any(v.numel() > 0 for v in inputs.values()):
-                    print(f"\nWarning: Received empty batch at step {step}. Skipping.")
+                    # Rank 0 prints message
+                    if not self.distributed or self.rank == 0:
+                        print(f"\nRank {self.rank}: Error getting batch at step {step}: {e}. Skipping step.")
+                    # Maybe barrier here too? If one rank fails, others might hang?
+                    # Let's continue for now, assuming store handles internal errors.
                     continue
 
-                # --- Forward pass and compute loss ---
+                # --- Check for empty batch --- (Optional but good practice)
+                # This check should ideally happen *before* moving data potentially
+                if not inputs or not targets or not any(v.numel() > 0 for v in inputs.values()):
+                    if not self.distributed or self.rank == 0:
+                        print(f"\nRank {self.rank}: Warning: Received empty batch at step {step}. Skipping.")
+                    continue
+
+                # --- Forward pass and compute loss --- (All ranks)
                 self.optimizer.zero_grad()
                 # Loss manager needs the model, inputs, targets, and step info
-
+                # Model forward/loss computation now involves communication via parallel layers
                 loss, loss_dict = self.loss_manager.compute_total_loss(
                     self.model,
                     inputs,
@@ -750,12 +1030,11 @@ class CLTTrainer:
                     self.training_config.training_steps,
                 )
 
-                # --- Update Dead Neuron Counters ---
-                # We need feature activations *after* non-linearity
+                # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
+                # We need *full* feature activations *after* non-linearity
                 if hasattr(self, "n_forward_passes_since_fired"):
                     with torch.no_grad():
-                        # Get feature activations (post-nonlinearity) for the current batch
-                        # Assuming inputs is the dictionary of layer activations fed to the model
+                        # get_feature_activations returns the *full* tensor
                         feature_activations_batch = self.model.get_feature_activations(inputs)
 
                         for layer_idx, layer_acts in feature_activations_batch.items():
@@ -763,34 +1042,33 @@ class CLTTrainer:
                             if layer_idx < self.n_forward_passes_since_fired.shape[0]:
                                 if layer_acts.numel() > 0:
                                     # layer_acts shape: [batch_tokens, num_features]
-                                    # Check which features fired (activation > threshold)
-                                    fired_mask_per_token = layer_acts > 1e-6  # Shape: [batch_tokens, num_features]
-                                    fired_features_this_layer = fired_mask_per_token.any(dim=0)  # Shape: [num_features]
+                                    fired_mask_per_token = layer_acts > 1e-6
+                                    fired_features_this_layer = fired_mask_per_token.any(dim=0)
 
-                                    # Ensure fired_features mask matches counter dimension
                                     if fired_features_this_layer.shape[0] == self.n_forward_passes_since_fired.shape[1]:
-                                        # Increment counters for all features in this layer
                                         self.n_forward_passes_since_fired[layer_idx] += 1
-                                        # Reset counters for features that fired
                                         self.n_forward_passes_since_fired[layer_idx][fired_features_this_layer] = 0
                                     else:
-                                        print(
-                                            f"Warning: Shape mismatch for dead neuron update at layer {layer_idx}. "
-                                            f"Activations shape: {layer_acts.shape}, Fired mask shape: {fired_features_this_layer.shape}, "
-                                            f"Counter shape: {self.n_forward_passes_since_fired.shape}"
-                                        )
+                                        if not self.distributed or self.rank == 0:  # Only rank 0 logs warning
+                                            print(
+                                                f"Rank {self.rank}: Warning: Shape mismatch for dead neuron update at layer {layer_idx}. "
+                                                f"Acts shape: {layer_acts.shape}, Fired mask: {fired_features_this_layer.shape}, "
+                                                f"Counter: {self.n_forward_passes_since_fired.shape}"
+                                            )
 
-                # --- Backward pass ---
+                # --- Backward pass --- (All ranks, handles communication implicitly)
                 if torch.isnan(loss):
-                    print(
-                        f"\nWarning: NaN loss encountered at step {step}. "
-                        f"Skipping backward pass and optimizer step."
-                    )
-                    # Optionally log more details or raise an error
+                    if not self.distributed or self.rank == 0:
+                        print(
+                            f"\nRank {self.rank}: Warning: NaN loss encountered at step {step}. "
+                            f"Skipping backward pass and optimizer step."
+                        )
                 else:
                     try:
-
                         loss.backward()
+
+                        # --- Synchronise gradients of replicated parameters --- #
+                        self._average_shared_parameter_grads()
 
                         # --- Gradient clipping --- #
                         if self.training_config.gradient_clip_val is not None:
@@ -799,127 +1077,154 @@ class CLTTrainer:
                                 self.training_config.gradient_clip_val,
                             )
                     except RuntimeError as e:
-                        print(f"\nError during backward pass at step {step}: {e}. " f"Skipping optimizer step.")
-                        # Potentially inspect gradients here if debugging is needed
-                        continue  # Skip optimizer step if backward fails
+                        if not self.distributed or self.rank == 0:
+                            print(
+                                f"\nRank {self.rank}: Error during backward pass at step {step}: {e}. Skipping optimizer step."
+                            )
+                        continue
 
-                    # --- Optimizer step ---
+                    # --- Optimizer step --- (Applied to local parameters using local gradients)
                     self.optimizer.step()
 
-                # --- Scheduler step ---
+                # --- Scheduler step --- (All ranks)
                 if self.scheduler:
                     self.scheduler.step()
 
-                # --- Update progress bar ---
-                # Include total dead features from training step log dict
-                # dead_str = f"Dead: {loss_dict.get('sparsity/total_dead_features', 0)}" # Removed
-                description = (
-                    f"Loss: {loss_dict.get('total', float('nan')):.4f} "
-                    f"(R: {loss_dict.get('reconstruction', float('nan')):.4f} "
-                    f"S: {loss_dict.get('sparsity', float('nan')):.4f} "
-                    f"P: {loss_dict.get('preactivation', float('nan')):.4f})"
-                    # f"{dead_str}"  # Removed
-                )
-                pbar.set_description(description)
+                # --- Update progress bar --- (Rank 0 only)
+                if isinstance(pbar, tqdm):
+                    description = (
+                        f"Loss: {loss_dict.get('total', float('nan')):.4f} "
+                        f"(R: {loss_dict.get('reconstruction', float('nan')):.4f} "
+                        f"S: {loss_dict.get('sparsity', float('nan')):.4f} "
+                        f"P: {loss_dict.get('preactivation', float('nan')):.4f})"
+                    )
+                    pbar.set_description(description)
+                    # Force update to display progress
+                    if step % 1 == 0:  # Update every step
+                        pbar.refresh()
+                        sys.stdout.flush()
 
-                # Force update to display progress
-                if step % 1 == 0:  # Update every step
-                    pbar.refresh()
-                    sys.stdout.flush()
-
-                # --- Log metrics --- # Simplified memory logging here
+                # --- Log metrics --- (Rank 0 logs to WandB/file)
                 self._log_metrics(step, loss_dict)
 
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
                 checkpoint_interval = self.training_config.checkpoint_interval
 
-                save_checkpoint_flag = (step % checkpoint_interval == 0) or (
+                save_checkpoint_flag = (step > 0 and step % checkpoint_interval == 0) or (  # Avoid checkpoint at step 0
                     step == self.training_config.training_steps - 1
                 )
                 run_eval_flag = (step % eval_interval == 0) or (step == self.training_config.training_steps - 1)
 
+                # --- Evaluation (all ranks participate to match collectives) ---
+                # In tensor-parallel mode the model forward includes collective ops (all_reduce/all_gather).
+                # If only rank 0 performed the forward pass these collectives would block on the other ranks
+                # resulting in NCCL timeouts.  Therefore, *every* rank must execute the evaluation forward pass.
+                # We still only log / store the resulting metrics on rank 0.
                 if run_eval_flag:
-                    # Detach mask for evaluator, which runs with no_grad
-                    current_dead_mask = self.dead_neurons_mask.detach().clone()
+                    if self.distributed:
+                        dist.barrier()  # Sync before evaluation starts so that all ranks enter together
 
-                    # Use the evaluator to compute metrics, passing the mask
+                    # Compute evaluation metrics on all ranks to keep collective ops aligned
+                    current_dead_mask = self.dead_neurons_mask.detach().clone()
                     eval_metrics = self.evaluator.compute_metrics(
                         inputs,
                         targets,
-                        dead_neuron_mask=current_dead_mask,  # Pass the mask
+                        dead_neuron_mask=current_dead_mask,
                     )
 
-                    # Store evaluation metrics (for saving to JSON)
-                    self.metrics["eval_metrics"].append({"step": step, **eval_metrics})
+                    if not self.distributed or self.rank == 0:
+                        # Store evaluation metrics (for saving to JSON)
+                        self.metrics["eval_metrics"].append({"step": step, **eval_metrics})
 
-                    # --- Update Progress Bar Postfix --- #
-                    l0_str = f"AvgL0: {eval_metrics.get('sparsity/avg_l0', 0.0):.2f}"
-                    ev_str = f"EV: {eval_metrics.get('reconstruction/explained_variance', 0.0):.3f}"
+                        # --- Update Progress Bar Postfix ---
+                        l0_str = f"AvgL0: {eval_metrics.get('sparsity/avg_l0', 0.0):.2f}"
+                        ev_str = f"EV: {eval_metrics.get('reconstruction/explained_variance', 0.0):.3f}"
+                        avg_density_mean = eval_metrics.get("sparsity/feature_density_mean")
+                        dens_str = f"Dens: {avg_density_mean:.3f}" if avg_density_mean is not None else "Dens: N/A"
+                        eval_dead_str = f"Dead(Eval): {eval_metrics.get('dead_features/total_eval', 0)}"
+                        eval_msg = f"{l0_str}, {ev_str}, {dens_str}, {eval_dead_str}"
 
-                    # Use the pre-calculated aggregate density if available
-                    avg_density_mean = eval_metrics.get("sparsity/feature_density_mean")
-                    dens_str = f"Dens: {avg_density_mean:.3f}" if avg_density_mean is not None else "Dens: N/A"
+                        if isinstance(pbar, tqdm):
+                            pbar.set_postfix_str(eval_msg)
+                            pbar.refresh()
 
-                    # Add total dead features from evaluation metrics
-                    eval_dead_str = f"Dead(Eval): {eval_metrics.get('dead_features/total_eval', 0)}"
+                        # --- Log evaluation metrics to WandB ---
+                        self.wandb_logger.log_evaluation(step, eval_metrics)
 
-                    # Note: Lambda is logged during training step
-                    eval_msg = f"{l0_str}, {ev_str}, {dens_str}, {eval_dead_str}"
+                        # --- Save metrics JSON after evaluation ---
+                        self._save_metrics()
 
-                    pbar.set_postfix_str(eval_msg)
-                    pbar.refresh()  # Force update
+                    # Ensure all ranks finish evaluation before proceeding
+                    if self.distributed:
+                        dist.barrier()
 
-                    # --- Log evaluation metrics to WandB --- #
-                    # The eval_metrics dict already has the desired structure
-                    self.wandb_logger.log_evaluation(step, eval_metrics)
-
-                    # --- Save metrics JSON after evaluation --- #
-                    self._save_metrics()
-
+                # --- Checkpointing (All ranks participate) ---
                 if save_checkpoint_flag:
                     self._save_checkpoint(step)
-                    # Optionally remove older checkpoints here if desired
 
             # --- Explicitly delete tensors at the very end of the loop iteration --- #
+            # Do this on all ranks
             try:
                 del inputs
                 del targets
-                # Loss might not exist if NaN occurred or skip step happened
                 if "loss" in locals() and loss is not None:
                     del loss
+                if "feature_activations_batch" in locals():
+                    del feature_activations_batch
             except NameError:
-                # Handle cases where variables might not be defined (e.g., error on first step)
                 pass
+
         except KeyboardInterrupt:
-            print("\nTraining interrupted by user.")
+            if not self.distributed or self.rank == 0:
+                print("\nTraining interrupted by user.")
         finally:
-            pbar.close()
-            print(f"Training loop finished at step {step}.")
+            if isinstance(pbar, tqdm):
+                pbar.close()
+            if not self.distributed or self.rank == 0:
+                print(f"Training loop finished at step {step}.")
 
-        # --- Save final model and metrics ---
-        final_path = os.path.join(self.log_dir, "clt_final.pt")
-        final_store_path = os.path.join(self.log_dir, "activation_store_final.pt")
+        # Sync before final save attempt
+        if self.distributed:
+            dist.barrier()
 
-        print(f"Saving final model to {final_path}...")
+        # --- Save final model and metrics --- (Rank 0 handles metrics/store, all ranks save model state)
+        final_checkpoint_dir = os.path.join(self.log_dir, "final")
+        final_store_path = os.path.join(final_checkpoint_dir, "activation_store_final.pt")  # Store inside final dir
+
+        # All ranks save final model state
         try:
-            self.model.save(final_path)
-            # Log final model as artifact to WandB
-            self.wandb_logger.log_artifact(artifact_path=final_path, artifact_type="model", name="clt_final")
+            final_model_state_dict = self.model.state_dict()
+            save_state_dict(
+                state_dict=final_model_state_dict,
+                storage_writer=FileSystemWriter(final_checkpoint_dir),
+                planner=DefaultSavePlanner(),
+                no_dist=(not self.distributed),  # Disable distributed save if not distributed
+            )
         except Exception as e:
-            print(f"Warning: Failed to save final model: {e}")
+            print(f"Rank {self.rank}: Warning: Failed to save final distributed model state: {e}")
 
-        print(f"Saving final activation store state to {final_store_path}...")
-        try:
-            torch.save(self.activation_store.state_dict(), final_store_path)
-        except Exception as e:
-            print(f"Warning: Failed to save final activation store state: {e}")
+        # Rank 0 saves store, metrics, logs artifact
+        if not self.distributed or self.rank == 0:
+            print(f"Saving final activation store state to {final_store_path}...")
+            os.makedirs(final_checkpoint_dir, exist_ok=True)  # Ensure dir exists for store save
+            try:
+                torch.save(self.activation_store.state_dict(), final_store_path)
+            except Exception as e:
+                print(f"Rank 0: Warning: Failed to save final activation store state: {e}")
 
-        print("Saving final metrics...")
-        self._save_metrics()
+            print("Saving final metrics...")
+            self._save_metrics()
 
-        # Finish WandB logging
-        self.wandb_logger.finish()
+            # Log final checkpoint directory as artifact
+            self.wandb_logger.log_artifact(artifact_path=final_checkpoint_dir, artifact_type="model", name="clt_final")
 
-        print(f"Training completed! Final model attempted save to {final_path}")
+            # Finish WandB logging
+            self.wandb_logger.finish()
+            print(f"Training completed! Final checkpoint saved to {final_checkpoint_dir}")
+
+        # Clean up distributed process group
+        if self.distributed:
+            dist.destroy_process_group()
+
         return self.model

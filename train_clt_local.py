@@ -94,6 +94,11 @@ def parse_args():
         default=None,
         help="Device to use (e.g., 'cuda', 'cpu', 'mps'). Auto-detected if None.",
     )
+    core_group.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Enable distributed training (requires torchrun/appropriate launcher).",
+    )
 
     # --- CLT Model Architecture ---
     clt_group = parser.add_argument_group("CLT Model Architecture (CLTConfig)")
@@ -349,6 +354,7 @@ def main():
             training_config=training_config,
             log_dir=str(output_dir),
             device=device,
+            distributed=args.distributed,
         )
     except Exception as e:
         logger.exception(f"Failed to initialize CLTTrainer: {e}")  # Use logger.exception
