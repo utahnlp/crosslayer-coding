@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import math
-from typing import Callable, Optional
+from typing import Callable, Optional, cast
 
 
 class _ParallelLinear(nn.Module):
@@ -84,35 +84,77 @@ class _ParallelLinear(nn.Module):
         raise NotImplementedError
 
 
-def _gather(input_, process_group, dim=-1, full_dim_size: Optional[int] = None):
-    """Gather tensors and concatenate along specified dimension.
-    Assumes all ranks have the same local dimension size (padded if needed).
+class _Gather(torch.autograd.Function):
+    """Autograd-aware all-gather + concat.
+
+    During the forward pass each rank contributes its *local* slice and the
+    concatenated full tensor is returned to every rank.  In the backward pass
+    the incoming gradient is **sliced** so that each rank receives the portion
+    corresponding to its original contribution.  This mirrors the behaviour of
+    a plain :func:`torch.cat` w.r.t. autograd and enables correct gradient
+    propagation through the gather.
     """
-    if process_group is None or not dist.is_initialized():
-        return input_  # No-op if not distributed
 
-    world_size = dist.get_world_size(process_group)
-    if world_size == 1:
-        return input_
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, process_group: ProcessGroup, dim: int, full_dim_size: Optional[int]):
+        if process_group is None or not dist.is_initialized() or dist.get_world_size(process_group) == 1:
+            ctx.dim = dim
+            ctx.local_dim = input_.size(dim)
+            ctx.full_dim_size = full_dim_size or input_.size(dim)
+            ctx.process_group = None  # Mark non-distributed case
+            return input_
 
-    # Ensure input is contiguous
-    input_ = input_.contiguous()
+        world_size = dist.get_world_size(process_group)
+        rank = dist.get_rank(process_group)
 
-    # --- Modification: Reinstate pre-assignment for autograd --- #
-    rank = dist.get_rank(process_group)  # Need rank again
-    gathered_list = [torch.empty_like(input_) for _ in range(world_size)]  # Use empty_like
-    gathered_list[rank] = input_  # Keep reference to original input for grad flow
-    dist.all_gather(gathered_list, input_, group=process_group)  # Pass local tensor to gather
+        ctx.dim = dim
+        ctx.local_dim = input_.size(dim)
+        ctx.full_dim_size = full_dim_size if full_dim_size is not None else ctx.local_dim * world_size
+        ctx.process_group = process_group
 
-    output = torch.cat(gathered_list, dim=dim)
+        # Ensure a contiguous tensor before communication for NCCL efficiency.
+        input_contig = input_.contiguous()
 
-    # Truncate the gathered output if the original dimension was not divisible
-    if full_dim_size is not None and output.shape[dim] > full_dim_size:
-        indices = [slice(None)] * output.dim()
-        indices[dim] = slice(0, full_dim_size)
-        output = output[tuple(indices)]
+        gathered: list[torch.Tensor] = [torch.empty_like(input_contig) for _ in range(world_size)]
+        # Preserve the *exact* tensor object for the local slice so that autograd
+        # can track the dependency (no copy!).
+        gathered[rank] = input_contig
 
-    return output
+        # Perform the collective.
+        dist.all_gather(gathered, input_contig, group=process_group)
+
+        output = torch.cat(gathered, dim=dim)
+
+        # If we padded the tensor dimension for divisibility, remove the excess.
+        if output.size(dim) > ctx.full_dim_size:
+            idx = [slice(None)] * output.dim()
+            idx[dim] = slice(0, ctx.full_dim_size)
+            output = output[tuple(idx)]
+
+        return output
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        # Expect exactly one gradient tensor from downstream.
+        grad_output = grad_outputs[0]
+
+        # Non-distributed: gradient flows straight through.
+        if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
+            return grad_output, None, None, None
+
+        rank = dist.get_rank(ctx.process_group)
+
+        # Compute start/end indices for this rank's slice along the gather dim.
+        local_dim_padded = ctx.local_dim  # Already accounts for padding in weight shape.
+        start = rank * local_dim_padded
+        end = start + ctx.local_dim
+
+        # Extract the gradient slice that corresponds to this rank.
+        idx = [slice(None)] * grad_output.dim()
+        idx[ctx.dim] = slice(start, end)
+        grad_input = grad_output[tuple(idx)].contiguous()
+
+        return grad_input, None, None, None
 
 
 def _reduce(input_, process_group):
@@ -312,3 +354,17 @@ class RowParallelLinear(_ParallelLinear):
             reduced_output = reduced_output + self.bias_param
 
         return reduced_output
+
+
+# --------------------------- Public helper --------------------------- #
+
+
+def _gather(
+    input_: torch.Tensor,
+    process_group: Optional[ProcessGroup],
+    dim: int = -1,
+    full_dim_size: Optional[int] = None,
+) -> torch.Tensor:
+    """Wrapper around :class:`_Gather` to match original functional interface."""
+
+    return cast(torch.Tensor, _Gather.apply(input_, process_group, dim, full_dim_size))

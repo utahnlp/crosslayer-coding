@@ -201,50 +201,6 @@ def scatter_full_parameter(full_param: torch.Tensor, model_param: torch.nn.Param
             # Fallback: maybe zero pad? Or fail? Let's print and maybe fail test later.
 
 
-# --- Helper to Get Expected Shard --- #
-def get_expected_shard(full_tensor: torch.Tensor, target_shard_shape: tuple, partition_dim: int) -> torch.Tensor:
-    """Calculates the expected shard for the current rank from a full tensor."""
-    if WORLD_SIZE <= 1 or not dist.is_initialized():
-        return full_tensor  # No sharding needed
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    full_dim_size = full_tensor.size(partition_dim)
-
-    # Calculate start/end index for this rank's shard in the full tensor
-    # Use the target_shard_shape to determine padding/actual size
-    local_dim_actual = target_shard_shape[partition_dim]
-    local_dim_padded = math.ceil(full_dim_size / world_size)
-    start_index = rank * local_dim_padded
-    end_index = start_index + local_dim_actual
-
-    # Ensure end_index doesn't exceed the original full dimension
-    end_index = min(end_index, full_dim_size)
-    actual_local_dim_size_on_full = max(0, end_index - start_index)
-
-    if actual_local_dim_size_on_full > 0:
-        # Create slice objects
-        indices = [slice(None)] * full_tensor.dim()
-        indices[partition_dim] = slice(start_index, end_index)
-
-        # Extract the shard
-        expected_shard_unpadded = full_tensor[tuple(indices)].clone()
-
-        # Pad if necessary (if target shard is larger than extracted shard)
-        pad_amount = target_shard_shape[partition_dim] - expected_shard_unpadded.size(partition_dim)
-        if pad_amount > 0:
-            pad_dims = [0, 0] * len(target_shard_shape)
-            pad_idx = len(target_shard_shape) - 1 - partition_dim
-            pad_dims[2 * pad_idx + 1] = pad_amount
-            expected_shard_padded = F.pad(expected_shard_unpadded, tuple(pad_dims))
-            return expected_shard_padded
-        else:
-            return expected_shard_unpadded
-    else:
-        # If this rank gets no part of the original tensor, return zeros of target shape
-        return torch.zeros(target_shard_shape, dtype=full_tensor.dtype, device=full_tensor.device)
-
-
 # --- Model Fixtures ---
 @pytest.fixture(scope="module")
 def single_gpu_model(base_config: CLTConfig, device: torch.device) -> CrossLayerTranscoder:
@@ -973,39 +929,23 @@ def test_gradient_calculation(
         )
         target_dict[layer_idx] = target_tensor.to(device)
 
-    # --- Single GPU Backward Pass (on Rank 0's device conceptually, but broadcasted model used) ---
+    # --- Single GPU Backward Pass ---
+    # Ensure model is in train mode for gradients
     single_gpu_model.train()
     single_gpu_model.zero_grad()
-    target_dict_single = {
-        k: v.clone().to(single_gpu_model.device) for k, v in target_dict.items()
-    }  # Ensure targets on same device as model
-    input_dict_single = {k: v.clone().to(single_gpu_model.device) for k, v in input_dict.items()}
+    target_dict_single = {k: v.clone() for k, v in target_dict.items()}
     single_total_loss, _ = loss_manager.compute_total_loss(
-        single_gpu_model,
-        input_dict_single,
-        target_dict_single,
-        current_step=0,
-        total_steps=training_config.training_steps,
+        single_gpu_model, input_dict, target_dict_single, current_step=0, total_steps=training_config.training_steps
     )
     single_total_loss.backward()
     single_gpu_grads = {name: p.grad.clone() for name, p in single_gpu_model.named_parameters() if p.grad is not None}
     single_gpu_model.eval()  # Back to eval mode
 
-    # --- Broadcast single_gpu_grads Tensors from Rank 0 to All Ranks --- #
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        print(f"Rank {RANK}: Broadcasting single_gpu_grads...")
-        grad_items = list(single_gpu_grads.items())  # Use list for ordered broadcast
-        for name, grad_tensor in grad_items:
-            dist.broadcast(grad_tensor, src=0)  # Broadcast tensor data directly
-            if RANK != 0:
-                single_gpu_grads[name] = grad_tensor  # Update non-rank 0 dicts
-        dist.barrier()
-        print(f"Rank {RANK}: single_gpu_grads broadcast complete.")
-
-    # --- Multi GPU Backward Pass --- (Same as before)
+    # --- Multi GPU Backward Pass ---
     if multi_gpu_model is None:
         pytest.skip("Multi-GPU model not available.")
         return
+
     multi_gpu_model.train()
     multi_gpu_model.zero_grad()
     input_dict_multi = {k: v.clone() for k, v in input_dict.items()}
@@ -1013,10 +953,15 @@ def test_gradient_calculation(
     multi_total_loss, _ = loss_manager.compute_total_loss(
         multi_gpu_model, input_dict_multi, target_dict_multi, current_step=0, total_steps=training_config.training_steps
     )
+    # Simulate trainer's backward pass:
+    # 1. Backward
     multi_total_loss.backward()
+    # 2. Average replicated grads (like in trainer)
     average_replicated_grads(multi_gpu_model)
+    # 3. Barrier (optional but good practice)
     if dist.is_initialized():
         dist.barrier()
+
     multi_gpu_local_grads = {name: p.grad for name, p in multi_gpu_model.named_parameters() if p.grad is not None}
     multi_gpu_model.eval()  # Back to eval mode
     print(f"Multi GPU Rank {RANK} Backward Pass Completed. Found {len(multi_gpu_local_grads)} local grads.")
@@ -1025,117 +970,110 @@ def test_gradient_calculation(
     if dist.is_initialized():
         dist.barrier()
 
-    # --- Comparison Loop (All Ranks Compare Local Grads, Rank 0 Reports) --- #
-    # Check keys on Rank 0
+    # --- Comparison Loop (All Ranks Participate in Gathering) --- #
+    # Moved loop outside Rank 0 check
+    # Ensure same parameters have gradients (check on rank 0 only)
     if RANK == 0:
-        print("\nComparing Gradients (Rank 0 performs checks):")
-        if single_gpu_grads.keys() != multi_gpu_local_grads.keys():
-            pytest.fail(f"Gradient keys differ: {single_gpu_grads.keys()} vs {multi_gpu_local_grads.keys()}")
+        print("\nComparing Gradients (Rank 0):")
+        assert (
+            single_gpu_grads.keys() == multi_gpu_local_grads.keys()
+        ), f"Gradient keys differ: {single_gpu_grads.keys()} vs {multi_gpu_local_grads.keys()}"
 
-    mismatch_detected_on_rank = False
-    mismatch_messages_on_rank = []  # Collect local messages
+    multi_gpu_params_dict = dict(multi_gpu_model.named_parameters())
 
-    # Iterate through local grads computed by multi-GPU model
-    for name, local_grad in multi_gpu_local_grads.items():
-        if name not in single_gpu_grads:
-            msg = f"Rank {RANK} Warning: Grad for '{name}' missing in (broadcasted) single_gpu_grads dict."
-            print(msg)
-            mismatch_detected_on_rank = True
-            mismatch_messages_on_rank.append(msg)
+    # --------- NEW: Track mismatches to avoid premature assertion that breaks barriers ---------
+    gradient_mismatch_detected = False
+    mismatch_messages = []  # Collect detailed messages for debugging on Rank 0
+    # -------------------------------------------------------------------------------------------
+
+    for name, single_grad in single_gpu_grads.items():
+        if name not in multi_gpu_local_grads:
+            # This case should be caught by the key check on Rank 0, but good practice
+            if RANK == 0:
+                msg = f"Warning: Grad for {name} missing in multi-GPU model."
+                print(msg)
+                gradient_mismatch_detected = True
+                mismatch_messages.append(msg)
             continue
 
-        # Get the corresponding full gradient from the broadcasted single-GPU results
-        single_grad_full = single_gpu_grads[name].to(device)
+        local_grad = multi_gpu_local_grads[name]
+        param = multi_gpu_params_dict[name]
 
-        # Identify parameter type and determine if comparison is needed
+        # --- Perform Gathering on ALL ranks if sharded --- #
+        full_multi_grad = None  # Initialize for Rank != 0
         is_sharded = False
         partition_dim = -1
-        is_replicated = False
 
-        if name == "log_threshold":
-            is_replicated = True
-        elif "decoders." in name and ".bias" in name:
-            is_replicated = True  # Decoder bias is replicated
-        elif "encoders." in name and ".weight" in name:
+        if "encoders." in name and ".weight" in name:
             is_sharded = True
             partition_dim = 0
         elif "decoders." in name and ".weight" in name:
             is_sharded = True
             partition_dim = 1
-        # Note: Encoder bias (if it existed) would be sharded with partition_dim=0
+        # Add other sharded types here (e.g., encoder bias if ColumnParallel)
+        elif "encoders." in name and ".bias" in name:  # Check if bias is sharded (depends on ColumnParallel impl)
+            # Encoders have bias=False, this branch should not be hit
+            if hasattr(multi_gpu_model.encoders[int(name.split(".")[1])], "bias_param"):
+                is_sharded = True
+                partition_dim = 0  # ColumnParallel bias is sharded along output features
 
-        try:
-            comparison_passed = True  # Assume pass initially
-            if is_sharded:
-                # Calculate the expected shard for this rank from the full single-GPU gradient
-                expected_shard = get_expected_shard(single_grad_full, local_grad.shape, partition_dim)
-                # Compare local multi-GPU grad shard with the expected shard
-                comparison_passed = torch.allclose(expected_shard, local_grad, atol=1e-4, rtol=1e-3)
-                if not comparison_passed:
-                    mismatch_messages_on_rank.append(
-                        f"Mismatch Sharded '{name}'. Max diff: {(expected_shard - local_grad).abs().max():.6e}"
-                    )
-            elif is_replicated:
-                # Compare local multi-GPU grad (already averaged) with the full single-GPU gradient
-                tol = (1e-4, 1e-4) if name == "log_threshold" else (1e-5, 1e-4)
-                comparison_passed = torch.allclose(single_grad_full, local_grad, atol=tol[0], rtol=tol[1])
-                if not comparison_passed:
-                    mismatch_messages_on_rank.append(
-                        f"Mismatch Replicated '{name}'. Max diff: {(single_grad_full - local_grad).abs().max():.6e}"
-                    )
-            else:
-                # Parameter wasn't identified as sharded or known replicated - raise error on Rank 0 later
-                msg = f"Unhandled parameter '{name}' in gradient check."
-                print(f"Rank {RANK}: {msg}")
-                comparison_passed = False
-                mismatch_messages_on_rank.append(msg)
+        if is_sharded:
+            # All ranks participate in the gather
+            # gather_sharded_gradient returns the full tensor only on Rank 0
+            full_multi_grad = gather_sharded_gradient(local_grad, param, single_grad.shape, partition_dim)
 
-            if not comparison_passed:
-                mismatch_detected_on_rank = True
+        # --- Comparison (only on Rank 0) --- #
+        if RANK == 0:
+            print(f"  Comparing grad for: {name} (shape {single_grad.shape})")
+            single_grad = single_grad.to(local_grad.device)
 
-        except Exception as exc:
-            # Catch any unexpected errors during comparison
-            msg = f"Rank {RANK} Exception comparing '{name}': {exc}"
-            print(msg)
-            mismatch_detected_on_rank = True
-            mismatch_messages_on_rank.append(msg)
-
-    # --- Gather mismatch status from all ranks --- #
-    mismatch_status_tensor = torch.tensor([1 if mismatch_detected_on_rank else 0], dtype=torch.int, device=device)
-    gathered_status_list = None
-    if dist.is_initialized():
-        gathered_status_list = [torch.zeros_like(mismatch_status_tensor) for _ in range(WORLD_SIZE)]
-        dist.all_gather(gathered_status_list, mismatch_status_tensor)
-        dist.barrier()
-
-    # --- Final Assertion on Rank 0 --- #
-    if RANK == 0:
-        final_mismatch_detected = False
-        failure_messages = []
-        if gathered_status_list:
-            # Check status from all ranks
-            for r, status_tensor in enumerate(gathered_status_list):
-                if status_tensor.item() == 1:
-                    final_mismatch_detected = True
-                    # Only gather detailed messages from Rank 0 itself to avoid complex object comms
-                    if r == 0:
-                        failure_messages.extend([f"[Rank 0] {msg}" for msg in mismatch_messages_on_rank])
-                    else:
-                        failure_messages.append(
-                            f"Gradient mismatch detected on Rank {r}. Check Rank {r} logs for details."
+            try:
+                # Identify parameter type (replicated or sharded)
+                if name == "log_threshold":  # Replicated parameter
+                    print("    Type: Replicated")
+                    if not torch.allclose(single_grad, local_grad, atol=1e-4, rtol=1e-4):
+                        gradient_mismatch_detected = True
+                        mismatch_messages.append(
+                            f"Mismatch in replicated gradient for '{name}'. Max diff: {(single_grad - local_grad).abs().max()}"
                         )
-        elif mismatch_detected_on_rank:  # Handle single GPU case (WORLD_SIZE=1)
-            final_mismatch_detected = True
-            failure_messages.extend(mismatch_messages_on_rank)
 
-        if final_mismatch_detected:
-            pytest.fail("Gradient mismatches detected:\n" + "\n".join(failure_messages))
-        else:
-            print("\nGradient Check PASSED.")
+                elif is_sharded:
+                    # Access the gathered gradient computed above
+                    print(f"    Type: Sharded (partition_dim={partition_dim})")
+                    if full_multi_grad is not None:
+                        # Increase tolerance for gathered sharded grads
+                        assert torch.allclose(
+                            single_grad, full_multi_grad, atol=1e-4, rtol=1e-3
+                        ), f"Mismatch in gathered sharded gradient for '{name}'. Max diff: {(single_grad - full_multi_grad).abs().max()}"
+                    else:
+                        pytest.fail(f"Failed to gather gradient for sharded parameter {name} on Rank 0")
 
-    # --- Final Barrier --- # (Keep final barrier)
+                # Handle non-sharded, non-log_threshold parameters (e.g., RowParallelLinear bias)
+                elif "decoders." in name and ".bias" in name:
+                    # Bias for RowParallelLinear should be replicated
+                    print("    Type: Replicated (Decoder Bias)")
+                    if not torch.allclose(single_grad, local_grad, atol=1e-5, rtol=1e-4):
+                        gradient_mismatch_detected = True
+                        mismatch_messages.append(f"Mismatch in replicated gradient for '{name}'.")
+                else:
+                    # Unknown/unhandled parameter type
+                    gradient_mismatch_detected = True
+                    mismatch_messages.append(f"Unhandled parameter type for gradient check: {name}")
+            except Exception as exc:
+                # Catch unexpected errors to ensure barrier below is still reached
+                gradient_mismatch_detected = True
+                mismatch_messages.append(f"Exception during gradient comparison for {name}: {exc}")
+
+    # --- Final Barrier --- #
+    # Ensure all ranks wait until Rank 0 finishes comparisons before proceeding
     if dist.is_initialized():
         dist.barrier()
+
+    # After synchronization, raise once on Rank 0 if any mismatches were detected
+    if RANK == 0 and gradient_mismatch_detected:
+        pytest.fail("\n".join(mismatch_messages))
+
+    # -------------------------------------------------------------------------------------------
 
 
 # --- Isolated Layer Tests ---
