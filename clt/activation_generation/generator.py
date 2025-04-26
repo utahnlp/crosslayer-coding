@@ -214,13 +214,35 @@ class _RunningStat:
         self.M2 = torch.zeros(dim, dtype=torch.float64)
 
     def update(self, x: torch.Tensor):
+        """Update running mean & M2 using a mini-batch (Welford, parallel form).
+
+        This corrects the previous implementation which **under-estimated** the
+        variance by failing to include the between-batch mean shift term.
+        """
+
+        # Promote to float64 for numerical stability
         x = x.to(torch.float64)
+
         cnt = x.shape[0]
-        delta = x.mean(0) - self.mean
-        new_n = self.n + cnt
-        self.mean += delta * (cnt / new_n)
-        self.M2 += ((x - self.mean).pow(2)).sum(0)
-        self.n = new_n
+        if cnt == 0:
+            return  # nothing to do
+
+        # Batch statistics
+        batch_mean = x.mean(0)
+        batch_M2 = ((x - batch_mean).pow(2)).sum(0)  # Σ (x_i − μ_batch)^2
+
+        # Combine with running statistics (parallel update formula)
+        delta = batch_mean - self.mean
+        total_n = self.n + cnt
+
+        # Update running mean
+        self.mean += delta * (cnt / total_n)
+
+        # Update running M2 – include within-batch and between-batch terms
+        self.M2 += batch_M2 + delta.pow(2) * self.n * cnt / total_n
+
+        # Update count
+        self.n = int(total_n)
 
     def finalize(self) -> Tuple[np.ndarray, np.ndarray]:
         var = self.M2 / max(self.n - 1, 1)

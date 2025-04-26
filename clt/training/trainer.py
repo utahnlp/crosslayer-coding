@@ -953,14 +953,15 @@ class CLTTrainer:
 
         # After the existing startup messages
         if self.distributed:
-            print(f"\n!!! DIAGNOSTIC INFO !!!")
+            print("\n!!! DIAGNOSTIC INFO !!!")
             print(f"Rank {self.rank}: Process group type: {type(self.process_group)}")
             print(f"Rank {self.rank}: RowParallelLinear _reduce does NOT divide by world_size")
             print(f"Rank {self.rank}: Using weight regularization in sparsity penalty")
             print(f"Rank {self.rank}: Averaging replicated parameter gradients")
-            print(
-                f"Rank {self.rank}: Data sharding: rank={self.activation_store.rank}, world={self.activation_store.world}"
-            )
+            # Check if activation store has rank/world attributes before accessing
+            store_rank = getattr(self.activation_store, "rank", "N/A")
+            store_world = getattr(self.activation_store, "world", "N/A")
+            print(f"Rank {self.rank}: Data sharding: rank={store_rank}, world={store_world}")
             print(f"Rank {self.rank}: Batch size tokens: {self.training_config.train_batch_size_tokens}")
             print(f"Rank {self.rank}: Sparsity lambda: {self.training_config.sparsity_lambda}")
 
@@ -972,7 +973,7 @@ class CLTTrainer:
             dummy = torch.ones(1, device=self.device, requires_grad=True)
             dummy_out = dummy * 2
             dummy_out.backward()
-            print(f"!!! END DIAGNOSTIC !!!\n")
+            print("!!! END DIAGNOSTIC !!!\n")
 
         # Create progress bar only on rank 0
         pbar: Union[tqdm, range]
@@ -1017,6 +1018,40 @@ class CLTTrainer:
                     if not self.distributed or self.rank == 0:
                         print(f"\nRank {self.rank}: Warning: Received empty batch at step {step}. Skipping.")
                     continue
+
+                # --- BEGIN: One-time Normalization Check ---
+                if step == 0 and (not self.distributed or self.rank == 0):
+                    logger.info("--- Running Post-Normalization Check (First Batch) ---")
+                    norm_applied = getattr(self.activation_store, "apply_normalization", None)
+                    if isinstance(self.activation_store, (LocalActivationStore, RemoteActivationStore)):
+                        logger.info(f"ActivationStore reports apply_normalization={norm_applied}")
+                    elif isinstance(self.activation_store, StreamingActivationStore):
+                        logger.info(
+                            f"Streaming store normalization method: {self.activation_store.normalization_method}"
+                        )
+
+                    for li in range(self.clt_config.num_layers):
+                        mean_in, std_in, mean_tg, std_tg = float("nan"), float("nan"), float("nan"), float("nan")
+                        try:
+                            if li in inputs and inputs[li].numel() > 0:
+                                input_tensor = inputs[li].float()
+                                mean_in = input_tensor.mean().item()
+                                std_in = input_tensor.std().item()
+                            if li in targets and targets[li].numel() > 0:
+                                target_tensor = targets[li].float()
+                                mean_tg = target_tensor.mean().item()
+                                std_tg = target_tensor.std().item()
+
+                            if not (
+                                torch.isnan(torch.tensor(mean_in)) and torch.isnan(torch.tensor(mean_tg))
+                            ):  # Log if at least one value is valid
+                                logger.info(
+                                    f"  Layer {li:>2}: Input Mean={mean_in:+.4f}, Std={std_in:.4f} | Target Mean={mean_tg:+.4f}, Std={std_tg:.4f}"
+                                )
+                        except Exception as e:
+                            logger.error(f"  Layer {li}: Error during normalization check: {e}")
+                    logger.info("--- End Post-Normalization Check ---")
+                # --- END: One-time Normalization Check ---
 
                 # --- Forward pass and compute loss --- (All ranks)
                 self.optimizer.zero_grad()
