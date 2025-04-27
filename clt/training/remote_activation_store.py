@@ -62,6 +62,7 @@ class RemoteActivationStore(ManifestActivationStore):
         world: int = 1,
         seed: int = 42,
         timeout: int = 60,
+        sampling_strategy: str = "sequential",
     ):
         """
         Initializes the RemoteActivationStore.
@@ -76,6 +77,7 @@ class RemoteActivationStore(ManifestActivationStore):
             world: Total number of processes in distributed training.
             seed: Random seed for the sampler.
             timeout: HTTP request timeout in seconds.
+            sampling_strategy: 'sequential' or 'random_chunk'.
         """
         self.server = server_url.rstrip("/") + "/"
         self.did_enc = quote(dataset_id, safe="")  # URL-encoded dataset ID
@@ -90,12 +92,21 @@ class RemoteActivationStore(ManifestActivationStore):
             rank=rank,
             world=world,
             seed=seed,
+            sampling_strategy=sampling_strategy,
         )
 
         logger.info(
-            f"RemoteActivationStore initialized for dataset '{self.did_raw}' at {self.server} "
-            f"(Rank {self.rank}/{self.world}, Seed {self.seed}, Batch {self.train_batch_size_tokens}, "
-            f"Device {self.device}, Dtype {self.dtype})"
+            "RemoteActivationStore initialized for dataset '%s' at %s "
+            "(Rank %d/%d, Seed %d, Batch %d, Device %s, Dtype %s, Strategy '%s')",
+            self.did_raw,
+            self.server,
+            self.rank,
+            self.world,
+            self.seed,
+            self.train_batch_size_tokens,
+            self.device,
+            self.dtype,
+            self.sampling_strategy,
         )
 
     # --- Implementation of abstract methods for remote fetching --- #

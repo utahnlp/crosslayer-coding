@@ -208,6 +208,16 @@ def parse_args():
         help="Number of steps of inactivity before a feature is considered 'dead' for evaluation.",
     )
 
+    # --- Sampling Strategy --- Added Group
+    sampling_group = parser.add_argument_group("Sampling Strategy (TrainingConfig)")
+    sampling_group.add_argument(
+        "--sampling-strategy",
+        type=str,
+        choices=["sequential", "random_chunk"],
+        default="sequential",
+        help="Sampling strategy: 'sequential' processes chunks in order per epoch, 'random_chunk' picks a random valid chunk each step.",
+    )
+
     # --- Logging & Checkpointing ---
     log_group = parser.add_argument_group("Logging & Checkpointing (TrainingConfig)")
     log_group.add_argument(
@@ -322,6 +332,8 @@ def main():
         activation_dtype=args.activation_dtype,
         # Normalization
         normalization_method=args.normalization_method,
+        # Sampling Strategy
+        sampling_strategy=args.sampling_strategy,
         # Loss Coeffs
         sparsity_lambda=args.sparsity_lambda,
         sparsity_c=args.sparsity_c,

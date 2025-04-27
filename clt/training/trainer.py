@@ -488,6 +488,7 @@ class CLTTrainer:
             Configured instance of a BaseActivationStore subclass.
         """
         activation_source = self.training_config.activation_source
+        sampling_strategy = self.training_config.sampling_strategy
 
         shard_data = False  # add a flag if you like
         row_rank = 0 if shard_data is False else self.rank
@@ -578,6 +579,7 @@ class CLTTrainer:
                 rank=rank,  # Use trainer's rank
                 world=world,  # Use trainer's world size
                 seed=self.training_config.seed,
+                sampling_strategy=sampling_strategy,
             )
             # Fix: Check instance type before accessing subclass-specific attributes
             if isinstance(store, LocalActivationStore):
@@ -608,6 +610,7 @@ class CLTTrainer:
                 world=world,  # Use trainer's world size
                 seed=self.training_config.seed,
                 timeout=remote_cfg.get("timeout", 60),
+                sampling_strategy=sampling_strategy,
             )
             # Fix: Check instance type before accessing subclass-specific attributes
             if isinstance(store, RemoteActivationStore):

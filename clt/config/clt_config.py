@@ -55,6 +55,9 @@ class TrainingConfig:
     remote_config: Optional[Dict[str, Any]] = None  # Dict with server_url, dataset_id, etc.
     # --- End Activation Store Source --- #
 
+    # Sampling strategy for manifest-based stores
+    sampling_strategy: Literal["sequential", "random_chunk"] = "sequential"
+
     # Loss function coefficients
     sparsity_lambda: float = 1e-3  # Coefficient for sparsity penalty
     sparsity_c: float = 1.0  # Parameter affecting sparsity penalty shape
@@ -113,3 +116,9 @@ class TrainingConfig:
             assert (
                 "server_url" in self.remote_config and "dataset_id" in self.remote_config
             ), "remote_config must contain 'server_url' and 'dataset_id'"
+
+        # Validate sampling strategy
+        assert self.sampling_strategy in [
+            "sequential",
+            "random_chunk",
+        ], "sampling_strategy must be 'sequential' or 'random_chunk'"

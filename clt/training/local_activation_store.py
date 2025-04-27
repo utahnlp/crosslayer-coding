@@ -41,6 +41,7 @@ class LocalActivationStore(ManifestActivationStore):
         rank: int = 0,
         world: int = 1,
         seed: int = 42,
+        sampling_strategy: str = "sequential",
     ):
         """
         Initializes the LocalActivationStore.
@@ -54,6 +55,7 @@ class LocalActivationStore(ManifestActivationStore):
             rank: Rank of the current process in distributed training.
             world: Total number of processes in distributed training.
             seed: Random seed for the sampler.
+            sampling_strategy: 'sequential' or 'random_chunk'.
         """
         self.dataset_path = Path(dataset_path).resolve()  # Ensure absolute path
         if not self.dataset_path.is_dir():
@@ -67,12 +69,20 @@ class LocalActivationStore(ManifestActivationStore):
             rank=rank,
             world=world,
             seed=seed,
+            sampling_strategy=sampling_strategy,
         )
 
         logger.info(
-            f"LocalActivationStore initialized for dataset at {self.dataset_path} "
-            f"(Rank {self.rank}/{self.world}, Seed {self.seed}, Batch {self.train_batch_size_tokens}, "
-            f"Device {self.device}, Dtype {self.dtype})"
+            "LocalActivationStore initialized for dataset at %s "
+            "(Rank %d/%d, Seed %d, Batch %d, Device %s, Dtype %s, Strategy '%s')",
+            self.dataset_path,
+            self.rank,
+            self.world,
+            self.seed,
+            self.train_batch_size_tokens,
+            self.device,
+            self.dtype,
+            self.sampling_strategy,
         )
         logger.info(f"Found {self.num_chunks} chunks based on manifest.")
 
