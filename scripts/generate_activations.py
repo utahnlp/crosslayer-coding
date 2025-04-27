@@ -116,7 +116,7 @@ def parse_arguments():
         help="Compression ('lz4', 'gzip', or 'None').",
     )
     parser.add_argument(
-        "--chunk_size_tokens",
+        "--chunk_token_threshold",
         type=int,
         default=1_000_000,
         help="Target tokens per chunk file.",
