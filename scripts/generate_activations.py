@@ -127,6 +127,12 @@ def parse_arguments():
         default=None,
         help="Optional URL for the remote activation server (e.g., 'http://host:port').",
     )
+    parser.add_argument(
+        "--activation_dtype",
+        type=str,
+        default="float32",
+        help="Data type for storing activations (e.g., 'float32', 'bfloat16').",
+    )
 
     # --- Normalization ---
     parser.add_argument(
@@ -211,6 +217,7 @@ def main():
         nnsight_tracer_kwargs=nnsight_tracer_kwargs,
         nnsight_invoker_args=nnsight_invoker_args,
         remote_server_url=args.remote_server_url,
+        activation_dtype=args.activation_dtype,
     )
 
     # Instantiate the generator, passing the config and optional device override
