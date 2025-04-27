@@ -121,6 +121,12 @@ def parse_arguments():
         default=1_000_000,
         help="Target tokens per chunk file.",
     )
+    parser.add_argument(
+        "--remote_server_url",
+        type=str,
+        default=None,
+        help="Optional URL for the remote activation server (e.g., 'http://host:port').",
+    )
 
     # --- Normalization ---
     parser.add_argument(
@@ -204,6 +210,7 @@ def main():
         compute_norm_stats=args.compute_norm_stats,
         nnsight_tracer_kwargs=nnsight_tracer_kwargs,
         nnsight_invoker_args=nnsight_invoker_args,
+        remote_server_url=args.remote_server_url,
     )
 
     # Instantiate the generator, passing the config and optional device override
