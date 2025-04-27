@@ -457,7 +457,7 @@ class CrossLayerTranscoder(BaseTranscoder):
         )
 
         # Use self.world_size which is correctly set for non-distributed case
-        rank = self.rank
+        # rank = self.rank # Removed unused variable
 
         for src_layer in range(self.config.num_layers):
             # Accumulate squared norms locally first, then reduce
@@ -481,26 +481,39 @@ class CrossLayerTranscoder(BaseTranscoder):
                 local_dim_padded = decoder.local_in_features  # Padded local size
 
                 # Calculate start and end indices in the *full* dimension
-                start_idx = rank * local_dim_padded
-                end_idx_padded = start_idx + local_dim_padded
+                # Correct calculation using integer division based on full dimension
+                features_per_rank = (full_dim + self.world_size - 1) // self.world_size
+                start_idx = self.rank * features_per_rank
+                end_idx = min(start_idx + features_per_rank, full_dim)
+                actual_local_dim = max(0, end_idx - start_idx)
 
-                # The actual end index in the original dimension might be smaller
-                actual_end_idx = min(end_idx_padded, full_dim)
-                actual_local_dim = max(0, actual_end_idx - start_idx)
+                # Check if local padded size matches expected local dimension
+                # This is a sanity check for RowParallelLinear's partitioning logic
+                if local_dim_padded != features_per_rank and self.rank == self.world_size - 1:
+                    # The last rank might have fewer features if full_dim is not divisible by world_size
+                    # RowParallelLinear pads its weight, so local_dim_padded might be larger than actual_local_dim
+                    pass  # Padding is expected here
+                elif local_dim_padded != actual_local_dim and local_dim_padded != features_per_rank:
+                    logger.warning(
+                        f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for {decoder_key}. This might indicate an issue with RowParallelLinear partitioning."
+                    )
+                    # Proceed cautiously, but log the potential discrepancy
 
-                # If this rank has valid features for this layer
+                # If this rank has valid features for this layer (based on correct calculation)
                 if actual_local_dim > 0:
                     # The norms correspond to the first `actual_local_dim` columns of the weight
+                    # We slice the norms up to the *actual* number of features this rank owns, ignoring padding
                     valid_norms_sq = current_norms_sq[:actual_local_dim]
 
                     # Ensure shapes match before adding
                     if valid_norms_sq.shape[0] == actual_local_dim:
-                        global_slice = slice(start_idx, actual_end_idx)
+                        # Accumulate into the correct global slice determined by start_idx and end_idx
+                        global_slice = slice(start_idx, end_idx)
                         local_norms_sq_accum[global_slice] += valid_norms_sq
                     else:
                         # This should not happen with the slicing logic above
                         logger.warning(
-                            f"Rank {rank}: Shape mismatch in decoder norm calculation for {decoder_key}. "
+                            f"Rank {self.rank}: Shape mismatch in decoder norm calculation for {decoder_key}. "
                             f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
                         )
 

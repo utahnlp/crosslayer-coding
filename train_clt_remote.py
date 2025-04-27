@@ -349,10 +349,11 @@ def main():
         wandb_run_name = args.wandb_run_name
     else:
         # Construct the name based on the specified format
-        # Format: {width}-width-{batch_size}-batch-{slambda}-slambda-{sc}-sc
+        # Format: {width}-width-{batch_size}-batch-{lr}-lr-{slambda}-slambda-{sc}-sc
         wandb_run_name = (
             f"{args.num_features}-width-"
             f"{args.train_batch_size_tokens}-batch-"
+            f"{args.learning_rate:.1e}-lr-"  # Added learning rate
             f"{args.sparsity_lambda:.1e}-slambda-"  # Use scientific notation for lambda
             f"{args.sparsity_c:.1f}-sc"  # Use one decimal place for c
         )

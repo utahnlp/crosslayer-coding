@@ -107,9 +107,7 @@ class LocalActivationStore(ManifestActivationStore):
             logger.info(f"Manifest loaded from {path} ({len(data)} rows).")
             return data
         except ValueError as e:
-            logger.error(
-                f"Error reshaping manifest data from {path} (expected Nx2): {e}"
-            )
+            logger.error(f"Error reshaping manifest data from {path} (expected Nx2): {e}")
             return None
         except OSError as e:
             logger.error(f"Error reading manifest file {path}: {e}")
@@ -156,12 +154,19 @@ class LocalActivationStore(ManifestActivationStore):
 
         try:
             # --- Get layer keys dynamically --- #
-            # Sort to ensure consistent order across chunks/fetches
-            layer_keys = sorted([k for k in hf.keys() if k.startswith("layer_")])
+            # Use *numeric* sort so that layer_10, layer_11 come after layer_9
+            # This keeps the per-layer byte layout identical to the generator
+            # (`_write_chunk`) which iterates over integer-sorted `layer_ids`.
+            def _layer_sort_key(name: str) -> int:
+                try:
+                    return int(name.split("_")[1])
+                except (IndexError, ValueError):
+                    # Fallback – keep original string order if parsing fails
+                    return 1_000_000  # push unparsable names to the end
+
+            layer_keys = sorted([k for k in hf.keys() if k.startswith("layer_")], key=_layer_sort_key)
             if not layer_keys:
-                raise ValueError(
-                    f"No layer groups found in chunk {chunk_id} at {chunk_path}"
-                )
+                raise ValueError(f"No layer groups found in chunk {chunk_id} at {chunk_path}")
             if len(layer_keys) != self.num_layers:
                 logger.warning(
                     f"Chunk {chunk_id}: Number of layer groups ({len(layer_keys)}) doesn't match metadata ({self.num_layers}). Using layers found in chunk."
@@ -184,9 +189,7 @@ class LocalActivationStore(ManifestActivationStore):
                 layer_group = hf[lk]
                 # Check if datasets exist before accessing
                 if "inputs" not in layer_group or "targets" not in layer_group:
-                    raise KeyError(
-                        f"Missing 'inputs' or 'targets' dataset in layer group '{lk}' of chunk {chunk_id}"
-                    )
+                    raise KeyError(f"Missing 'inputs' or 'targets' dataset in layer group '{lk}' of chunk {chunk_id}")
 
                 # h5py fancy indexing with a sorted list/array is efficient
                 input_data = layer_group["inputs"][row_indices_h5, :]
@@ -202,9 +205,7 @@ class LocalActivationStore(ManifestActivationStore):
             return b"".join(bufs)
 
         except KeyError as e:
-            logger.error(
-                f"Error accessing data within chunk {chunk_id} at {chunk_path}: Missing key {e}"
-            )
+            logger.error(f"Error accessing data within chunk {chunk_id} at {chunk_path}: Missing key {e}")
             raise RuntimeError(f"Data structure error in HDF5 chunk {chunk_id}") from e
         except Exception as e:
             # Catch other potential h5py or numpy errors during data access/conversion
@@ -212,9 +213,7 @@ class LocalActivationStore(ManifestActivationStore):
                 f"Error processing data from chunk {chunk_id} at {chunk_path}: {e}",
                 exc_info=True,
             )
-            raise RuntimeError(
-                f"Failed to read data slice from chunk {chunk_id}"
-            ) from e
+            raise RuntimeError(f"Failed to read data slice from chunk {chunk_id}") from e
 
     # state_dict and load_state_dict are handled by the base class
     # __len__ is handled by the base class

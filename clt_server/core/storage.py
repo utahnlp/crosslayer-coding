@@ -110,7 +110,14 @@ async def slice_chunk(
         logger.error("Failed to open %s: %s", chunk_path, e)
         raise HTTPException(500, "Corrupt chunk file")
 
-    layer_keys = sorted(k for k in hf.keys() if k.startswith("layer_"))
+    # Sort layer keys numerically to ensure correct byte order
+    def _layer_sort_key(name: str) -> int:
+        try:
+            return int(name.split("_")[1])
+        except (IndexError, ValueError):
+            return 1_000_000  # Push unparsable names to the end
+
+    layer_keys = sorted([k for k in hf.keys() if k.startswith("layer_")], key=_layer_sort_key)
     if not layer_keys:
         raise HTTPException(500, "No layer groups in chunk")
 

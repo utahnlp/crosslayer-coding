@@ -96,7 +96,7 @@ print(clt_config)
 # --- Activation Generation Configuration ---
 # Define where activations will be stored and how they should be generated
 # Use a small number of target tokens for the tutorial
-activation_dir = "./tutorial_activations_local"
+activation_dir = "./tutorial_activations_local_1M"
 # Fix SyntaxError: remove parenthesis around string assignment
 dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
@@ -147,7 +147,7 @@ expected_activation_path = os.path.join(
 training_config = TrainingConfig(
     # Training loop parameters
     learning_rate=3e-4,
-    training_steps=1000,  # Reduced steps for tutorial
+    training_steps=100,  # Reduced steps for tutorial
     seed=42,  # Added seed for reproducibility
     # Activation source - use local manifest-based store
     activation_source="local_manifest",  # Changed from 'local'
@@ -171,7 +171,7 @@ training_config = TrainingConfig(
     dead_feature_window=200,  # Reduced window for tutorial
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-multi-gpu-test",
+    wandb_project="clt-tutorial",
     wandb_run_name="single-gpu-baseline",
     # Fields removed (now in ActivationConfig or implicitly handled):
     # model_name, model_dtype, mlp_*, dataset_*, streaming, context_size,
