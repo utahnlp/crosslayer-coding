@@ -63,6 +63,7 @@ class RemoteActivationStore(ManifestActivationStore):
         seed: int = 42,
         timeout: int = 60,
         sampling_strategy: str = "sequential",
+        normalization_method: str = "none",
     ):
         """
         Initializes the RemoteActivationStore.

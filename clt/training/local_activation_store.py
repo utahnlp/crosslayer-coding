@@ -42,6 +42,7 @@ class LocalActivationStore(ManifestActivationStore):
         world: int = 1,
         seed: int = 42,
         sampling_strategy: str = "sequential",
+        normalization_method: str = "none",
     ):
         """
         Initializes the LocalActivationStore.

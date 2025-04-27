@@ -125,7 +125,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 ColumnParallelLinear(
                     in_features=config.d_model,
                     out_features=config.num_features,
-                    bias=False,
+                    bias=True,
                     process_group=self.process_group,  # Pass potentially None group
                     device=self.device,  # Pass device
                 )

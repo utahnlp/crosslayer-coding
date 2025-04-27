@@ -146,8 +146,8 @@ expected_activation_path = os.path.join(
 
 training_config = TrainingConfig(
     # Training loop parameters
-    learning_rate=3e-4,
-    training_steps=100,  # Reduced steps for tutorial
+    learning_rate=1e-4,
+    training_steps=1000,  # Reduced steps for tutorial
     seed=42,  # Added seed for reproducibility
     # Activation source - use local manifest-based store
     activation_source="local_manifest",  # Changed from 'local'
@@ -155,6 +155,7 @@ training_config = TrainingConfig(
     activation_dtype="float32",  # Specify dtype for loading/training
     # Training batch size
     train_batch_size_tokens=1024,
+    sampling_strategy="random_chunk",
     # Normalization for training (use stored stats)
     normalization_method="auto",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
@@ -172,7 +173,7 @@ training_config = TrainingConfig(
     # WandB (Optional)
     enable_wandb=True,
     wandb_project="clt-tutorial",
-    wandb_run_name="single-gpu-baseline",
+    # wandb_run_name="single-gpu-baseline",
     # Fields removed (now in ActivationConfig or implicitly handled):
     # model_name, model_dtype, mlp_*, dataset_*, streaming, context_size,
     # inference_batch_size, prepend_bos, exclude_special_tokens, cache_path,

@@ -580,6 +580,7 @@ class CLTTrainer:
                 world=world,  # Use trainer's world size
                 seed=self.training_config.seed,
                 sampling_strategy=sampling_strategy,
+                normalization_method=self.training_config.normalization_method,
             )
             # Fix: Check instance type before accessing subclass-specific attributes
             if isinstance(store, LocalActivationStore):

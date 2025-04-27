@@ -269,6 +269,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         world: int = 1,
         seed: int = 42,
         sampling_strategy: str = "sequential",  # Added sampling strategy
+        normalization_method: str = "none",  # Added normalization method
     ):
         self.train_batch_size_tokens = train_batch_size_tokens  # From Base
         self.rank = rank
@@ -388,7 +389,10 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
         # --- Load Normalization Stats (optional, subclass responsibility) ---
         self.norm_stats_data = self._load_norm_stats()
-        self.apply_normalization = bool(self.norm_stats_data)
+        if normalization_method == "none":
+            self.apply_normalization = False
+        else:
+            self.apply_normalization = bool(self.norm_stats_data)
         if self.apply_normalization:
             self._prep_norm()
         else:

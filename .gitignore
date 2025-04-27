@@ -187,4 +187,8 @@ tutorials/tutorial_activations_local/
 temp_tutorial_server_data/
 tutorials/tutorial_activations_small/
 tutorials/tutorial_activations_local_1M/
+tutorials/tutorial_activations_local_1M_v2/
 tutorials/tutorial_activations_local_100k/
+tutorials/tutorial_activations_local_100k_v2/
+tutorials/tutorial_activations_local_1M_pythia/
+tutorials/tutorial_activations_local_100k_pythia/
