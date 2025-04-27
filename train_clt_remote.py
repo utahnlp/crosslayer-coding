@@ -208,6 +208,18 @@ def parse_args():
         help="Optimizer algorithm.",
     )
     train_group.add_argument(
+        "--optimizer-beta1",
+        type=float,
+        default=None,
+        help="Optimizer beta1 value (if using Adam/AdamW).",
+    )
+    train_group.add_argument(
+        "--optimizer-beta2",
+        type=float,
+        default=None,
+        help="Optimizer beta2 value (if using Adam/AdamW).",
+    )
+    train_group.add_argument(
         "--lr-scheduler",
         type=str,
         choices=["linear", "cosine", "linear_final20", "none"],
@@ -391,6 +403,8 @@ def main():
         preactivation_coef=args.preactivation_coef,
         # Optimizer & Scheduler
         optimizer=args.optimizer,
+        optimizer_beta1=args.optimizer_beta1,
+        optimizer_beta2=args.optimizer_beta2,
         lr_scheduler=lr_scheduler_arg,
         # Logging & Checkpointing
         log_interval=args.log_interval,

@@ -61,7 +61,13 @@ else:
 print(f"Using device: {device}")
 
 # Base model for activation extraction
-BASE_MODEL_NAME = "gpt2"  # Using GPT-2 small
+BASE_MODEL_NAME = "EleutherAI/pythia-70m"  # Using GPT-2 small
+# %%
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_NAME)
+
+print(model)
 
 # %% [markdown]
 # ## 2. Configuration
@@ -76,8 +82,8 @@ BASE_MODEL_NAME = "gpt2"  # Using GPT-2 small
 # %%
 # --- CLT Architecture Configuration ---
 # We need to match the base model's dimensions
-gpt2_num_layers = 12
-gpt2_d_model = 768
+gpt2_num_layers = 6
+gpt2_d_model = 512
 expansion_factor = 4
 
 # For the tutorial, let's use a smaller number of features than d_model
@@ -96,14 +102,14 @@ print(clt_config)
 # --- Activation Generation Configuration ---
 # Define where activations will be stored and how they should be generated
 # Use a small number of target tokens for the tutorial
-activation_dir = "./tutorial_activations_local_1M"
+activation_dir = "./tutorial_activations_local_1M_pythia"
 # Fix SyntaxError: remove parenthesis around string assignment
 dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
-    mlp_input_module_path_template="transformer.h.{}.ln_2.input",  # We include the layernorm for linearity
-    mlp_output_module_path_template="transformer.h.{}.mlp.output",  # Default for GPT2
+    mlp_input_module_path_template="gpt_neox.layers.{}.mlp.input",  # We include the layernorm for linearity
+    mlp_output_module_path_template="gpt_neox.layers.{}.mlp.output",  # Default for GPT2
     model_dtype=None,  # Use default precision
     # Dataset Source
     dataset_path=dataset_name,
@@ -144,9 +150,25 @@ expected_activation_path = os.path.join(
     f"{os.path.basename(activation_config.dataset_path)}_{activation_config.dataset_split}",
 )
 
+# --- Determine WandB Run Name (using config values) ---
+# Values needed for the name (replace with actual config values if different)
+_lr = 1e-4
+_batch_size = 1024
+_sparsity_lambda = 0.0001
+_sparsity_c = 1.0
+
+wdb_run_name = (
+    f"{clt_config.num_features}-width-"
+    f"{_batch_size}-batch-"
+    f"{_lr:.1e}-lr-"
+    f"{_sparsity_lambda:.1e}-slambda-"
+    f"{_sparsity_c:.1f}-sc"
+)
+print(f"\nGenerated WandB run name: {wdb_run_name}")
+
 training_config = TrainingConfig(
     # Training loop parameters
-    learning_rate=1e-4,
+    learning_rate=_lr,
     training_steps=1000,  # Reduced steps for tutorial
     seed=42,  # Added seed for reproducibility
     # Activation source - use local manifest-based store
@@ -154,17 +176,18 @@ training_config = TrainingConfig(
     activation_path=expected_activation_path,  # Point to generated data directory
     activation_dtype="float32",  # Specify dtype for loading/training
     # Training batch size
-    train_batch_size_tokens=1024,
+    train_batch_size_tokens=_batch_size,
     sampling_strategy="random_chunk",
     # Normalization for training (use stored stats)
     normalization_method="auto",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
-    sparsity_lambda=0.00001,
-    sparsity_c=1.0,
+    sparsity_lambda=_sparsity_lambda,
+    sparsity_c=_sparsity_c,
     preactivation_coef=3e-6,
     # Optimizer & Scheduler
     optimizer="adamw",
     lr_scheduler="linear",
+    optimizer_beta2=0.98,
     # Logging & Checkpointing
     log_interval=10,
     eval_interval=50,
@@ -172,8 +195,8 @@ training_config = TrainingConfig(
     dead_feature_window=200,  # Reduced window for tutorial
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-tutorial",
-    # wandb_run_name="single-gpu-baseline",
+    wandb_project="clt-tutorial-pythia",
+    wandb_run_name=wdb_run_name,  # Use the generated name
     # Fields removed (now in ActivationConfig or implicitly handled):
     # model_name, model_dtype, mlp_*, dataset_*, streaming, context_size,
     # inference_batch_size, prepend_bos, exclude_special_tokens, cache_path,

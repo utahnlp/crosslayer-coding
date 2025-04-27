@@ -16,15 +16,11 @@ from clt.config.data_config import ActivationConfig  # Import ActivationConfig
 
 def parse_arguments():
     """Parse command-line arguments for activation generation."""
-    parser = argparse.ArgumentParser(
-        description="Generate and save model activations using ActivationConfig."
-    )
+    parser = argparse.ArgumentParser(description="Generate and save model activations using ActivationConfig.")
 
     # Arguments map directly to ActivationConfig fields
     # --- Model Source ---
-    parser.add_argument(
-        "--model_name", type=str, required=True, help="Model name or path."
-    )
+    parser.add_argument("--model_name", type=str, required=True, help="Model name or path.")
     parser.add_argument(
         "--mlp_input_template",
         type=str,
@@ -45,12 +41,8 @@ def parse_arguments():
     )
 
     # --- Dataset Source ---
-    parser.add_argument(
-        "--dataset_path", type=str, required=True, help="Dataset name or path."
-    )
-    parser.add_argument(
-        "--dataset_split", type=str, default="train", help="Dataset split."
-    )
+    parser.add_argument("--dataset_path", type=str, required=True, help="Dataset name or path.")
+    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split.")
     parser.add_argument(
         "--dataset_text_column",
         type=str,
@@ -65,9 +57,7 @@ def parse_arguments():
         default=128,
         help="Context size for tokenization/inference.",
     )
-    parser.add_argument(
-        "--inference_batch_size", type=int, default=512, help="Inference batch size."
-    )
+    parser.add_argument("--inference_batch_size", type=int, default=512, help="Inference batch size.")
     parser.add_argument(
         "--exclude_special_tokens",
         action=argparse.BooleanOptionalAction,
@@ -94,9 +84,7 @@ def parse_arguments():
         default=False,
         help="Trust remote code for dataset.",
     )
-    parser.add_argument(
-        "--cache_path", type=str, default=None, help="Optional HF dataset cache path."
-    )
+    parser.add_argument("--cache_path", type=str, default=None, help="Optional HF dataset cache path.")
 
     # --- Generation Output Control ---
     parser.add_argument(
@@ -105,9 +93,7 @@ def parse_arguments():
         default=None,
         help="Target number of tokens to generate.",
     )
-    parser.add_argument(
-        "--max_samples", type=int, default=None, help="Max dataset samples to process."
-    )
+    parser.add_argument("--max_samples", type=int, default=None, help="Max dataset samples to process.")
 
     # --- Storage Parameters ---
     parser.add_argument(
@@ -211,11 +197,10 @@ def main():
         dataset_trust_remote_code=args.trust_remote_code,
         cache_path=args.cache_path,
         target_total_tokens=args.target_total_tokens,
-        max_samples=args.max_samples,
         activation_dir=args.activation_dir,
         output_format=args.output_format,
         compression=compression_algo,
-        chunk_size_tokens=args.chunk_size_tokens,
+        chunk_token_threshold=args.chunk_token_threshold,
         compute_norm_stats=args.compute_norm_stats,
         nnsight_tracer_kwargs=nnsight_tracer_kwargs,
         nnsight_invoker_args=nnsight_invoker_args,
@@ -223,7 +208,7 @@ def main():
 
     # Instantiate the generator, passing the config and optional device override
     generator = ActivationGenerator(
-        activation_config=activation_config,
+        cfg=activation_config,  # Use 'cfg' parameter name
         device=args.device,  # Pass device separately
     )
 
