@@ -346,10 +346,24 @@ class CLTTrainer:
         )
 
         # Initialize optimizer - works on local parameters
+        # Explicitly type the kwargs dict for clarity and linting
+        optimizer_kwargs: Dict[str, Any] = {"lr": training_config.learning_rate}
+        beta1 = training_config.optimizer_beta1  # Could be None
+        beta2 = training_config.optimizer_beta2  # Could be None
+
+        # Only add 'betas' if at least one is specified
+        if beta1 is not None or beta2 is not None:
+            # Get defaults if one is None
+            # Default Adam/AdamW betas are (0.9, 0.999)
+            final_beta1 = beta1 if beta1 is not None else 0.9
+            final_beta2 = beta2 if beta2 is not None else 0.999
+            optimizer_kwargs["betas"] = (final_beta1, final_beta2)
+            logger.info(f"Rank {self.rank}: Using optimizer betas: ({final_beta1}, {final_beta2})")
+
         if training_config.optimizer == "adam":
-            self.optimizer: Any = optim.Adam(self.model.parameters(), lr=training_config.learning_rate)
+            self.optimizer: Any = optim.Adam(self.model.parameters(), **optimizer_kwargs)
         else:  # "adamw"
-            self.optimizer = optim.AdamW(self.model.parameters(), lr=training_config.learning_rate)
+            self.optimizer = optim.AdamW(self.model.parameters(), **optimizer_kwargs)
 
         # Initialize scheduler
         self.scheduler: Optional[Any] = None
@@ -488,6 +502,7 @@ class CLTTrainer:
             Configured instance of a BaseActivationStore subclass.
         """
         activation_source = self.training_config.activation_source
+        sampling_strategy = self.training_config.sampling_strategy
 
         shard_data = False  # add a flag if you like
         row_rank = 0 if shard_data is False else self.rank
@@ -578,6 +593,8 @@ class CLTTrainer:
                 rank=rank,  # Use trainer's rank
                 world=world,  # Use trainer's world size
                 seed=self.training_config.seed,
+                sampling_strategy=sampling_strategy,
+                normalization_method=self.training_config.normalization_method,
             )
             # Fix: Check instance type before accessing subclass-specific attributes
             if isinstance(store, LocalActivationStore):
@@ -608,6 +625,7 @@ class CLTTrainer:
                 world=world,  # Use trainer's world size
                 seed=self.training_config.seed,
                 timeout=remote_cfg.get("timeout", 60),
+                sampling_strategy=sampling_strategy,
             )
             # Fix: Check instance type before accessing subclass-specific attributes
             if isinstance(store, RemoteActivationStore):

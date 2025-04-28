@@ -100,15 +100,15 @@ else:
 print(f"Using device: {device}")
 
 # --- Server Configuration --- #
-SERVER_HOST = "34.41.125.189"  # Run on local server for now
-SERVER_PORT = 8000  # Use a different port than default 8000 just in case
+SERVER_HOST = "34.41.125.189"
+SERVER_PORT = 8000
 SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 HEALTH_CHECK_URL = urljoin(SERVER_URL, "/api/v1/health")
 # Ensure server uses a temporary directory for this tutorial
 SERVER_STORAGE_DIR = os.path.join(project_root, "temp_tutorial_server_data")
 
 # --- Base Model --- #
-BASE_MODEL_NAME = "gpt2"  # Using GPT-2 small
+BASE_MODEL_NAME = "EleutherAI/pythia-70m"  # Using GPT-2 small
 
 server_process = None  # Global variable to hold the server process
 
@@ -124,8 +124,8 @@ server_process = None  # Global variable to hold the server process
 # %%
 # --- CLT Architecture Configuration ---
 # (Same as Tutorial 1 for simplicity)
-gpt2_num_layers = 12
-gpt2_d_model = 768
+gpt2_num_layers = 6
+gpt2_d_model = 512
 expansion_factor = 4  # Use smaller expansion factor for speed
 
 clt_num_features = gpt2_d_model * expansion_factor
@@ -144,8 +144,8 @@ dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller 
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
-    mlp_input_module_path_template="transformer.h.{}.ln_2.input",
-    mlp_output_module_path_template="transformer.h.{}.mlp.output",
+    mlp_input_module_path_template="gpt_neox.layers.{}.mlp.input",
+    mlp_output_module_path_template="gpt_neox.layers.{}.mlp.output",
     # Dataset Source
     dataset_path=dataset_name,
     dataset_split="train",
@@ -179,46 +179,6 @@ print(activation_config)
 # --- Training Configuration (Remote) ---
 # Construct the dataset_id used by the server/generator
 dataset_id = f"{activation_config.model_name}/{os.path.basename(activation_config.dataset_path)}_{activation_config.dataset_split}"
-
-training_config = TrainingConfig(
-    # Training loop parameters
-    learning_rate=1e-4,
-    training_steps=1000,  # Very few steps for tutorial
-    train_batch_size_tokens=1024,
-    gradient_clip_val=1.0,
-    # >> Key change: Activation source is remote <<
-    activation_source="remote",
-    # >> Key change: Provide remote config <<
-    remote_config={
-        "server_url": SERVER_URL,
-        "dataset_id": dataset_id,  # Match generator output
-        # Added timeout parameters for remote connections
-        "timeout": 120,  # 2 minutes timeout for batch fetching
-        "max_retries": 3,  # Number of retries for failed batch fetches
-        "prefetch_batches": 16,  # Prefetch more batches to handle potential timeouts
-    },
-    # Normalization (Remote store handles fetching based on 'auto')
-    normalization_method="auto",
-    activation_dtype="float32",
-    # Loss function coefficients
-    sparsity_lambda=0.00001,
-    sparsity_c=1.0,
-    preactivation_coef=3e-6,
-    # Optimizer & Scheduler
-    optimizer="adamw",
-    lr_scheduler="cosine",
-    lr_scheduler_params={"eta_min": 1e-4},
-    # Logging & Checkpointing
-    log_interval=10,
-    eval_interval=50,
-    checkpoint_interval=100,
-    dead_feature_window=200,
-    # WandB (Optional)
-    enable_wandb=True,
-    wandb_project="clt-tutorial",
-)
-print("\nTraining Configuration (Remote):")
-print(training_config)
 
 # %% [markdown]
 # ## 3. Preliminary Health Check (Optional)

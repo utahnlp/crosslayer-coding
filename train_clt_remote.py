@@ -208,6 +208,18 @@ def parse_args():
         help="Optimizer algorithm.",
     )
     train_group.add_argument(
+        "--optimizer-beta1",
+        type=float,
+        default=None,
+        help="Optimizer beta1 value (if using Adam/AdamW).",
+    )
+    train_group.add_argument(
+        "--optimizer-beta2",
+        type=float,
+        default=None,
+        help="Optimizer beta2 value (if using Adam/AdamW).",
+    )
+    train_group.add_argument(
         "--lr-scheduler",
         type=str,
         choices=["linear", "cosine", "linear_final20", "none"],
@@ -234,6 +246,16 @@ def parse_args():
         type=int,
         default=1000,
         help="Number of steps of inactivity before a feature is considered 'dead' for evaluation.",
+    )
+
+    # --- Sampling Strategy --- Added Group
+    sampling_group = parser.add_argument_group("Sampling Strategy (TrainingConfig)")
+    sampling_group.add_argument(
+        "--sampling-strategy",
+        type=str,
+        choices=["sequential", "random_chunk"],
+        default="sequential",
+        help="Sampling strategy: 'sequential' processes chunks in order per epoch, 'random_chunk' picks a random valid chunk each step.",
     )
 
     # --- Logging & Checkpointing ---
@@ -373,12 +395,16 @@ def main():
         # Removed activation_path
         # Normalization
         normalization_method=args.normalization_method,
+        # Sampling Strategy
+        sampling_strategy=args.sampling_strategy,
         # Loss Coeffs
         sparsity_lambda=args.sparsity_lambda,
         sparsity_c=args.sparsity_c,
         preactivation_coef=args.preactivation_coef,
         # Optimizer & Scheduler
         optimizer=args.optimizer,
+        optimizer_beta1=args.optimizer_beta1,
+        optimizer_beta2=args.optimizer_beta2,
         lr_scheduler=lr_scheduler_arg,
         # Logging & Checkpointing
         log_interval=args.log_interval,

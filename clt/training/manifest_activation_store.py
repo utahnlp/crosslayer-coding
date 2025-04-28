@@ -36,9 +36,17 @@ ActivationBatch = Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]
 # ---------------------------------------------------------------------------
 class ChunkRowSampler(Sampler):
     """
-    Shuffle chunk order each epoch; inside each chunk iterate rows
-    sequentially (already random due to shuffle at generation).
-    Strides by GPU rank so there is no overlap. Yields (chunk_id, row_id) pairs.
+    Samples (chunk_id, row_id) pairs for deterministic, sharded iteration.
+
+    Supports two strategies:
+    1. 'sequential' (default): Shuffles chunk order each epoch; iterates rows sequentially
+       within each chunk (rows are already random due to generation shuffling).
+    2. 'random_chunk': Selects a random chunk for each batch from chunks that still
+       have unused rows for the current rank in the current epoch. Rows within
+       a chunk are yielded in a pre-shuffled order for that epoch.
+
+    Strides by GPU rank so there is no overlap. Yields (batch, 2) numpy arrays
+    containing [chunk_id, row_id].
     """
 
     def __init__(
@@ -50,6 +58,7 @@ class ChunkRowSampler(Sampler):
         epoch: int,
         rank: int,
         world: int,
+        sampling_strategy: str = "sequential",  # Added sampling strategy
     ):
         # Handle chunk_sizes as either a dict mapping chunk_id → size or an array of sizes
         if isinstance(chunk_sizes, dict):
@@ -65,6 +74,13 @@ class ChunkRowSampler(Sampler):
         self.seed = seed
         self.epoch = epoch
 
+        # Added: Validate and store sampling strategy
+        if sampling_strategy not in ["sequential", "random_chunk"]:
+            raise ValueError(
+                f"Invalid sampling_strategy: '{sampling_strategy}'. Must be 'sequential' or 'random_chunk'."
+            )
+        self.sampling_strategy = sampling_strategy
+
         if not self.chunk_sizes:
             raise ValueError("chunk_sizes cannot be empty")
         if self.batch <= 0:
@@ -72,37 +88,65 @@ class ChunkRowSampler(Sampler):
         if not (0 <= self.rank < self.world):
             raise ValueError(f"Invalid rank/world: {rank}/{world}")
 
-        # Initialize generator here to set chunk_order for the first epoch
+        # Initialize generator here to set state for the first epoch
         self._reset_generator()
 
     def _reset_generator(self):
-        """Resets the numpy random generator and shuffles chunk order for a new epoch."""
-        rng = np.random.default_rng(self.seed + self.epoch)
-        self.chunk_order = rng.permutation(self.num_chunks)
+        """Resets the numpy random generator and internal state for a new epoch."""
+        self.rng = np.random.default_rng(self.seed + self.epoch)  # Use instance RNG
 
-        # Create chunk_id → row_ids mapping for each chunk
-        self.rows_by_chunk = {}
+        # --- State common to both strategies ---
+        # Create chunk_id → row_ids mapping for each chunk FOR THIS RANK
+        self.rows_by_chunk_for_epoch: Dict[int, np.ndarray] = {}
         for chunk_id, chunk_size in self.chunk_sizes.items():
             if chunk_id >= self.num_chunks:
-                continue  # Skip if chunk_id is beyond what we consider in this epoch
+                continue  # Skip chunks beyond considered range
 
-            # For each chunk, get the subset of rows assigned to this rank
+            # Get rows assigned to this rank
             chunk_rows = np.arange(chunk_size, dtype=np.uint32)
-            self.rows_by_chunk[chunk_id] = chunk_rows[self.rank :: self.world]
+            rows_for_rank = chunk_rows[self.rank :: self.world]
+            # Shuffle rows *within* the chunk for this rank for the epoch
+            self.rng.shuffle(rows_for_rank)
+            self.rows_by_chunk_for_epoch[chunk_id] = rows_for_rank
 
-        # Count total rows across all chunks for this rank
-        total_rows = sum(len(rows) for rows in self.rows_by_chunk.values())
-        self.total_batches_this_rank = total_rows // self.batch
+        # Count total rows across all chunks for this rank (used for __len__)
+        self.total_rows_this_rank = sum(len(rows) for rows in self.rows_by_chunk_for_epoch.values())
+        self.total_batches_this_rank = self.total_rows_this_rank // self.batch
 
-        self.current_chunk_idx_in_order = 0
-        self.current_row_offset = 0
+        # --- Strategy-specific state reset ---
+        if self.sampling_strategy == "sequential":
+            # Shuffle chunk order for sequential iteration
+            self.chunk_order = self.rng.permutation(
+                # Only shuffle chunks that actually have rows for this rank
+                [cid for cid, rows in self.rows_by_chunk_for_epoch.items() if len(rows) > 0]
+            )
+            self.current_chunk_idx_in_order = 0
+            self.current_row_offset_in_chunk = 0
+        elif self.sampling_strategy == "random_chunk":
+            # Track next starting row offset for each chunk independently
+            self.next_row_offset_by_chunk = {chunk_id: 0 for chunk_id in self.rows_by_chunk_for_epoch}
+            self.batches_yielded_this_epoch = 0
 
     def __iter__(self):
-        self.current_chunk_idx_in_order = 0
-        self.current_row_offset = 0
+        # Reset iteration state based on strategy
+        if self.sampling_strategy == "sequential":
+            self.current_chunk_idx_in_order = 0
+            self.current_row_offset_in_chunk = 0
+        elif self.sampling_strategy == "random_chunk":
+            self.batches_yielded_this_epoch = 0
         return self
 
     def __next__(self):
+        if self.sampling_strategy == "sequential":
+            return self._next_sequential()
+        elif self.sampling_strategy == "random_chunk":
+            return self._next_random_chunk()
+        else:
+            # Should not happen due to validation in __init__
+            raise RuntimeError(f"Internal Error: Unknown sampling strategy '{self.sampling_strategy}'")
+
+    def _next_sequential(self):
+        """Get the next batch using the sequential chunk strategy."""
         if self.current_chunk_idx_in_order >= len(self.chunk_order):
             # End of epoch reached
             raise StopIteration
@@ -110,26 +154,29 @@ class ChunkRowSampler(Sampler):
         # Get the actual chunk ID for this step
         current_chunk_id = self.chunk_order[self.current_chunk_idx_in_order]
 
-        # Chunk doesn't exist or has no rows assigned to this rank?
-        if current_chunk_id not in self.rows_by_chunk or not len(self.rows_by_chunk[current_chunk_id]):
-            # Skip to next chunk and try again
-            self.current_chunk_idx_in_order += 1
-            self.current_row_offset = 0
-            return self.__next__()
+        # This check should be redundant now as chunk_order only includes valid chunks
+        # if current_chunk_id not in self.rows_by_chunk_for_epoch:
+        #     # This should ideally not happen if chunk_order is built correctly
+        #     self.current_chunk_idx_in_order += 1
+        #     self.current_row_offset_in_chunk = 0
+        #     return self._next_sequential() # Try next
 
-        # Get the rows for this chunk assigned to this rank
-        rows_for_this_chunk = self.rows_by_chunk[current_chunk_id]
+        # Get the pre-shuffled rows for this chunk assigned to this rank for this epoch
+        rows_for_this_chunk = self.rows_by_chunk_for_epoch[current_chunk_id]
 
-        # Determine batch slice
-        start_row_offset = self.current_row_offset
+        # Determine batch slice start/end within the current chunk
+        start_row_offset = self.current_row_offset_in_chunk
         end_row_offset = min(start_row_offset + self.batch, len(rows_for_this_chunk))
-        batch_rows = rows_for_this_chunk[start_row_offset:end_row_offset]
 
-        # If we didn't get enough rows for a full batch, move to next chunk
-        if len(batch_rows) < self.batch:
+        # Check if we have enough rows left in *this chunk* for a full batch
+        if (end_row_offset - start_row_offset) < self.batch:
+            # Not enough rows left in this chunk for a full batch, move to the next chunk
             self.current_chunk_idx_in_order += 1
-            self.current_row_offset = 0
-            return self.__next__()  # Try next chunk
+            self.current_row_offset_in_chunk = 0
+            return self._next_sequential()  # Try next chunk
+
+        # We have a full batch from this chunk
+        batch_rows = rows_for_this_chunk[start_row_offset:end_row_offset]
 
         # Prepare output: (batch, 2) numpy array [chunk_id, row_id]
         batch_output = np.stack(
@@ -137,28 +184,66 @@ class ChunkRowSampler(Sampler):
             axis=1,
         )
 
-        # Update offset for the next batch within the current chunk
-        if end_row_offset >= len(rows_for_this_chunk):
+        # Update offset for the next potential batch within the current chunk
+        self.current_row_offset_in_chunk = end_row_offset
+
+        # If we've exhausted rows in the current chunk, move to the next chunk index for the *next* call
+        if self.current_row_offset_in_chunk >= len(rows_for_this_chunk):
             self.current_chunk_idx_in_order += 1
-            self.current_row_offset = 0
-        else:
-            self.current_row_offset = end_row_offset
+            self.current_row_offset_in_chunk = 0  # Reset row offset for the new chunk
+
+        return batch_output
+
+    def _next_random_chunk(self):
+        """Get the next batch using the random chunk strategy."""
+        if self.batches_yielded_this_epoch >= self.total_batches_this_rank:
+            raise StopIteration  # Epoch complete
+
+        # Find chunks that have enough remaining rows for a full batch for this rank
+        available_chunks = [
+            chunk_id
+            for chunk_id, rows in self.rows_by_chunk_for_epoch.items()
+            if self.next_row_offset_by_chunk[chunk_id] + self.batch <= len(rows)
+        ]
+
+        if not available_chunks:
+            # No single chunk has enough rows left for a full batch.
+            # This indicates the end of the epoch based on full batches.
+            # Note: Some rows might remain unused if total_rows % batch != 0.
+            raise StopIteration
+
+        # Randomly select one of the available chunks
+        selected_chunk_id = self.rng.choice(available_chunks)
+
+        # Get the rows and current offset for the selected chunk
+        rows_for_selected_chunk = self.rows_by_chunk_for_epoch[selected_chunk_id]
+        start_offset = self.next_row_offset_by_chunk[selected_chunk_id]
+        end_offset = start_offset + self.batch
+
+        # Extract the batch rows (already shuffled during _reset_generator)
+        batch_rows = rows_for_selected_chunk[start_offset:end_offset]
+
+        # Update the offset for the selected chunk for the next time it's picked
+        self.next_row_offset_by_chunk[selected_chunk_id] = end_offset
+
+        # Prepare output
+        batch_output = np.stack(
+            [np.full(len(batch_rows), selected_chunk_id, dtype=np.uint32), batch_rows],
+            axis=1,
+        )
+
+        # Increment the count of batches yielded this epoch
+        self.batches_yielded_this_epoch += 1
 
         return batch_output
 
     def __len__(self):
-        """Return the total number of batches this rank will process in an epoch."""
-        # Count total valid rows for this rank across all chunks
-        total_rows = 0
-        for chunk_id, rows in self.rows_by_chunk.items():
-            if chunk_id < self.num_chunks:  # Only consider chunks in our range
-                total_rows += len(rows)
-
-        # Calculate batches (integer division drops partial batches)
-        return total_rows // self.batch
+        """Return the total number of *full* batches this rank will process in an epoch."""
+        # Calculation remains the same regardless of strategy
+        return self.total_batches_this_rank
 
     def set_epoch(self, epoch: int):
-        """Sets the epoch for this sampler, resetting the RNG and chunk order."""
+        """Sets the epoch for this sampler, resetting the RNG and internal state."""
         self.epoch = epoch
         self._reset_generator()
 
@@ -183,12 +268,16 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         rank: int = 0,
         world: int = 1,
         seed: int = 42,
+        sampling_strategy: str = "sequential",  # Added sampling strategy
+        normalization_method: str = "none",  # Added normalization method
     ):
         self.train_batch_size_tokens = train_batch_size_tokens  # From Base
         self.rank = rank
         self.world = world
         self.seed = seed
         self.epoch = 0  # Initial epoch
+        # Added: Store sampling strategy
+        self.sampling_strategy = sampling_strategy
 
         # Device setup
         _device_input = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -300,7 +389,10 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
         # --- Load Normalization Stats (optional, subclass responsibility) ---
         self.norm_stats_data = self._load_norm_stats()
-        self.apply_normalization = bool(self.norm_stats_data)
+        if normalization_method == "none":
+            self.apply_normalization = False
+        else:
+            self.apply_normalization = bool(self.norm_stats_data)
         if self.apply_normalization:
             self._prep_norm()
         else:
@@ -311,6 +403,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             self.std_tg: Dict[int, torch.Tensor] = {}
 
         # --- Setup Sampler ---
+        # Pass the sampling_strategy to the sampler
         self.sampler = ChunkRowSampler(
             chunk_sizes=self.chunk_sizes,
             num_chunks=self.num_chunks,
@@ -319,6 +412,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             epoch=self.epoch,
             rank=self.rank,
             world=self.world,
+            sampling_strategy=self.sampling_strategy,  # Pass the strategy
         )
         self.sampler_iter = iter(self.sampler)
 
@@ -648,6 +742,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             "store_type": self.__class__.__name__,  # Include specific type
             "epoch": self.epoch,
             "seed": self.seed,
+            "sampling_strategy": self.sampling_strategy,
             # Sampler state (chunk order, position) is implicitly restored
             # by re-initializing ChunkRowSampler with the saved epoch and seed.
         }
@@ -661,6 +756,8 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
         loaded_epoch = int(state_dict.get("epoch", 0))
         loaded_seed = int(state_dict.get("seed", self.seed))
+        # --> Added: Load sampling strategy, default to sequential if missing <--
+        loaded_strategy = state_dict.get("sampling_strategy", "sequential")
 
         if loaded_seed != self.seed:
             logger.warning(
@@ -669,9 +766,18 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             self.seed = loaded_seed  # Update own seed to match loaded state
 
         self.epoch = loaded_epoch
+        # --> Added: Update own strategy to match loaded state <--
+        # Check if the loaded strategy is different and log a warning maybe?
+        if loaded_strategy != self.sampling_strategy:
+            logger.warning(
+                f"Loading state with different sampling strategy ('{loaded_strategy}') than current ('{self.sampling_strategy}'). Using loaded strategy."
+            )
+            self.sampling_strategy = loaded_strategy
 
-        # Re‑create sampler iterator starting from the loaded epoch
-        logger.info(f"Resetting sampler to epoch {self.epoch} with seed {self.seed}.")
+        # Re‑create sampler iterator starting from the loaded epoch, seed, and strategy
+        logger.info(
+            f"Resetting sampler to epoch {self.epoch} with seed {self.seed} and strategy '{self.sampling_strategy}'."
+        )
         self.sampler = ChunkRowSampler(
             chunk_sizes=self.chunk_sizes,
             num_chunks=self.num_chunks,
@@ -680,6 +786,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             epoch=self.epoch,
             rank=self.rank,
             world=self.world,
+            sampling_strategy=self.sampling_strategy,  # Use loaded/updated strategy
         )
         self.sampler_iter = iter(self.sampler)
 

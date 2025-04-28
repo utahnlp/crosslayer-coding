@@ -55,6 +55,9 @@ class TrainingConfig:
     remote_config: Optional[Dict[str, Any]] = None  # Dict with server_url, dataset_id, etc.
     # --- End Activation Store Source --- #
 
+    # Sampling strategy for manifest-based stores
+    sampling_strategy: Literal["sequential", "random_chunk"] = "sequential"
+
     # Loss function coefficients
     sparsity_lambda: float = 1e-3  # Coefficient for sparsity penalty
     sparsity_c: float = 1.0  # Parameter affecting sparsity penalty shape
@@ -62,6 +65,8 @@ class TrainingConfig:
 
     # Optimizer parameters
     optimizer: Literal["adam", "adamw"] = "adamw"
+    optimizer_beta1: Optional[float] = None  # Beta1 for Adam/AdamW (default: 0.9)
+    optimizer_beta2: Optional[float] = None  # Beta2 for Adam/AdamW (default: 0.999)
     # Learning rate scheduler type. "linear_final20" keeps LR constant for the first 80% of
     # training and then linearly decays it to 0 for the final 20% (configurable via lr_scheduler_params).
     lr_scheduler: Optional[Literal["linear", "cosine", "linear_final20"]] = "linear"
@@ -113,3 +118,9 @@ class TrainingConfig:
             assert (
                 "server_url" in self.remote_config and "dataset_id" in self.remote_config
             ), "remote_config must contain 'server_url' and 'dataset_id'"
+
+        # Validate sampling strategy
+        assert self.sampling_strategy in [
+            "sequential",
+            "random_chunk",
+        ], "sampling_strategy must be 'sequential' or 'random_chunk'"

@@ -125,7 +125,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 ColumnParallelLinear(
                     in_features=config.d_model,
                     out_features=config.num_features,
-                    bias=False,
+                    bias=True,
                     process_group=self.process_group,  # Pass potentially None group
                     device=self.device,  # Pass device
                 )
@@ -139,7 +139,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 f"{src_layer}->{tgt_layer}": RowParallelLinear(
                     in_features=config.num_features,  # Full feature dim
                     out_features=config.d_model,
-                    bias=False,
+                    bias=True,
                     process_group=self.process_group,  # Pass potentially None group
                     input_is_parallel=False,  # Decoder receives full activation, splits internally
                     # Pass model dims needed for init
