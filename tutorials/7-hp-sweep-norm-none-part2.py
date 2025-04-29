@@ -28,6 +28,7 @@ import time
 import sys
 import traceback
 import copy
+import requests  # Ensure requests is imported - Removed as server check is goneß
 from transformers import AutoModelForCausalLM  # Moved import
 
 # import requests  # Ensure requests is imported - Removed as server check is gone

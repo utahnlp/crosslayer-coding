@@ -30,7 +30,7 @@ import traceback
 import copy
 from transformers import AutoModelForCausalLM  # Moved import
 
-# import requests  # Ensure requests is imported - Removed as server check is gone
+import requests  # Ensure requests is imported - Removed as server check is gone
 import shutil  # Import shutil for directory removal
 
 # Import components from the clt library
