@@ -167,7 +167,7 @@ base_training_config = TrainingConfig(
     checkpoint_interval=100,
     dead_feature_window=200,
     enable_wandb=True,
-    wandb_project="clt-hp-sweeps-gpt2-norm-auto",  # Specific project for gpt2 norm=auto
+    wandb_project="clt-hp-sweeps-gpt2",  # Specific project for gpt2 norm=auto
     wandb_run_name="placeholder-run-name",  # Will be set in loop
 )
 print("\nBase Training Configuration (Normalization=Auto, Source=Remote):")
