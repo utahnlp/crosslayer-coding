@@ -90,7 +90,7 @@ print(model)
 # --- CLT Architecture Configuration ---
 gpt2_num_layers = 12
 gpt2_d_model = 768
-expansion_factor = 4
+expansion_factor = 32
 clt_num_features = gpt2_d_model * expansion_factor
 clt_config = CLTConfig(
     num_features=clt_num_features,
