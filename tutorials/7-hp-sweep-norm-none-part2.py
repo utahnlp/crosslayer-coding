@@ -1,16 +1,18 @@
 # %% [markdown]
-# # Tutorial 7: GPT-2 Hyperparameter Sweep (Norm=None, Part 2)
+# # Tutorial 7: GPT-2 Hyperparameter Sweep (Remote, Norm=None, Part 2)
 #
-# This tutorial demonstrates splitting a hyperparameter sweep across multiple scripts.
+# This tutorial demonstrates splitting a hyperparameter sweep across multiple scripts,
+# fetching activations from a remote server.
 # This script focuses on training GPT-2 CLTs with `normalization_method="none"` and the second
 # half of the `sparsity_c` values.
 #
-# It assumes activations have already been generated (norm stats are not required).
+# It assumes activations for 'gpt2/pile-uncopyrighted_train' are available on the server
+# at http://34.41.125.189:8000.
 #
 # We will:
-# 1. Configure CLT, Activation (reference), and Training parameters (setting norm="none").
+# 1. Configure CLT and Training parameters (setting norm="none", source="remote").
 # 2. Define the second subset of hyperparameters.
-# 3. Configure the trainer to use locally stored activations via manifest.
+# 3. Configure the trainer to use the `RemoteActivationStore`.
 # 4. Train CLT models for the assigned hyperparameter subset.
 # 5. Save the trained CLT models.
 
@@ -27,6 +29,7 @@ import sys
 import traceback
 import copy
 from transformers import AutoModelForCausalLM  # Moved import
+import requests  # Ensure requests is imported
 
 # Import components from the clt library
 # (Ensure the 'clt' directory is in your Python path or installed)
@@ -114,26 +117,34 @@ print("\nReference Activation Generation Configuration (Assumed):")
 print(activation_config)
 
 # --- Base Training Configuration ---
-expected_activation_path = os.path.join(
-    activation_config.activation_dir,
-    activation_config.model_name,
-    f"{os.path.basename(activation_config.dataset_path)}_{activation_config.dataset_split}",
-)
+# Define dataset ID expected on the server
+dataset_id = f"{activation_config.model_name.replace('/', '_')}/{os.path.basename(activation_config.dataset_path)}_{activation_config.dataset_split}"
+print(f"Expecting dataset_id on server: {dataset_id}")
 
 _lr = 1e-4
 _batch_size = 1024
 _default_sparsity_lambda = 0.003
 _default_sparsity_c = 0.03
+SERVER_URL = "http://34.41.125.189:8000"  # From tutorial 4
 
 base_training_config = TrainingConfig(
     learning_rate=_lr,
     training_steps=1000,
     seed=42,
-    activation_source="local_manifest",
-    activation_path=expected_activation_path,
+    # --- Activation Source: Remote --- #
+    activation_source="remote",
+    # activation_path=expected_activation_path, # Removed for remote source
+    remote_config={
+        "server_url": SERVER_URL,
+        "dataset_id": dataset_id,
+        "timeout": 120,
+        "max_retries": 3,
+        "prefetch_batches": 16,
+    },
+    # --------------------------------- #
     activation_dtype="float32",
     train_batch_size_tokens=_batch_size,
-    sampling_strategy="random_chunk",
+    sampling_strategy="random_chunk",  # Keep random chunk for sweep
     normalization_method="none",  # Set normalization method for this script
     sparsity_lambda=_default_sparsity_lambda,
     sparsity_c=_default_sparsity_c,
@@ -148,30 +159,32 @@ base_training_config = TrainingConfig(
     wandb_project="clt-hp-sweeps-gpt2-norm-none",  # Specific project for gpt2 norm=none
     wandb_run_name="placeholder-run-name",
 )
-print("\nBase Training Configuration (Normalization=None):")
+print("\nBase Training Configuration (Normalization=None, Source=Remote):")
 print(base_training_config)
 
 # %% [markdown]
-# ## 3. Verify Activations Exist
+# ## 3. Verify Server Connection (Optional)
 #
-# Check if core activation files (`metadata.json`, `index.bin`) exist.
+# Before starting the sweep, we can optionally check if the server is reachable.
 
 # %%
-print("\nStep 1: Verifying Activations (manifest only)...")
+print(f"\nStep 1: Verifying Server Connection at {SERVER_URL}...")
 
-metadata_path = os.path.join(expected_activation_path, "metadata.json")
-manifest_path = os.path.join(expected_activation_path, "index.bin")
-
-if os.path.exists(metadata_path) and os.path.exists(manifest_path):
-    print(f"Required activation files found at: {expected_activation_path}")
-    print(f"Proceeding with norm_method='{base_training_config.normalization_method}'.")
-else:
-    print(f"[ERROR] Required activation files (metadata, index) not found at: {expected_activation_path}")
-    print("Please generate activations first.")
-    sys.exit(1)
+health_check_url = f"{SERVER_URL}/api/v1/health"
+try:
+    response = requests.get(health_check_url, timeout=10)
+    if response.status_code == 200 and response.json().get("status") == "ok":
+        print(f"✅ Server connection successful and healthy at {SERVER_URL}")
+    else:
+        print(f"⚠️ Server health check failed or gave unexpected status: {response.status_code} - {response.text}")
+        print("   Training will likely fail. Ensure the server is running and accessible.")
+except requests.exceptions.RequestException as req_err:
+    print(f"[ERROR] Failed to connect to server at {SERVER_URL}: {req_err}")
+    print("   Please ensure the clt_server is running and accessible at the specified URL.")
+    sys.exit(1)  # Exit if connection fails
 
 # %% [markdown]
-# ## 4. Hyperparameter Sweep (Norm=None, Part 2)
+# ## 4. Hyperparameter Sweep (Remote, Norm=None, Part 2)
 #
 # Loop through the second half of `sparsity_c` values and all `sparsity_lambda` values.
 
@@ -184,7 +197,7 @@ sparsity_c_values = all_sparsity_c_values[split_point:]  # Second half
 
 sparsity_lambda_values = [1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3]
 
-print("\nStarting Hyperparameter Sweep (GPT-2, Norm=None, Part 2)...")
+print("\nStarting Hyperparameter Sweep (GPT-2, Remote, Norm=None, Part 2)...")
 print(f"Sweeping over sparsity_c: {sparsity_c_values}")
 print(f"Sweeping over sparsity_lambda: {sparsity_lambda_values}")
 
@@ -219,6 +232,13 @@ for sc in sparsity_c_values:
 
         try:
             print("\nCreating CLTTrainer instance for this run...")
+            print(f"- Activation Source: {training_config.activation_source}")
+            # Safely access remote config details
+            if training_config.remote_config:
+                print(f"- Reading activations from server: {training_config.remote_config.get('server_url')}")
+                print(f"- Reading dataset_id: {training_config.remote_config.get('dataset_id')}")
+            else:
+                print("- Error: Remote config not found in training config!")
             print(f"- Training Config: {vars(training_config)}")
 
             trainer = CLTTrainer(
@@ -259,7 +279,7 @@ for sc in sparsity_c_values:
 # Models saved in `{log_base_dir}`.
 
 # %%
-print("\nHyperparameter Sweep (GPT-2, Norm=None, Part 2) Complete!")
+print("\nHyperparameter Sweep (GPT-2, Remote, Norm=None, Part 2) Complete!")  # Updated print
 print(f"Logs for each run are saved in subdirectories within: {log_base_dir}")
 
 # %%
