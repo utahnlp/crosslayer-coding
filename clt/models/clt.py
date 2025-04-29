@@ -58,15 +58,16 @@ class JumpReLU(torch.autograd.Function):
         grad_threshold = None
 
         # 1. Gradient for input (Straight-through estimator)
+        #    We want gradients to flow for **all** active units (input >= threshold),
+        #    not only those in a narrow band.  This follows the usual STE treatment
+        #    and avoids vanishing gradients for strongly active features.
         if needs_input_grad:
-            # Calculate grad_input in original dtype
-            # Mask for inputs within the STE window around the threshold
-            is_near_threshold = torch.abs(input - threshold) <= (bandwidth / 2.0)
-            grad_input = grad_output * is_near_threshold.type_as(grad_output)
+            ste_mask = (input >= threshold).type_as(grad_output)
+            grad_input = grad_output * ste_mask
 
         # 2. Gradient for threshold
         if needs_threshold_grad:
-            # Calculate grad_threshold in original dtype
+            # Keep a narrow window around the threshold for a smooth surrogate
             is_near_threshold = torch.abs(input - threshold) <= (bandwidth / 2.0)
             local_grad_theta = (-input / bandwidth) * is_near_threshold.type_as(input)
             grad_threshold_per_element = grad_output * local_grad_theta
@@ -90,6 +91,9 @@ class JumpReLU(torch.autograd.Function):
 
 class CrossLayerTranscoder(BaseTranscoder):
     """Implementation of a Cross-Layer Transcoder (CLT) with tensor parallelism."""
+
+    # --- Cache --- #
+    _cached_decoder_norms: Optional[torch.Tensor] = None
 
     def __init__(
         self,
@@ -452,6 +456,10 @@ class CrossLayerTranscoder(BaseTranscoder):
         Returns:
             Tensor of shape [num_layers, num_features] containing decoder norms
         """
+        # --- Use Cache --- #
+        if self._cached_decoder_norms is not None:
+            return self._cached_decoder_norms
+
         full_decoder_norms = torch.zeros(
             self.config.num_layers, self.config.num_features, device=self.device, dtype=self.dtype  # Match model dtype
         )
@@ -528,6 +536,9 @@ class CrossLayerTranscoder(BaseTranscoder):
 
             # Now take the square root and store in the final tensor (cast back to model dtype)
             full_decoder_norms[src_layer] = torch.sqrt(local_norms_sq_accum).to(self.dtype)
+
+        # --- Populate Cache --- #
+        self._cached_decoder_norms = full_decoder_norms
 
         return full_decoder_norms
 

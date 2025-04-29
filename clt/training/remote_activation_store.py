@@ -94,6 +94,7 @@ class RemoteActivationStore(ManifestActivationStore):
             world=world,
             seed=seed,
             sampling_strategy=sampling_strategy,
+            normalization_method=normalization_method,
         )
 
         logger.info(

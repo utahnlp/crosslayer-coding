@@ -92,9 +92,8 @@ clt_config = CLTConfig(
     num_features=clt_num_features,
     num_layers=gpt2_num_layers,  # Must match the base model
     d_model=gpt2_d_model,  # Must match the base model
-    # clt_dtype="bfloat16", # Configured via TrainingConfig.activation_dtype now
-    activation_fn="relu",  # As described in the paper
-    jumprelu_threshold=0.03,  # Default value from paper
+    activation_fn="jumprelu",  # As described in the paper
+    jumprelu_threshold=0.2,  # Default value from paper
 )
 print("CLT Configuration:")
 print(clt_config)
@@ -155,7 +154,7 @@ expected_activation_path = os.path.join(
 _lr = 1e-4
 _batch_size = 1024
 _sparsity_lambda = 0.0001
-_sparsity_c = 1.0
+_sparsity_c = 0.1
 
 wdb_run_name = (
     f"{clt_config.num_features}-width-"
@@ -182,11 +181,13 @@ training_config = TrainingConfig(
     normalization_method="auto",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
     sparsity_lambda=_sparsity_lambda,
+    sparsity_lambda_schedule="linear",
+    # sparsity_lambda_delay_frac=0.10,
     sparsity_c=_sparsity_c,
     preactivation_coef=3e-6,
     # Optimizer & Scheduler
     optimizer="adamw",
-    lr_scheduler="linear",
+    lr_scheduler="linear_final20",
     optimizer_beta2=0.98,
     # Logging & Checkpointing
     log_interval=10,

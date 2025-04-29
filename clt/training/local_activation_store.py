@@ -57,6 +57,7 @@ class LocalActivationStore(ManifestActivationStore):
             world: Total number of processes in distributed training.
             seed: Random seed for the sampler.
             sampling_strategy: 'sequential' or 'random_chunk'.
+            normalization_method: 'none' or 'mean_std'.
         """
         self.dataset_path = Path(dataset_path).resolve()  # Ensure absolute path
         if not self.dataset_path.is_dir():
@@ -71,6 +72,7 @@ class LocalActivationStore(ManifestActivationStore):
             world=world,
             seed=seed,
             sampling_strategy=sampling_strategy,
+            normalization_method=normalization_method,
         )
 
         logger.info(

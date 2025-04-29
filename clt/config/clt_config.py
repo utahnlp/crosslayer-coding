@@ -60,6 +60,12 @@ class TrainingConfig:
 
     # Loss function coefficients
     sparsity_lambda: float = 1e-3  # Coefficient for sparsity penalty
+    # Sparsity schedule: \'linear\' scales lambda from 0 to max over all steps.
+    # \'delayed_linear\' keeps lambda at 0 for `delay_frac` steps, then scales linearly.
+    sparsity_lambda_schedule: Literal["linear", "delayed_linear"] = "linear"
+    sparsity_lambda_delay_frac: float = (
+        0.1  # Fraction of steps to delay lambda increase (if schedule is delayed_linear)
+    )
     sparsity_c: float = 1.0  # Parameter affecting sparsity penalty shape
     preactivation_coef: float = 3e-6  # Coefficient for pre-activation loss
 
@@ -76,6 +82,9 @@ class TrainingConfig:
     log_interval: int = 100  # How often to log metrics
     eval_interval: int = 1000  # How often to run evaluation
     checkpoint_interval: int = 1000  # How often to save checkpoints
+
+    # Optional diagnostic metrics (can be slow)
+    compute_sparsity_diagnostics: bool = False  # Whether to compute detailed sparsity diagnostics during eval
 
     # Dead feature tracking
     dead_feature_window: int = 1000  # Steps until a feature is considered dead
@@ -124,3 +133,10 @@ class TrainingConfig:
             "sequential",
             "random_chunk",
         ], "sampling_strategy must be 'sequential' or 'random_chunk'"
+
+        # Validate sparsity schedule params
+        assert self.sparsity_lambda_schedule in ["linear", "delayed_linear"], "Invalid sparsity_lambda_schedule"
+        if self.sparsity_lambda_schedule == "delayed_linear":
+            assert (
+                0.0 <= self.sparsity_lambda_delay_frac < 1.0
+            ), "sparsity_lambda_delay_frac must be between 0.0 (inclusive) and 1.0 (exclusive)"

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 
 from clt.config import TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
@@ -10,40 +10,74 @@ from clt.models.clt import CrossLayerTranscoder
 class LossManager:
     """Manages the computation of different loss components for the CLT."""
 
-    def __init__(self, config: TrainingConfig):
+    def __init__(
+        self,
+        config: TrainingConfig,
+        mean_tg: Optional[Dict[int, torch.Tensor]] = None,
+        std_tg: Optional[Dict[int, torch.Tensor]] = None,
+    ):
         """Initialize the loss manager.
 
         Args:
             config: Training configuration
+            mean_tg: Optional dictionary of per-layer target means for de-normalising outputs
+            std_tg: Optional dictionary of per-layer target stds for de-normalising outputs
         """
         self.config = config
         self.reconstruction_loss_fn = nn.MSELoss()
         self.current_sparsity_lambda = 0.0  # Initialize lambda
+        # Store normalisation stats if provided
+        self.mean_tg = mean_tg or {}
+        self.std_tg = std_tg or {}
+
+        # Validate sparsity schedule params
+        assert self.config.sparsity_lambda_schedule in ["linear", "delayed_linear"], "Invalid sparsity_lambda_schedule"
+        if self.config.sparsity_lambda_schedule == "delayed_linear":
+            assert (
+                0.0 <= self.config.sparsity_lambda_delay_frac < 1.0
+            ), "sparsity_lambda_delay_frac must be between 0.0 (inclusive) and 1.0 (exclusive)"
 
     def compute_reconstruction_loss(
         self, predicted: Dict[int, torch.Tensor], target: Dict[int, torch.Tensor]
     ) -> torch.Tensor:
         """Compute reconstruction loss (MSE) between predicted and target outputs.
 
+        If normalisation statistics were provided, the method first *de-normalises* both
+        the predictions and the targets using the stored mean/std tensors so that the
+        loss is measured in the *original* activation space.  This avoids the loss
+        scale changing depending on whether the inputs were normalised by the
+        ActivationStore.
+
         Args:
             predicted: Dictionary mapping layer indices to predicted outputs
             target: Dictionary mapping layer indices to target outputs
 
         Returns:
-            MSE loss
+            MSE loss (summed over layers)
         """
         total_loss = torch.tensor(
             0.0,
             device=(next(iter(predicted.values())).device if predicted else torch.device("cpu")),
         )
-        num_layers = 0
-        for layer_idx in predicted:
-            if layer_idx in target:
-                layer_loss = self.reconstruction_loss_fn(predicted[layer_idx], target[layer_idx])
-                total_loss += layer_loss
-                num_layers += 1
 
-        # Summed over layers as in the paper
+        for layer_idx in predicted:
+            if layer_idx not in target:
+                continue
+
+            pred_layer = predicted[layer_idx]
+            tgt_layer = target[layer_idx]
+
+            # De-normalise if stats available for this layer
+            if layer_idx in self.mean_tg and layer_idx in self.std_tg:
+                mean = self.mean_tg[layer_idx].to(pred_layer.device, pred_layer.dtype)
+                std = self.std_tg[layer_idx].to(pred_layer.device, pred_layer.dtype)
+                # mean/std were stored with an added batch dim – ensure broadcast shape
+                pred_layer = pred_layer * std + mean
+                tgt_layer = tgt_layer * std + mean
+
+            layer_loss = self.reconstruction_loss_fn(pred_layer, tgt_layer)
+            total_loss += layer_loss
+
         return total_loss
 
     def compute_sparsity_penalty(
@@ -67,12 +101,33 @@ class LossManager:
         # --- Sparsity penalty calculation restored --- #
 
         if not activations:
-            return torch.tensor(0.0), 0.0
+            return torch.tensor(0.0, device=next(iter(model.parameters())).device), 0.0
 
-        # Create a linear scaling for lambda from 0 to config value
-        # This allows the model to learn useful features before enforcing sparsity
-        progress = min(1.0, current_step / (total_steps))
-        lambda_factor = self.config.sparsity_lambda * progress
+        # --- Calculate current lambda based on schedule --- #
+        target_lambda = self.config.sparsity_lambda
+        delay_frac = self.config.sparsity_lambda_delay_frac
+        schedule = self.config.sparsity_lambda_schedule
+
+        progress = min(1.0, current_step / total_steps)
+        lambda_factor = 0.0
+
+        if schedule == "linear":
+            lambda_factor = target_lambda * progress
+        elif schedule == "delayed_linear":
+            delay_start_step = delay_frac * total_steps
+            if current_step >= delay_start_step:
+                # Avoid division by zero if delay_frac is very close to 1
+                if total_steps > delay_start_step:
+                    delayed_progress = (current_step - delay_start_step) / (total_steps - delay_start_step)
+                    lambda_factor = target_lambda * min(1.0, delayed_progress)
+                else:
+                    lambda_factor = target_lambda  # Start at max lambda immediately if delay covers whole training
+            else:
+                lambda_factor = 0.0  # Still in delay phase
+
+        # If lambda factor is effectively zero, no penalty
+        if lambda_factor < 1e-9:  # Use a small tolerance
+            return torch.tensor(0.0, device=next(iter(model.parameters())).device), 0.0
 
         # Get decoder norms for feature weighting
         decoder_norms = model.get_decoder_norms()
@@ -181,6 +236,7 @@ class LossManager:
         targets: Dict[int, torch.Tensor],
         current_step: int,
         total_steps: int,
+        precomputed_activations: Optional[Dict[int, torch.Tensor]] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute the total loss for CLT training.
 
@@ -190,6 +246,8 @@ class LossManager:
             targets: Dictionary mapping layer indices to target outputs
             current_step: Current training step
             total_steps: Total number of training steps
+            precomputed_activations: Optional dictionary of feature activations that have already been
+                computed outside this function. Supplying this avoids redundant encoder forward passes.
 
         Returns:
             Tuple of (total loss, dictionary of individual loss components)
@@ -198,7 +256,10 @@ class LossManager:
         predictions = model(inputs)
 
         # Get feature activations
-        activations = model.get_feature_activations(inputs)
+        if precomputed_activations is None:
+            activations = model.get_feature_activations(inputs)
+        else:
+            activations = precomputed_activations
 
         # Compute loss components
         reconstruction_loss = self.compute_reconstruction_loss(predictions, targets)

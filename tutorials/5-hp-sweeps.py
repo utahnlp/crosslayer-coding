@@ -274,7 +274,8 @@ for sc in sparsity_c_values:
             f"{training_config.train_batch_size_tokens}-batch-"
             f"{training_config.learning_rate:.1e}-lr-"
             f"{sl:.1e}-slambda-"  # Use current sl
-            f"{sc:.2f}-sc"  # Use current sc
+            f"{sc:.2f}-sc-"  # Use current sc
+            f"norm_{training_config.normalization_method}"  # Add normalization method
         )
         training_config.wandb_run_name = wdb_run_name
         print(f"Generated WandB run name: {wdb_run_name}")
