@@ -237,3 +237,5 @@ except Exception as gen_err:
     print(f"[ERROR] Remote activation generation failed: {gen_err}")
     traceback.print_exc()
     raise
+
+# %%

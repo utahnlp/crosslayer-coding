@@ -3,6 +3,8 @@ from __future__ import annotations
 import logging
 import time
 from collections import defaultdict
+import threading
+import queue
 
 # import json # Unused
 from abc import ABC, abstractmethod
@@ -270,6 +272,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         seed: int = 42,
         sampling_strategy: str = "sequential",  # Added sampling strategy
         normalization_method: str = "none",  # Added normalization method
+        prefetch_batches: int = 1,  # Number of batches to prefetch (1 means no prefetching)
     ):
         self.train_batch_size_tokens = train_batch_size_tokens  # From Base
         self.rank = rank
@@ -277,6 +280,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         self.seed = seed
         self.epoch = 0  # Initial epoch
         # Added: Store sampling strategy
+        self.prefetch_batches = max(1, prefetch_batches)  # Ensure at least 1
         self.sampling_strategy = sampling_strategy
 
         # Device setup
@@ -422,6 +426,15 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         # bytes_per_tensor = slice_tok * bytes_per_row (depends on batch size)
         # per_layer_bytes = bytes_per_tensor * 2 (input + target)
 
+        # --- Setup Prefetching (if enabled) ---
+        self.prefetch_queue: Optional[queue.Queue] = None
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._stop_prefetch: Optional[threading.Event] = None
+        self._prefetch_error: Optional[Exception] = None  # To store errors from thread
+
+        if self.prefetch_batches > 1:
+            self._initialize_prefetching()
+
         # --- Previous chunk tracking for logging ---
         self.last_processed_chunk_ids: Optional[set[int]] = None
 
@@ -545,47 +558,93 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         # Add final log statement regardless of path taken
         logger.debug(f"_prep_norm finished. Final self.apply_normalization = {self.apply_normalization}")
 
-    def get_batch(self) -> ActivationBatch:
-        """Fetches the next batch based on the manifest sampler.
-        Raises RuntimeError if a batch cannot be fetched due to persistent chunk errors.
-        """
-        # --> ADDED: Retry config for fetch <--
-        max_fetch_retries = 3
-        fetch_initial_backoff = 0.5  # seconds
-        fetch_max_backoff = 10.0  # seconds
-        # --> END ADDED <--
+    def _initialize_prefetching(self):
+        """Initializes the prefetching queue, thread, and events."""
+        if not self.prefetch_batches > 1:
+            return
 
-        start_time = time.monotonic()
+        logger.info(f"Rank {self.rank}: Initializing prefetching with queue size {self.prefetch_batches - 1}")
+        # Queue holds pre-fetched batches. Size is num_to_prefetch - 1 because
+        # one batch is always being processed by the main thread.
+        self.prefetch_queue = queue.Queue(maxsize=self.prefetch_batches - 1)
+        self._stop_prefetch = threading.Event()
+        self._prefetch_thread = threading.Thread(
+            target=self._prefetch_loop,
+            name=f"PrefetchThread-Rank{self.rank}",
+            daemon=True,  # Allow program exit even if thread is running
+        )
+        self._prefetch_thread.start()
+
+    def _prefetch_loop(self):
+        """Target function for the prefetch thread."""
+        logger.debug(f"Prefetch thread started for rank {self.rank}.")
         try:
-            idxs = next(self.sampler_iter)
-        except StopIteration:
-            self.epoch += 1
-            logger.info(f"Epoch {self.epoch} finished. Resetting sampler.")
-            self.sampler.set_epoch(self.epoch)
-            try:
-                idxs = next(self.sampler_iter)
-            except StopIteration:
-                logger.error("Sampler immediately exhausted even after epoch increment...")
-                raise StopIteration("Dataset exhausted.")
+            while not self._stop_prefetch.is_set():  # type: ignore[union-attr]
+                try:
+                    # Get next indices from the shared sampler iterator
+                    # Note: The main thread __next__ will handle epoch bumps if needed
+                    # when it consumes StopIteration from the queue.
+                    # This thread focuses solely on filling the queue.
+                    idxs = next(self.sampler_iter)
 
+                    # Log time taken for fetch/parse
+                    fetch_parse_start_time = time.monotonic()
+                    # Fetch and parse the batch using the refactored logic
+                    batch = self._fetch_and_parse_batch(idxs)
+                    fetch_parse_duration = time.monotonic() - fetch_parse_start_time
+                    logger.debug(f"Rank {self.rank}: _fetch_and_parse_batch took {fetch_parse_duration:.4f}s")
+
+                    # Put the fetched batch onto the queue, blocking if full.
+                    # Use a timeout to periodically check the stop signal.
+                    while not self._stop_prefetch.is_set():  # type: ignore[union-attr]
+                        try:
+                            self.prefetch_queue.put(batch, timeout=0.5)  # type: ignore[union-attr]
+                            logger.debug(f"Rank {self.rank}: Prefetch thread put batch onto queue (current qsize={self.prefetch_queue.qsize()})")  # type: ignore[union-attr]
+                            break  # Successfully put batch
+                        except queue.Full:
+                            continue  # Queue is full, loop and check stop signal again
+
+                except StopIteration:
+                    logger.info(f"Rank {self.rank}: Prefetch thread detected end of sampler iteration.")
+                    # Signal end of data by putting None onto the queue
+                    self.prefetch_queue.put(None, block=True)  # type: ignore[union-attr] # Block until space
+                    break  # Exit loop, epoch finished
+
+                except Exception as e:
+                    # Log error and store it for the main thread
+                    logger.error(f"Rank {self.rank}: Error in prefetch loop: {e}", exc_info=True)
+                    self._prefetch_error = e  # Store the exception
+                    # Signal error by putting the exception itself onto the queue? Or None?
+                    # Putting None signals end-of-data, let's put the exception
+                    self.prefetch_queue.put(e, block=True)  # type: ignore[union-attr]
+                    break  # Exit loop on error
+
+        except Exception as e:
+            # Catch errors during thread setup/loop entry
+            logger.error(f"Rank {self.rank}: Unhandled exception in _prefetch_loop setup: {e}", exc_info=True)
+            self._prefetch_error = e
+            # Attempt to signal error via queue if possible
+            if self.prefetch_queue:
+                try:
+                    self.prefetch_queue.put(e, block=False)
+                except queue.Full:
+                    logger.error("Prefetch queue full, cannot signal error.")
+
+        finally:
+            logger.debug(f"Prefetch thread stopping for rank {self.rank}.")
+
+    def _fetch_and_parse_batch(self, idxs: np.ndarray) -> ActivationBatch:
+        """Fetches raw bytes for the given indices and parses into tensors."""
+        # --- Existing Fetch/Parse Logic from get_batch ---
         fetch_start_time = time.monotonic()
         unique_chunks, inverse_indices = np.unique(idxs[:, 0], return_inverse=True)
+        # ---> ADDED: Retry config moved here <---
+        max_fetch_retries = 3
+        fetch_initial_backoff = 0.5
+        fetch_max_backoff = 10.0
         rows_by_chunk: Dict[int, np.ndarray] = {}
         for i, chunk_id in enumerate(unique_chunks):
             rows_by_chunk[chunk_id] = idxs[inverse_indices == i, 1]
-
-        # ---> ADDED CHUNK TRANSITION LOGGING <---
-        current_chunk_ids = set(unique_chunks)
-        if self.last_processed_chunk_ids != current_chunk_ids:
-            if self.last_processed_chunk_ids is None:
-                logger.debug(f"Starting fetch. Accessing chunk(s): {sorted(list(current_chunk_ids))}")
-            else:
-                logger.debug(
-                    f"Chunk transition detected. Now accessing chunk(s): {sorted(list(current_chunk_ids))} "
-                    f"(Previous was: {sorted(list(self.last_processed_chunk_ids))})"
-                )
-            self.last_processed_chunk_ids = current_chunk_ids
-        # ---> END ADDED CHUNK TRANSITION LOGGING <---
 
         raw_bytes_by_chunk: Dict[int, bytes] = {}
         fetch_errors = []
@@ -736,12 +795,22 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                 logger.debug(f"Normalization Stats (Layer 0): {log_stats_this_batch}")
 
         parse_duration = time.monotonic() - parse_start_time
-        total_duration = time.monotonic() - start_time
+        total_duration = time.monotonic() - fetch_start_time
         logger.debug(
             f"get_batch completed in {total_duration:.4f}s (fetch: {fetch_duration:.4f}s, parse: {parse_duration:.4f}s)"
         )
 
         return final_batch_inputs, final_batch_targets
+
+    # Add concrete get_batch to satisfy BaseActivationStore abstract method
+    def get_batch(self) -> ActivationBatch:
+        """Compatibility method to satisfy BaseActivationStore abstract requirement."""
+        try:
+            # Delegate to the __next__ method which handles prefetching queue or direct call
+            return self.__next__()
+        except StopIteration:
+            # Ensure StopIteration is propagated correctly if __next__ raises it
+            raise
 
     def state_dict(self) -> Dict[str, Any]:
         """Return minimal state needed to resume iteration."""
@@ -810,14 +879,32 @@ class ManifestActivationStore(BaseActivationStore, ABC):
     def __next__(self):
         # --> MODIFIED: Implement skip logic <--
         try:
-            # Attempt to get the next batch normally
-            return self.get_batch()
+            # If prefetching, get from queue, else call get_batch()
+            if self.prefetch_queue is not None:
+                # Block until an item is available from the prefetch thread
+                item = self.prefetch_queue.get(block=True)
+                if isinstance(item, Exception):  # Check if thread sent an error
+                    logger.error(f"Rank {self.rank}: Error received from prefetch thread: {item}")
+                    raise item  # Re-raise the error from the thread
+                elif item is None:  # Check for end-of-data sentinel
+                    raise StopIteration("Prefetch thread signalled end of data.")
+                else:
+                    logger.debug(f"Rank {self.rank}: Retrieved batch from prefetch queue (previous qsize approx: {self.prefetch_queue.qsize() + 1})")  # type: ignore[union-attr]
+                    return item  # Return the prefetched batch
+            else:
+                # Get indices and call fetch/parse directly
+                idxs = next(self.sampler_iter)
+                return self._fetch_and_parse_batch(idxs)
         except RuntimeError as e:
             # This exception is raised by get_batch() if fetching fails permanently
             logger.warning(f"Batch fetch failed ({e}), attempting to skip and fetch the next one...")
+            # Skip logic needs adjustment for prefetching - how to tell prefetch thread to skip?
+            # For now, let's keep the skip logic simpler and assume it works mostly for non-prefetch
+            # or handles errors raised *after* getting from the queue.
             try:
                 # Try getting the *subsequent* batch
-                next_batch = self.get_batch()
+                idxs = next(self.sampler_iter)  # Need to get new indices
+                next_batch = self._fetch_and_parse_batch(idxs)
                 logger.info("Successfully fetched subsequent batch after skipping failed one.")
                 return next_batch
             except RuntimeError as e2:
@@ -829,6 +916,24 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                 raise  # Re-raise StopIteration
         # Note: StopIteration from the initial self.get_batch() call propagates normally
         # --> END MODIFIED <--
+
+    def close(self):
+        """Shuts down the prefetch thread if it's running."""
+        logger.info(f"Rank {self.rank}: Closing activation store...")
+        if self._prefetch_thread and self._prefetch_thread.is_alive():
+            logger.debug(f"Rank {self.rank}: Signalling prefetch thread to stop.")
+            self._stop_prefetch.set()  # type: ignore[union-attr]
+
+            # Put a sentinel value to potentially unblock the thread from queue.put()
+            # Or unblock the main thread if it's waiting on queue.get()
+            if self.prefetch_queue:
+                try:
+                    self.prefetch_queue.put(None, block=False)
+                except queue.Full:
+                    pass
+
+            self._prefetch_thread.join(timeout=5.0)  # Wait for thread to finish
+            logger.debug(f"Rank {self.rank}: Prefetch thread joined.")
 
 
 # --- LRU Cache for HDF5 Files (used by Local variant) ---

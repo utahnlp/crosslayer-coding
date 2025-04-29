@@ -58,6 +58,11 @@ class BaseActivationStore(ABC):
         """Load state from a dictionary."""
         pass
 
+    @abstractmethod
+    def close(self):
+        """Close the store and clean up resources (e.g., threads). Stub for base class."""
+        pass
+
     def __iter__(self):
         """Make the store iterable."""
         return self
@@ -83,9 +88,7 @@ class BaseActivationStore(ABC):
         ):
             return 0
         # Ensure division is safe
-        return (
-            self.total_tokens + self.train_batch_size_tokens - 1
-        ) // self.train_batch_size_tokens
+        return (self.total_tokens + self.train_batch_size_tokens - 1) // self.train_batch_size_tokens
 
 
 # --------------------------
@@ -156,19 +159,11 @@ class StreamingActivationStore(BaseActivationStore):
         self.start_time = start_time or time.time()
 
         # Set device (Common logic, could be in Base if needed)
-        _device_input = device or (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        )
-        self.device = (
-            torch.device(_device_input)
-            if isinstance(_device_input, str)
-            else _device_input
-        )
+        _device_input = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
+        self.device = torch.device(_device_input) if isinstance(_device_input, str) else _device_input
 
         # Calculate target buffer size
-        self.target_buffer_size_tokens = (
-            self.n_batches_in_buffer * self.train_batch_size_tokens
-        )
+        self.target_buffer_size_tokens = self.n_batches_in_buffer * self.train_batch_size_tokens
 
         # Initialize state (buffers etc. will be initialized lazily)
         self.buffer_initialized = False
@@ -213,30 +208,18 @@ class StreamingActivationStore(BaseActivationStore):
 
         # Initialize empty buffers for each layer
         for layer_idx in self.layer_indices:
-            self.buffered_inputs[layer_idx] = torch.empty(
-                (0, self.d_model), device=self.device, dtype=self.dtype
-            )
-            self.buffered_targets[layer_idx] = torch.empty(
-                (0, self.d_model), device=self.device, dtype=self.dtype
-            )
+            self.buffered_inputs[layer_idx] = torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
+            self.buffered_targets[layer_idx] = torch.empty((0, self.d_model), device=self.device, dtype=self.dtype)
             # Validate dimensions for all layers in the first batch
-            if (
-                inputs_dict[layer_idx].shape[-1] != self.d_model
-                or targets_dict[layer_idx].shape[-1] != self.d_model
-            ):
+            if inputs_dict[layer_idx].shape[-1] != self.d_model or targets_dict[layer_idx].shape[-1] != self.d_model:
                 raise ValueError(
                     f"Inconsistent d_model across layers in the first batch. "
                     f"Expected {self.d_model}, got {inputs_dict[layer_idx].shape[-1]} "
                     f"for input or {targets_dict[layer_idx].shape[-1]} for target "
                     f"at layer {layer_idx}."
                 )
-            if (
-                inputs_dict[layer_idx].dtype != self.dtype
-                or targets_dict[layer_idx].dtype != self.dtype
-            ):
-                logger.warning(
-                    f"Inconsistent dtype across layers/tensors in first batch. Using {self.dtype}."
-                )
+            if inputs_dict[layer_idx].dtype != self.dtype or targets_dict[layer_idx].dtype != self.dtype:
+                logger.warning(f"Inconsistent dtype across layers/tensors in first batch. Using {self.dtype}.")
 
         self.buffer_initialized = True
         logger.info(
@@ -251,15 +234,10 @@ class StreamingActivationStore(BaseActivationStore):
         if self.normalization_method == "estimated_mean_std" and self.input_means:
             inputs_dict, targets_dict = self._normalize_batch(inputs_dict, targets_dict)
         elif self.normalization_method != "none" and not self.input_means:
-            logger.warning(
-                "Normalization requested but statistics not computed yet. Skipping normalization."
-            )
+            logger.warning("Normalization requested but statistics not computed yet. Skipping normalization.")
 
         # Validate layer indices match
-        if (
-            sorted(inputs_dict.keys()) != self.layer_indices
-            or sorted(targets_dict.keys()) != self.layer_indices
-        ):
+        if sorted(inputs_dict.keys()) != self.layer_indices or sorted(targets_dict.keys()) != self.layer_indices:
             raise ValueError(
                 f"Inconsistent layer indices received from generator. Expected {self.layer_indices}, "
                 f"got inputs: {sorted(inputs_dict.keys())}, targets: {sorted(targets_dict.keys())}"
@@ -271,10 +249,7 @@ class StreamingActivationStore(BaseActivationStore):
             tgt_tensor = targets_dict[layer_idx].to(self.device)
 
             # Validate shapes and types before concatenating
-            if (
-                inp_tensor.shape[-1] != self.d_model
-                or tgt_tensor.shape[-1] != self.d_model
-            ):
+            if inp_tensor.shape[-1] != self.d_model or tgt_tensor.shape[-1] != self.d_model:
                 raise ValueError(
                     f"Inconsistent d_model in batch for layer {layer_idx}. "
                     f"Expected {self.d_model}, got input: {inp_tensor.shape[-1]}, target: {tgt_tensor.shape[-1]}"
@@ -296,9 +271,7 @@ class StreamingActivationStore(BaseActivationStore):
             if i == 0:
                 num_tokens_in_batch = inp_tensor.shape[0]
                 if num_tokens_in_batch == 0:
-                    logger.warning(
-                        f"Received an empty batch (0 tokens) for layer {layer_idx}. Skipping."
-                    )
+                    logger.warning(f"Received an empty batch (0 tokens) for layer {layer_idx}. Skipping.")
                     return 0  # Return 0 tokens added
 
             # Check consistency of token count across layers within the batch
@@ -309,18 +282,12 @@ class StreamingActivationStore(BaseActivationStore):
                 )
 
             # Concatenate to buffers
-            self.buffered_inputs[layer_idx] = torch.cat(
-                (self.buffered_inputs[layer_idx], inp_tensor), dim=0
-            )
-            self.buffered_targets[layer_idx] = torch.cat(
-                (self.buffered_targets[layer_idx], tgt_tensor), dim=0
-            )
+            self.buffered_inputs[layer_idx] = torch.cat((self.buffered_inputs[layer_idx], inp_tensor), dim=0)
+            self.buffered_targets[layer_idx] = torch.cat((self.buffered_targets[layer_idx], tgt_tensor), dim=0)
 
         # Add corresponding read indices (initialized to False)
         if num_tokens_in_batch > 0:
-            new_read_indices = torch.zeros(
-                num_tokens_in_batch, dtype=torch.bool, device=self.device
-            )
+            new_read_indices = torch.zeros(num_tokens_in_batch, dtype=torch.bool, device=self.device)
             self.read_indices = torch.cat((self.read_indices, new_read_indices), dim=0)
             self.total_tokens_yielded_by_generator += num_tokens_in_batch
 
@@ -371,9 +338,7 @@ class StreamingActivationStore(BaseActivationStore):
         )
 
         if self.read_indices.shape[0] == 0 and self.generator_exhausted:
-            logger.warning(
-                "Buffer is empty and generator is exhausted. No data available."
-            )
+            logger.warning("Buffer is empty and generator is exhausted. No data available.")
 
     def _prune_buffer(self):
         """Removes fully read tokens from the beginning of the buffer."""
@@ -381,23 +346,15 @@ class StreamingActivationStore(BaseActivationStore):
             return
 
         # Find the first index that is False (not read)
-        first_unread_idx = torch.argmin(
-            self.read_indices.int()
-        )  # argmin returns first 0 if available
-        if self.read_indices[
-            first_unread_idx
-        ]:  # If the first unread is True, all are True
+        first_unread_idx = torch.argmin(self.read_indices.int())  # argmin returns first 0 if available
+        if self.read_indices[first_unread_idx]:  # If the first unread is True, all are True
             first_unread_idx = self.read_indices.shape[0]
 
         if first_unread_idx > 0:
             # Prune the buffers and the read_indices tensor
             for layer_idx in self.layer_indices:
-                self.buffered_inputs[layer_idx] = self.buffered_inputs[layer_idx][
-                    first_unread_idx:
-                ]
-                self.buffered_targets[layer_idx] = self.buffered_targets[layer_idx][
-                    first_unread_idx:
-                ]
+                self.buffered_inputs[layer_idx] = self.buffered_inputs[layer_idx][first_unread_idx:]
+                self.buffered_targets[layer_idx] = self.buffered_targets[layer_idx][first_unread_idx:]
             self.read_indices = self.read_indices[first_unread_idx:]
 
             if torch.cuda.is_available() and self.device.type == "cuda":
@@ -428,39 +385,27 @@ class StreamingActivationStore(BaseActivationStore):
         # If still no unread tokens after trying to fill
         if num_unread == 0:
             if self.generator_exhausted:
-                logger.info(
-                    "Generator exhausted and buffer empty. Signalling end of iteration."
-                )
+                logger.info("Generator exhausted and buffer empty. Signalling end of iteration.")
                 raise StopIteration
             else:
-                logger.error(
-                    "Buffer has no unread tokens despite generator not being marked as exhausted."
-                )
+                logger.error("Buffer has no unread tokens despite generator not being marked as exhausted.")
                 raise RuntimeError("Failed to get unread tokens after buffer refill.")
 
         # --- Sample indices ---
         unread_token_indices = (~self.read_indices).nonzero().squeeze(-1)
         num_to_sample = min(self.train_batch_size_tokens, len(unread_token_indices))
         if num_to_sample == 0:
-            raise RuntimeError(
-                "No unread indices available for sampling, despite earlier checks."
-            )
+            raise RuntimeError("No unread indices available for sampling, despite earlier checks.")
 
-        perm = torch.randperm(len(unread_token_indices), device=self.device)[
-            :num_to_sample
-        ]
+        perm = torch.randperm(len(unread_token_indices), device=self.device)[:num_to_sample]
         sampled_buffer_indices = unread_token_indices[perm]
 
         # --- Create batch dictionaries ---
         batch_inputs: Dict[int, torch.Tensor] = {}
         batch_targets: Dict[int, torch.Tensor] = {}
         for layer_idx in self.layer_indices:
-            batch_inputs[layer_idx] = self.buffered_inputs[layer_idx][
-                sampled_buffer_indices
-            ]
-            batch_targets[layer_idx] = self.buffered_targets[layer_idx][
-                sampled_buffer_indices
-            ]
+            batch_inputs[layer_idx] = self.buffered_inputs[layer_idx][sampled_buffer_indices]
+            batch_targets[layer_idx] = self.buffered_targets[layer_idx][sampled_buffer_indices]
 
         # --- Mark indices as read ---
         self.read_indices[sampled_buffer_indices] = True
@@ -485,9 +430,7 @@ class StreamingActivationStore(BaseActivationStore):
         first_batch_seen = False
         batches_processed = 0
 
-        pbar_norm = tqdm(
-            range(self.normalization_estimation_batches), desc="Estimating Norm Stats"
-        )
+        pbar_norm = tqdm(range(self.normalization_estimation_batches), desc="Estimating Norm Stats")
         try:
             for _ in pbar_norm:
                 batch_inputs, batch_targets = next(self.activation_generator)
@@ -503,79 +446,59 @@ class StreamingActivationStore(BaseActivationStore):
                 for layer_idx in self.layer_indices:
                     # Collect tensors (move to CPU to avoid GPU OOM during estimation)
                     all_inputs_for_norm[layer_idx].append(batch_inputs[layer_idx].cpu())
-                    all_outputs_for_norm[layer_idx].append(
-                        batch_targets[layer_idx].cpu()
-                    )
+                    all_outputs_for_norm[layer_idx].append(batch_targets[layer_idx].cpu())
         except StopIteration:
             self.generator_exhausted = True
-            logger.warning(
-                f"Generator exhausted after {batches_processed} batches during norm estimation."
-            )
+            logger.warning(f"Generator exhausted after {batches_processed} batches during norm estimation.")
         finally:
             pbar_norm.close()
 
         if not first_batch_seen:
-            logger.error(
-                "No batches received from generator during normalization estimation. Cannot compute stats."
-            )
+            logger.error("No batches received from generator during normalization estimation. Cannot compute stats.")
             self.normalization_method = "none"  # Fallback
             return
 
         logger.info("Calculating mean and std from collected tensors...")
         for layer_idx in tqdm(self.layer_indices, desc="Calculating Stats"):
             if not all_inputs_for_norm[layer_idx]:
-                logger.warning(
-                    f"No data collected for layer {layer_idx} during norm estimation."
-                )
+                logger.warning(f"No data collected for layer {layer_idx} during norm estimation.")
                 continue
 
             try:
                 # Concatenate on CPU, compute stats, then move results to target device
-                in_cat = torch.cat(
-                    all_inputs_for_norm[layer_idx], dim=0
-                ).float()  # Ensure float32 for stable stats
+                in_cat = torch.cat(all_inputs_for_norm[layer_idx], dim=0).float()  # Ensure float32 for stable stats
                 out_cat = torch.cat(all_outputs_for_norm[layer_idx], dim=0).float()
 
                 # Calculate stats and move to target device
-                self.input_means[layer_idx] = in_cat.mean(dim=0, keepdim=True).to(
+                self.input_means[layer_idx] = in_cat.mean(dim=0, keepdim=True).to(self.device, dtype=self.dtype)
+                self.input_stds[layer_idx] = (in_cat.std(dim=0, keepdim=True) + 1e-6).to(self.device, dtype=self.dtype)
+                self.output_means[layer_idx] = out_cat.mean(dim=0, keepdim=True).to(self.device, dtype=self.dtype)
+                self.output_stds[layer_idx] = (out_cat.std(dim=0, keepdim=True) + 1e-6).to(
                     self.device, dtype=self.dtype
                 )
-                self.input_stds[layer_idx] = (
-                    in_cat.std(dim=0, keepdim=True) + 1e-6
-                ).to(self.device, dtype=self.dtype)
-                self.output_means[layer_idx] = out_cat.mean(dim=0, keepdim=True).to(
-                    self.device, dtype=self.dtype
-                )
-                self.output_stds[layer_idx] = (
-                    out_cat.std(dim=0, keepdim=True) + 1e-6
-                ).to(self.device, dtype=self.dtype)
 
                 # --- Crucially, add the collected batches back to the buffer --- #
                 # We iterate through the original CPU tensors we collected
-                logger.debug(
-                    f"Adding {len(all_inputs_for_norm[layer_idx])} norm batches back to buffer..."
-                )
+                logger.debug(f"Adding {len(all_inputs_for_norm[layer_idx])} norm batches back to buffer...")
                 temp_rebuild_batches = []
                 num_batches = len(all_inputs_for_norm[layer_idx])
                 for i in range(num_batches):
                     batch_input_dict = {
-                        l: all_inputs_for_norm[l][i]
-                        for l in self.layer_indices
-                        if i < len(all_inputs_for_norm[l])
+                        layer_idx_inner: all_inputs_for_norm[layer_idx_inner][i]
+                        for layer_idx_inner in self.layer_indices
+                        if i < len(all_inputs_for_norm[layer_idx_inner])
                     }
                     batch_output_dict = {
-                        l: all_outputs_for_norm[l][i]
-                        for l in self.layer_indices
-                        if i < len(all_outputs_for_norm[l])
+                        layer_idx_inner: all_outputs_for_norm[layer_idx_inner][i]
+                        for layer_idx_inner in self.layer_indices
+                        if i < len(all_outputs_for_norm[layer_idx_inner])
                     }
                     temp_rebuild_batches.append((batch_input_dict, batch_output_dict))
 
                 for batch_in_dict, batch_out_dict in temp_rebuild_batches:
                     # Ensure metadata is initialized (should be already)
                     if not self.buffer_initialized:
-                        self._initialize_buffer_metadata(
-                            (batch_in_dict, batch_out_dict)
-                        )
+                        self._initialize_buffer_metadata((batch_in_dict, batch_out_dict))
                     # Add batch (this handles moving to device and normalization)
                     self._add_batch_to_buffer((batch_in_dict, batch_out_dict))
                 logger.debug("Finished adding norm batches back.")
@@ -589,9 +512,7 @@ class StreamingActivationStore(BaseActivationStore):
 
         del all_inputs_for_norm, all_outputs_for_norm  # Free memory
         gc.collect()
-        logger.info(
-            f"Normalization estimation complete using {batches_processed} batches."
-        )
+        logger.info(f"Normalization estimation complete using {batches_processed} batches.")
 
     def _normalize_batch(
         self,
@@ -614,9 +535,7 @@ class StreamingActivationStore(BaseActivationStore):
             normalized_targets[layer_idx] = tgt
         return normalized_inputs, normalized_targets
 
-    def denormalize_outputs(
-        self, outputs: Dict[int, torch.Tensor]
-    ) -> Dict[int, torch.Tensor]:
+    def denormalize_outputs(self, outputs: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
         """Denormalizes output activations to their original scale."""
         if self.normalization_method == "none" or not self.output_means:
             return outputs
@@ -626,13 +545,9 @@ class StreamingActivationStore(BaseActivationStore):
             if layer_idx in self.output_means and layer_idx in self.output_stds:
                 mean = self.output_means[layer_idx]
                 std = self.output_stds[layer_idx]
-                denormalized[layer_idx] = (output * std.to(output.device)) + mean.to(
-                    output.device
-                )
+                denormalized[layer_idx] = (output * std.to(output.device)) + mean.to(output.device)
             else:
-                logger.warning(
-                    f"Attempting denormalize layer {layer_idx} but no stats found."
-                )
+                logger.warning(f"Attempting denormalize layer {layer_idx} but no stats found.")
                 denormalized[layer_idx] = output
         return denormalized
 
@@ -673,31 +588,17 @@ class StreamingActivationStore(BaseActivationStore):
         except AttributeError:
             logger.warning(f"Could parse dtype '{state_dict['dtype']}', defaulting.")
 
-        self.input_means = {
-            k: v.to(self.device) for k, v in state_dict["input_means"].items()
-        }
-        self.input_stds = {
-            k: v.to(self.device) for k, v in state_dict["input_stds"].items()
-        }
-        self.output_means = {
-            k: v.to(self.device) for k, v in state_dict["output_means"].items()
-        }
-        self.output_stds = {
-            k: v.to(self.device) for k, v in state_dict["output_stds"].items()
-        }
+        self.input_means = {k: v.to(self.device) for k, v in state_dict["input_means"].items()}
+        self.input_stds = {k: v.to(self.device) for k, v in state_dict["input_stds"].items()}
+        self.output_means = {k: v.to(self.device) for k, v in state_dict["output_means"].items()}
+        self.output_stds = {k: v.to(self.device) for k, v in state_dict["output_stds"].items()}
 
-        self.total_tokens_yielded_by_generator = state_dict[
-            "total_tokens_yielded_by_generator"
-        ]
+        self.total_tokens_yielded_by_generator = state_dict["total_tokens_yielded_by_generator"]
         self.target_buffer_size_tokens = state_dict["target_buffer_size_tokens"]
         self.train_batch_size_tokens = state_dict["train_batch_size_tokens"]
         self.normalization_method = state_dict["normalization_method"]
-        self.normalization_estimation_batches = state_dict[
-            "normalization_estimation_batches"
-        ]
-        self.total_tokens = (
-            -1
-        )  # Reset total tokens, will update on generator exhaustion
+        self.normalization_estimation_batches = state_dict["normalization_estimation_batches"]
+        self.total_tokens = -1  # Reset total tokens, will update on generator exhaustion
 
         # Reset buffer state
         self.buffered_inputs, self.buffered_targets = {}, {}
@@ -705,6 +606,11 @@ class StreamingActivationStore(BaseActivationStore):
         self.buffer_initialized = False
         self.generator_exhausted = False
         logger.info("StreamingActivationStore state loaded. Requires a new generator.")
+
+    # Add close method stub for compatibility
+    def close(self):
+        """Close method stub for StreamingActivationStore."""
+        pass
 
 
 # --------------------------

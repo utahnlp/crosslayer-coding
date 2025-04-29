@@ -84,7 +84,7 @@ print(model)
 # We need to match the base model's dimensions
 gpt2_num_layers = 12
 gpt2_d_model = 768
-expansion_factor = 4
+expansion_factor = 32
 
 # For the tutorial, let's use a smaller number of features than d_model
 clt_num_features = gpt2_d_model * expansion_factor

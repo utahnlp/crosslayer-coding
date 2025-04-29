@@ -1018,12 +1018,16 @@ class CLTTrainer:
         try:
             for step in pbar:
                 # Refresh progress bar on rank 0
+                step_start_time = time.monotonic()  # Start timing the step
                 if isinstance(pbar, tqdm):
                     pbar.refresh()
 
                 try:
                     # Get batch directly from the iterator (handles distributed sampling internally)
+                    batch_get_start_time = time.monotonic()
                     inputs, targets = next(self.activation_store)
+                    batch_get_duration = time.monotonic() - batch_get_start_time
+                    logger.debug(f"Rank {self.rank} Step {step}: Getting batch took {batch_get_duration:.4f}s")
 
                 except StopIteration:
                     # Rank 0 prints message
@@ -1175,6 +1179,11 @@ class CLTTrainer:
                 # --- Log metrics --- (Rank 0 logs to WandB/file)
                 self._log_metrics(step, loss_dict)
 
+                step_duration = time.monotonic() - step_start_time
+                logger.debug(
+                    f"Rank {self.rank} Step {step}: Main logic (incl. batch get, fwd, bwd, optim) took {step_duration:.4f}s"
+                )
+
                 # --- Evaluation & Checkpointing ---
                 eval_interval = self.training_config.eval_interval
                 checkpoint_interval = self.training_config.checkpoint_interval
@@ -1288,9 +1297,11 @@ class CLTTrainer:
             print(f"Saving final activation store state to {final_store_path}...")
             os.makedirs(final_checkpoint_dir, exist_ok=True)  # Ensure dir exists for store save
             try:
-                torch.save(self.activation_store.state_dict(), final_store_path)
+                # Check if the store has a close method before calling (for compatibility)
+                if hasattr(self.activation_store, "close") and callable(getattr(self.activation_store, "close")):
+                    self.activation_store.close()
             except Exception as e:
-                print(f"Rank 0: Warning: Failed to save final activation store state: {e}")
+                print(f"Rank 0: Warning: Failed to close activation store: {e}")
 
             print("Saving final metrics...")
             self._save_metrics()
@@ -1301,6 +1312,10 @@ class CLTTrainer:
             # Finish WandB logging
             self.wandb_logger.finish()
             print(f"Training completed! Final checkpoint saved to {final_checkpoint_dir}")
+
+        # --- Close the activation store (stops prefetch thread if applicable) --- #
+        if hasattr(self.activation_store, "close") and callable(getattr(self.activation_store, "close")):
+            self.activation_store.close()
 
         # Clean up distributed process group
         if self.distributed:

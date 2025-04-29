@@ -29,7 +29,9 @@ import sys
 import traceback
 import copy
 from transformers import AutoModelForCausalLM  # Moved import
-import requests  # Ensure requests is imported
+
+# import requests  # Ensure requests is imported - Removed as server check is gone
+import shutil  # Import shutil for directory removal
 
 # Import components from the clt library
 # (Ensure the 'clt' directory is in your Python path or installed)
@@ -120,7 +122,7 @@ activation_config = ActivationConfig(
     activation_dir=activation_dir,
     output_format="hdf5",
     compression="gzip",
-    chunk_token_threshold=8_000,
+    chunk_token_threshold=32_000,
     activation_dtype="float32",
     compute_norm_stats=True,  # Important: Assumes this was True during generation
 )
@@ -217,6 +219,13 @@ print(f"Sweeping over sparsity_lambda: {sparsity_lambda_values}")
 # --- Sweep Loop ---
 sweep_results: dict = {}
 log_base_dir = f"clt_training_logs/norm_auto_part2"  # Specific log base directory
+
+# --- Delete existing log directory for this script before starting ---
+if os.path.exists(log_base_dir):
+    print(f"Deleting existing log directory: {log_base_dir}")
+    shutil.rmtree(log_base_dir)
+# ------------------------------------------------------------------
+
 os.makedirs(log_base_dir, exist_ok=True)
 
 for sc in sparsity_c_values:
