@@ -513,29 +513,37 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                     logger.warning(f"Missing target mean/std for layer {layer_idx} in norm stats.")
 
             if missing_layers:
-                logger.warning(f"Normalization stats missing for layers: {sorted(list(missing_layers))}")
+                # Add specific logging here
+                logger.warning(
+                    f"Normalization stats missing for layers: {sorted(list(missing_layers))}. Disabling normalization."
+                )
+                self.apply_normalization = False  # Explicitly disable if layers are missing
 
-            logger.info("Normalization statistics prepared.")
-            self.apply_normalization = True  # Confirm application
-
-            if self.apply_normalization:
-                log_msg = "Normalization statistics prepared successfully. Example shapes: "
-                example_layer = self.layer_indices[0]
-                if example_layer in self.mean_in:
-                    log_msg += f"mean_in[{example_layer}]: {self.mean_in[example_layer].shape}, "
-                if example_layer in self.std_in:
-                    log_msg += f"std_in[{example_layer}]: {self.std_in[example_layer].shape}"
-                logger.info(log_msg)
-            else:
-                logger.warning("Normalization statistics FAILED to load or were incomplete. Normalization disabled.")
+            # Only log success and set True if NO errors occurred AND no layers were missing
+            if self.apply_normalization:  # Check if it hasn't been set to False above
+                logger.info("Normalization statistics prepared successfully.")
+                # Optional: Add shape logging only on success
+                # log_msg = "Example shapes: "
+                # example_layer = self.layer_indices[0]
+                # if example_layer in self.mean_in:
+                #     log_msg += f"mean_in[{example_layer}]: {self.mean_in[example_layer].shape}, "
+                # if example_layer in self.std_in:
+                #     log_msg += f"std_in[{example_layer}]: {self.std_in[example_layer].shape}"
+                # logger.info(log_msg)
+            # else: # Already logged the reason for failure above (missing layers or exception)
+            #    logger.warning("Normalization statistics FAILED to load or were incomplete. Normalization disabled.")
 
         except (KeyError, ValueError, TypeError) as e:
+            # Add specific logging here
             logger.error(
-                f"Error processing normalization stats: {e}. Disabling normalization.",
-                exc_info=True,
+                f"Error processing normalization stats (e.g., invalid format, wrong keys): {e}. Disabling normalization.",
+                exc_info=True,  # Include traceback for debugging
             )
             self.apply_normalization = False
             self.mean_in, self.std_in, self.mean_tg, self.std_tg = {}, {}, {}, {}
+
+        # Add final log statement regardless of path taken
+        logger.debug(f"_prep_norm finished. Final self.apply_normalization = {self.apply_normalization}")
 
     def get_batch(self) -> ActivationBatch:
         """Fetches the next batch based on the manifest sampler.

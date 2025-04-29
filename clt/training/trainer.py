@@ -441,16 +441,25 @@ class CLTTrainer:
         # Initialize activation store based on config - uses self.rank/world_size now
         self.activation_store = self._create_activation_store(self.start_time)
 
-        # Initialize loss manager
-        self.loss_manager = LossManager(training_config)
+        # Pass normalisation statistics (if available) so the loss can be computed in
+        # the *original* scale even when inputs/targets are stored normalised.
+        mean_tg_stats = getattr(self.activation_store, "mean_tg", {})  # type: ignore[arg-type]
+        std_tg_stats = getattr(self.activation_store, "std_tg", {})  # type: ignore[arg-type]
 
-        # Initialize Evaluator - only on rank 0? Evaluation might be complex with TP
-        # For now, assume evaluator can handle the full model state if needed,
-        # or adapt evaluator later. Pass base model logic might break.
-        # Pass self.model (which is the parallel version). Evaluator needs adjustment if it relies
-        # on specific non-parallel structures or needs to gather states.
-        # TODO: Review evaluator logic for TP compatibility.
-        self.evaluator = CLTEvaluator(self.model, self.device, self.start_time)
+        self.loss_manager = LossManager(
+            training_config,
+            mean_tg=mean_tg_stats,
+            std_tg=std_tg_stats,
+        )
+
+        # Initialize Evaluator - Pass norm stats here too
+        self.evaluator = CLTEvaluator(
+            model=self.model,
+            device=self.device,
+            start_time=self.start_time,
+            mean_tg=mean_tg_stats,  # Pass the same stats
+            std_tg=std_tg_stats,  # Pass the same stats
+        )
 
         # Initialize dead neuron counters (replicated for now, consider sharding later if needed)
         self.n_forward_passes_since_fired = torch.zeros(
@@ -602,8 +611,9 @@ class CLTTrainer:
                 if store.apply_normalization:
                     logger.info(f"Rank {rank}:   Normalization ENABLED using loaded norm_stats.json.")
                 else:
+                    # Make the warning more generic as the file might be loaded but processing failed
                     logger.warning(
-                        f"Rank {rank}:   Normalization DISABLED (norm_stats.json not found or failed to load)."
+                        f"Rank {rank}:   Normalization DISABLED (processing failed or file incomplete/invalid)."
                     )
         elif activation_source == "remote":
             logger.info(f"Rank {rank}: Using RemoteActivationStore (remote slice server).")
@@ -1073,23 +1083,24 @@ class CLTTrainer:
 
                 # --- Forward pass and compute loss --- (All ranks)
                 self.optimizer.zero_grad()
-                # Loss manager needs the model, inputs, targets, and step info
-                # Model forward/loss computation now involves communication via parallel layers
+
+                # Compute feature activations **once** per step to avoid redundant encoder forward passes.
+                feature_activations_batch = self.model.get_feature_activations(inputs)
+
+                # Compute total loss using the pre-computed activations
                 loss, loss_dict = self.loss_manager.compute_total_loss(
                     self.model,
                     inputs,
                     targets,
                     step,
                     self.training_config.training_steps,
+                    precomputed_activations=feature_activations_batch,
                 )
 
                 # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
                 # We need *full* feature activations *after* non-linearity
                 if hasattr(self, "n_forward_passes_since_fired"):
                     with torch.no_grad():
-                        # get_feature_activations returns the *full* tensor
-                        feature_activations_batch = self.model.get_feature_activations(inputs)
-
                         for layer_idx, layer_acts in feature_activations_batch.items():
                             # Ensure layer index is within bounds of the counter tensor
                             if layer_idx < self.n_forward_passes_since_fired.shape[0]:
@@ -1138,6 +1149,10 @@ class CLTTrainer:
 
                     # --- Optimizer step --- (Applied to local parameters using local gradients)
                     self.optimizer.step()
+
+                    # --- Invalidate Caches --- #
+                    if hasattr(self.model, "_cached_decoder_norms"):
+                        self.model._cached_decoder_norms = None
 
                 # --- Scheduler step --- (All ranks)
                 if self.scheduler:
@@ -1207,6 +1222,17 @@ class CLTTrainer:
 
                         # --- Save metrics JSON after evaluation ---
                         self._save_metrics()
+
+                    # Optionally compute and log sparsity diagnostics (can be slow)
+                    if self.training_config.compute_sparsity_diagnostics:
+                        # Calculate diagnostics using the same batch data and cached activations/norms
+                        sparsity_diag_metrics = self._compute_sparsity_diagnostics(inputs, feature_activations_batch)
+                        # Merge diagnostics into the main eval metrics dict
+                        if sparsity_diag_metrics:
+                            eval_metrics.update(sparsity_diag_metrics)
+                            # Log updated metrics to WandB (only rank 0)
+                            if not self.distributed or self.rank == 0:
+                                self.wandb_logger.log_evaluation(step, eval_metrics)
 
                     # Ensure all ranks finish evaluation before proceeding
                     if self.distributed:
@@ -1281,3 +1307,123 @@ class CLTTrainer:
             dist.destroy_process_group()
 
         return self.model
+
+    # --- Helper method for optional, potentially slow diagnostics --- #
+    @torch.no_grad()
+    def _compute_sparsity_diagnostics(
+        self, inputs: Dict[int, torch.Tensor], feature_activations: Dict[int, torch.Tensor]
+    ) -> Dict[str, Any]:
+        """Computes detailed sparsity diagnostics (z-scores, tanh saturation, etc.).
+
+        Args:
+            inputs: Dictionary of input activations (used implicitly by get_decoder_norms).
+            feature_activations: Dictionary of feature activations (pre-computed).
+
+        Returns:
+            Dictionary containing sparsity diagnostic metrics.
+        """
+        diag_metrics: Dict[str, Any] = {}
+        layerwise_z_median: Dict[str, float] = {}
+        layerwise_z_p90: Dict[str, float] = {}
+        layerwise_mean_tanh: Dict[str, float] = {}
+        layerwise_sat_frac: Dict[str, float] = {}
+        layerwise_mean_abs_act: Dict[str, float] = {}
+        layerwise_mean_dec_norm: Dict[str, float] = {}
+
+        all_layer_medians = []
+        all_layer_p90s = []
+        all_layer_mean_tanhs = []
+        all_layer_sat_fracs = []
+        all_layer_abs_act = []
+        all_layer_dec_norm = []
+
+        sparsity_c = self.training_config.sparsity_c
+
+        # Norms should be cached from the loss calculation earlier in the step
+        diag_dec_norms = self.model.get_decoder_norms()  # [L, F]
+
+        for l_idx, layer_acts in feature_activations.items():
+            if layer_acts.numel() == 0:
+                layer_key = f"layer_{l_idx}"
+                layerwise_z_median[layer_key] = float("nan")
+                layerwise_z_p90[layer_key] = float("nan")
+                layerwise_mean_tanh[layer_key] = float("nan")
+                layerwise_sat_frac[layer_key] = float("nan")
+                continue
+
+            # Ensure norms and activations are compatible and on the same device
+            norms_l = diag_dec_norms[l_idx].to(layer_acts.device, layer_acts.dtype).unsqueeze(0)  # [1, F]
+            layer_acts = layer_acts.to(norms_l.device, norms_l.dtype)
+
+            z = sparsity_c * norms_l * layer_acts  # [tokens, F]
+            on_mask = layer_acts > 1e-6  # Use a small threshold > 0
+            z_on = z[on_mask]
+
+            if z_on.numel() > 0:
+                med = torch.median(z_on).item()
+                p90 = torch.quantile(z_on, 0.9).item()
+                tanh_z_on = torch.tanh(z_on)
+                mean_tanh = tanh_z_on.mean().item()
+                sat_frac = (tanh_z_on > 0.99).float().mean().item()
+            else:
+                # If no features were active, assign NaN or 0
+                med, p90, mean_tanh, sat_frac = float("nan"), float("nan"), float("nan"), float("nan")
+
+            layer_key = f"layer_{l_idx}"
+            layerwise_z_median[layer_key] = med
+            layerwise_z_p90[layer_key] = p90
+            layerwise_mean_tanh[layer_key] = mean_tanh
+            layerwise_sat_frac[layer_key] = sat_frac
+
+            # --- Additional diagnostics: mean |a| and decoder norm ---
+            mean_abs_act_val = layer_acts.abs().mean().item() if layer_acts.numel() > 0 else float("nan")
+            mean_dec_norm_val = diag_dec_norms[l_idx].mean().item()
+            layerwise_mean_abs_act.setdefault(f"layer_{l_idx}", mean_abs_act_val)
+            layerwise_mean_dec_norm.setdefault(f"layer_{l_idx}", mean_dec_norm_val)
+            if not torch.isnan(torch.tensor(mean_abs_act_val)):
+                all_layer_abs_act.append(mean_abs_act_val)
+            if not torch.isnan(torch.tensor(mean_dec_norm_val)):
+                all_layer_dec_norm.append(mean_dec_norm_val)
+
+            # Add to lists for aggregation (skip NaNs)
+            if not torch.isnan(torch.tensor(med)):
+                all_layer_medians.append(med)
+            if not torch.isnan(torch.tensor(p90)):
+                all_layer_p90s.append(p90)
+            if not torch.isnan(torch.tensor(mean_tanh)):
+                all_layer_mean_tanhs.append(mean_tanh)
+            if not torch.isnan(torch.tensor(sat_frac)):
+                all_layer_sat_fracs.append(sat_frac)
+
+        # Calculate aggregate metrics (average of per-layer values)
+        agg_z_median = torch.tensor(all_layer_medians).mean().item() if all_layer_medians else float("nan")
+        agg_z_p90 = torch.tensor(all_layer_p90s).mean().item() if all_layer_p90s else float("nan")
+        agg_mean_tanh = torch.tensor(all_layer_mean_tanhs).mean().item() if all_layer_mean_tanhs else float("nan")
+        agg_sat_frac = torch.tensor(all_layer_sat_fracs).mean().item() if all_layer_sat_fracs else float("nan")
+        agg_mean_abs_act = torch.tensor(all_layer_abs_act).mean().item() if all_layer_abs_act else float("nan")
+        agg_mean_dec_norm = torch.tensor(all_layer_dec_norm).mean().item() if all_layer_dec_norm else float("nan")
+
+        # --- Populate diagnostics dictionary --- #
+        # Layerwise dictionaries
+        diag_metrics["layerwise/sparsity_z_median"] = layerwise_z_median
+        diag_metrics["layerwise/sparsity_z_p90"] = layerwise_z_p90
+        diag_metrics["layerwise/sparsity_mean_tanh"] = layerwise_mean_tanh
+        diag_metrics["layerwise/sparsity_sat_frac"] = layerwise_sat_frac
+        diag_metrics["layerwise/mean_abs_activation"] = layerwise_mean_abs_act
+        diag_metrics["layerwise/mean_decoder_norm"] = layerwise_mean_dec_norm
+        # Aggregate scalars
+        diag_metrics["sparsity/z_median_agg"] = agg_z_median
+        diag_metrics["sparsity/z_p90_agg"] = agg_z_p90
+        diag_metrics["sparsity/mean_tanh_agg"] = agg_mean_tanh
+        diag_metrics["sparsity/sat_frac_agg"] = agg_sat_frac
+        diag_metrics["sparsity/mean_abs_activation_agg"] = agg_mean_abs_act
+        diag_metrics["sparsity/mean_decoder_norm_agg"] = agg_mean_dec_norm
+
+        # Clean up large tensors (optional, but good practice)
+        del diag_dec_norms
+        del z
+        del z_on
+        del on_mask
+        del tanh_z_on
+
+        return diag_metrics
