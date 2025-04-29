@@ -29,7 +29,8 @@ import sys
 import traceback
 import copy
 from transformers import AutoModelForCausalLM  # Moved import
-import requests
+
+# import requests - Removed
 import shutil  # Import shutil for directory removal
 
 # Import components from the clt library

@@ -28,7 +28,8 @@ import time
 import sys
 import traceback
 import copy
-import requests  # Ensure requests is imported - Removed as server check is goneß
+
+# import requests  # Ensure requests is imported - Removed as server check is goneß
 from transformers import AutoModelForCausalLM  # Moved import
 
 # import requests  # Ensure requests is imported - Removed as server check is gone
@@ -127,7 +128,7 @@ activation_config = ActivationConfig(
     chunk_token_threshold=32_000,
     activation_dtype="float32",
     # Normalization - Not needed for norm=none
-    compute_norm_stats=True,
+    compute_norm_stats=False,
     # NNsight args (defaults are usually fine)
     nnsight_tracer_kwargs={},
     nnsight_invoker_args={},
