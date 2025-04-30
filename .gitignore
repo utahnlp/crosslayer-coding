@@ -192,3 +192,4 @@ tutorials/tutorial_activations_local_100k/
 tutorials/tutorial_activations_local_100k_v2/
 tutorials/tutorial_activations_local_1M_pythia/
 tutorials/tutorial_activations_local_100k_pythia/
+tutorials/tutorial_activations_local_1M_float16/

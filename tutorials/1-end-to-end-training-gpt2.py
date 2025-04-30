@@ -84,7 +84,7 @@ print(model)
 # We need to match the base model's dimensions
 gpt2_num_layers = 12
 gpt2_d_model = 768
-expansion_factor = 32
+expansion_factor = 4
 
 # For the tutorial, let's use a smaller number of features than d_model
 clt_num_features = gpt2_d_model * expansion_factor
@@ -93,6 +93,7 @@ clt_config = CLTConfig(
     num_layers=gpt2_num_layers,  # Must match the base model
     d_model=gpt2_d_model,  # Must match the base model
     activation_fn="relu",  # As described in the paper
+    clt_dtype="float32",
     # jumprelu_threshold=0.2,  # Default value from paper
 )
 print("CLT Configuration:")
@@ -178,7 +179,7 @@ training_config = TrainingConfig(
     train_batch_size_tokens=_batch_size,
     sampling_strategy="sequential",
     # Normalization for training (use stored stats)
-    normalization_method="auto",  # Use stats from norm_stats.json generated earlier
+    normalization_method="none",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
     sparsity_lambda=_sparsity_lambda,
     sparsity_lambda_schedule="linear",
