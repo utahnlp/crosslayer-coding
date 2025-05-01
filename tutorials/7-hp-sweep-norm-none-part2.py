@@ -331,6 +331,16 @@ for sc in sparsity_c_values:
                 del trained_clt_model
             if trainer is not None:
                 del trainer
+            # Attempt to clear wandb cache
+            try:
+                wandb_cache_dir = os.path.expanduser("~/.cache/wandb")
+                if os.path.exists(wandb_cache_dir):
+                    print(f"Attempting to remove wandb cache directory: {wandb_cache_dir}")
+                    shutil.rmtree(wandb_cache_dir)
+                    print("Wandb cache directory removed.")
+            except OSError as e:
+                print(f"[Warning] Failed to remove wandb cache directory {wandb_cache_dir}: {e}")
+                traceback.print_exc()
             if device == "cuda":
                 torch.cuda.empty_cache()
             gc.collect()
@@ -345,6 +355,18 @@ for sc in sparsity_c_values:
             del trained_clt_model
         if trainer is not None:
             del trainer
+
+        # Attempt to clear wandb cache
+        try:
+            wandb_cache_dir = os.path.expanduser("~/.cache/wandb")
+            if os.path.exists(wandb_cache_dir):
+                print(f"Attempting to remove wandb cache directory: {wandb_cache_dir}")
+                shutil.rmtree(wandb_cache_dir)
+                print("Wandb cache directory removed.")
+        except OSError as e:
+            print(f"[Warning] Failed to remove wandb cache directory {wandb_cache_dir}: {e}")
+            traceback.print_exc()
+
         if device == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
