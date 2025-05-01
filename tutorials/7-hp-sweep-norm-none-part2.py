@@ -28,6 +28,8 @@ import time
 import sys
 import traceback
 import copy
+import argparse
+import gc
 
 # import requests  # Ensure requests is imported - Removed as server check is goneß
 from transformers import AutoModelForCausalLM  # Moved import
@@ -231,6 +233,11 @@ else:
 # training using the locally generated activations via the manifest.
 
 # %%
+# --- Argument Parsing ---
+parser = argparse.ArgumentParser(description="Run part 2 of GPT-2 CLT hyperparameter sweep with norm=none.")
+parser.add_argument("--skip", type=int, default=0, help="Number of hyperparameter combinations to skip.")
+args = parser.parse_args()
+print(f"Skipping the first {args.skip} runs.")
 
 # --- Define Hyperparameter Ranges for this script ---
 all_sparsity_c_values = [0.01, 0.03, 0.09, 0.27, 0.81, 2.43]
@@ -246,6 +253,7 @@ print(f"Sweeping over sparsity_lambda: {sparsity_lambda_values}")
 # --- Sweep Loop ---
 sweep_results: dict = {}
 log_base_dir = f"clt_training_logs/norm_none_part2"
+run_counter = 0  # Initialize run counter
 
 # --- Delete existing log directory for this script before starting ---
 if os.path.exists(log_base_dir):
@@ -257,8 +265,17 @@ os.makedirs(log_base_dir, exist_ok=True)
 
 for sc in sparsity_c_values:
     for sl in sparsity_lambda_values:
+        run_counter += 1  # Increment counter
+        if run_counter <= args.skip:
+            print(f"--- Skipping Run {run_counter}: sparsity_c={sc:.2f}, sparsity_lambda={sl:.1e} ---")
+            continue  # Skip this iteration
+
         run_start_time = time.time()
-        print(f"\n--- Starting Run: sparsity_c={sc:.2f}, sparsity_lambda={sl:.1e} ---")
+        print(f"\n--- Starting Run {run_counter}: sparsity_c={sc:.2f}, sparsity_lambda={sl:.1e} ---")
+
+        # Initialize variables for cleanup
+        trainer = None
+        trained_clt_model = None
 
         training_config = copy.deepcopy(base_training_config)
         training_config.sparsity_c = sc
@@ -309,10 +326,29 @@ for sc in sparsity_c_values:
             print(f"\n[ERROR] Failed during run (sc={sc:.2f}, sl={sl:.1e}): {e}")
             traceback.print_exc()
             print("Continuing to the next run...")
+            # Ensure cleanup happens even on error before continuing
+            if trained_clt_model is not None:
+                del trained_clt_model
+            if trainer is not None:
+                del trainer
+            if device == "cuda":
+                torch.cuda.empty_cache()
+            gc.collect()
             continue
 
         run_end_time = time.time()
-        print(f"--- Finished Run (sc={sc:.2f}, sl={sl:.1e}) in {run_end_time - run_start_time:.2f}s ---")
+        print(f"--- Finished Run {run_counter} (sc={sc:.2f}, sl={sl:.1e}) in {run_end_time - run_start_time:.2f}s ---")
+
+        # --- Memory Cleanup ---
+        print("Cleaning up memory before next run...")
+        if trained_clt_model is not None:
+            del trained_clt_model
+        if trainer is not None:
+            del trainer
+        if device == "cuda":
+            torch.cuda.empty_cache()
+        gc.collect()
+        print("Cleanup complete.")
 
 # %% [markdown]
 # ## 5. Post-Sweep Analysis
