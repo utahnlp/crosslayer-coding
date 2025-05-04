@@ -240,123 +240,118 @@ print(f"Skipping the first {args.skip} runs.")
 
 
 # --- Define Hyperparameter Ranges for this script ---
-all_sparsity_c_values = [0.01, 0.03, 0.09, 0.27, 0.81, 2.43]
-split_point = len(all_sparsity_c_values) // 2
-sparsity_c_values = all_sparsity_c_values[:split_point]  # First half
+# Original lists:
+# all_sparsity_c_values = [0.01, 0.03, 0.09, 0.27, 0.81, 2.43]
+# split_point = len(all_sparsity_c_values) // 2
+# sparsity_c_values = all_sparsity_c_values[:split_point]  # First half
+# sparsity_lambda_values = [1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3]
 
-# Use all lambda values
-sparsity_lambda_values = [1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3]
+# Define the specific missing combinations to run for Part 1
+missing_runs_part1 = [
+    # (sparsity_c, sparsity_lambda)
+    (0.03, 2.7e-4),
+    (0.03, 8.1e-4),
+    (0.03, 2.43e-3),
+    (0.09, 1e-5),
+    (0.09, 3e-5),
+    (0.09, 9e-5),
+    (0.09, 2.7e-4),
+    (0.09, 8.1e-4),
+    (0.09, 2.43e-3),
+]
 
-print("\nStarting Hyperparameter Sweep (GPT-2, Local Manifest, Norm=None, Part 1)...")
-print(f"Sweeping over sparsity_c: {sparsity_c_values}")
-print(f"Sweeping over sparsity_lambda: {sparsity_lambda_values}")
+print("Starting Hyperparameter Sweep (GPT-2, Local Manifest, Norm=None, Part 1 - Missing Runs)...")
+print(f"Running specific missing combinations: {missing_runs_part1}")
+# print(f"Sweeping over sparsity_c: {sparsity_c_values}") # Original print
+# print(f"Sweeping over sparsity_lambda: {sparsity_lambda_values}") # Original print
 
 # --- Sweep Loop ---
 sweep_results: dict = {}
-log_base_dir = f"clt_training_logs/norm_none_part1"
+# Define the main log directory (one level up from script-specific)
+main_log_dir = "clt_training_logs"
+# Define the script-specific sub-directory for organization (optional but good practice)
+log_sub_dir = "norm_none_part1"  # Original: f"clt_training_logs/norm_none_part1"
 run_counter = 0  # Initialize run counter
 
-# --- Delete existing log directory for this script before starting ---
-if os.path.exists(log_base_dir):
-    print(f"Deleting existing log directory: {log_base_dir}")
-    shutil.rmtree(log_base_dir)
+# --- Delete the *entire* existing log directory before starting ---
+# WARNING: This deletes ALL logs in clt_training_logs, not just for this script.
+if os.path.exists(main_log_dir):
+    print(f"Deleting entire existing log directory: {main_log_dir}")
+    shutil.rmtree(main_log_dir)
 # ------------------------------------------------------------------
 
-os.makedirs(log_base_dir, exist_ok=True)
+# Recreate the main directory (and script subdir if needed)
+script_log_base_dir = os.path.join(main_log_dir, log_sub_dir)
+os.makedirs(script_log_base_dir, exist_ok=True)
 
-for sc in sparsity_c_values:
-    for sl in sparsity_lambda_values:
-        run_counter += 1  # Increment counter
-        if run_counter <= args.skip:
-            print(f"--- Skipping Run {run_counter}: sparsity_c={sc:.2f}, sparsity_lambda={sl:.1e} ---")
-            continue  # Skip this iteration
+# Loop through the defined missing combinations
+for sc, sl in missing_runs_part1:
+    run_counter += 1  # Increment counter
+    if run_counter <= args.skip:
+        print(f"--- Skipping Run {run_counter}: sparsity_c={sc:.2f}, sparsity_lambda={sl:.1e} ---")
+        continue  # Skip this iteration
 
-        run_start_time = time.time()
-        print(f"\n--- Starting Run {run_counter}: sparsity_c={sc:.2f}, sparsity_lambda={sl:.1e} ---")
+    run_start_time = time.time()
+    print(f"\n--- Starting Run {run_counter}: sparsity_c={sc:.2f}, sparsity_lambda={sl:.1e} ---")
 
-        # Initialize variables for cleanup
-        trainer = None
-        trained_clt_model = None
+    # Initialize variables for cleanup
+    trainer = None
+    trained_clt_model = None
 
-        training_config = copy.deepcopy(base_training_config)
-        training_config.sparsity_c = sc
-        training_config.sparsity_lambda = sl
+    training_config = copy.deepcopy(base_training_config)
+    training_config.sparsity_c = sc
+    training_config.sparsity_lambda = sl
 
-        wdb_run_name = (
-            f"{clt_config.num_features}-width-"
-            f"{training_config.train_batch_size_tokens}-batch-"
-            f"{training_config.learning_rate:.1e}-lr-"
-            f"{sl:.1e}-slambda-"
-            f"{sc:.2f}-sc-"
-            f"norm_{training_config.normalization_method}"  # Will be "none"
+    wdb_run_name = (
+        f"{clt_config.num_features}-width-"
+        f"{training_config.train_batch_size_tokens}-batch-"
+        f"{training_config.learning_rate:.1e}-lr-"
+        f"{sl:.1e}-slambda-"
+        f"{sc:.2f}-sc-"
+        f"norm_{training_config.normalization_method}"  # Will be "none"
+    )
+    training_config.wandb_run_name = wdb_run_name
+    print(f"Generated WandB run name: {wdb_run_name}")
+
+    log_dir = os.path.join(script_log_base_dir, f"sweep_sc_{sc:.2f}_sl_{sl:.1e}_{int(run_start_time)}")  # Updated path
+    os.makedirs(log_dir, exist_ok=True)
+    print(f"Logs and checkpoints will be saved to: {log_dir}")
+
+    try:
+        print("\nCreating CLTTrainer instance for this run...")
+        print(f"- Activation Source: {training_config.activation_source}")
+        print(f"- Reading activations from: {training_config.activation_path}")
+        # Safely access remote config details - REMOVED
+        # if training_config.remote_config: ...
+        print(f"- Training Config: {vars(training_config)}")  # Simplified print
+
+        trainer = CLTTrainer(
+            clt_config=clt_config,
+            training_config=training_config,
+            log_dir=log_dir,
+            device=device,
+            distributed=False,
         )
-        training_config.wandb_run_name = wdb_run_name
-        print(f"Generated WandB run name: {wdb_run_name}")
+        print("CLTTrainer instance created successfully.")
 
-        log_dir = os.path.join(log_base_dir, f"sweep_sc_{sc:.2f}_sl_{sl:.1e}_{int(run_start_time)}")
-        os.makedirs(log_dir, exist_ok=True)
-        print(f"Logs and checkpoints will be saved to: {log_dir}")
+        print("\nBeginning training for this run...")
+        start_train_time = time.time()
+        trained_clt_model = trainer.train(eval_every=training_config.eval_interval)
+        end_train_time = time.time()
+        print(
+            f"\nTraining for run (sc={sc:.2f}, sl={sl:.1e}) finished in {end_train_time - start_train_time:.2f} seconds."
+        )
+        print(f"Final model for this run saved automatically in: {log_dir}")
 
-        try:
-            print("\nCreating CLTTrainer instance for this run...")
-            print(f"- Activation Source: {training_config.activation_source}")
-            print(f"- Reading activations from: {training_config.activation_path}")
-            # Safely access remote config details - REMOVED
-            # if training_config.remote_config: ...
-            print(f"- Training Config: {vars(training_config)}")  # Simplified print
-
-            trainer = CLTTrainer(
-                clt_config=clt_config,
-                training_config=training_config,
-                log_dir=log_dir,
-                device=device,
-                distributed=False,
-            )
-            print("CLTTrainer instance created successfully.")
-
-            print("\nBeginning training for this run...")
-            start_train_time = time.time()
-            trained_clt_model = trainer.train(eval_every=training_config.eval_interval)
-            end_train_time = time.time()
-            print(
-                f"\nTraining for run (sc={sc:.2f}, sl={sl:.1e}) finished in {end_train_time - start_train_time:.2f} seconds."
-            )
-            print(f"Final model for this run saved automatically in: {log_dir}")
-
-        except Exception as e:
-            print(f"\n[ERROR] Failed during run (sc={sc:.2f}, sl={sl:.1e}): {e}")
-            traceback.print_exc()
-            print("Continuing to the next run...")
-            # Ensure cleanup happens even on error before continuing
-            if trained_clt_model is not None:
-                del trained_clt_model
-            if trainer is not None:
-                del trainer
-            # Attempt to clear wandb cache
-            try:
-                wandb_cache_dir = os.path.expanduser("~/.cache/wandb")
-                if os.path.exists(wandb_cache_dir):
-                    print(f"Attempting to remove wandb cache directory: {wandb_cache_dir}")
-                    shutil.rmtree(wandb_cache_dir)
-                    print("Wandb cache directory removed.")
-            except OSError as e:
-                print(f"[Warning] Failed to remove wandb cache directory {wandb_cache_dir}: {e}")
-                traceback.print_exc()
-            if device == "cuda":
-                torch.cuda.empty_cache()
-            gc.collect()
-            continue
-
-        run_end_time = time.time()
-        print(f"--- Finished Run {run_counter} (sc={sc:.2f}, sl={sl:.1e}) in {run_end_time - run_start_time:.2f}s ---")
-
-        # --- Memory Cleanup ---
-        print("Cleaning up memory before next run...")
+    except Exception as e:
+        print(f"\n[ERROR] Failed during run (sc={sc:.2f}, sl={sl:.1e}): {e}")
+        traceback.print_exc()
+        print("Continuing to the next run...")
+        # Ensure cleanup happens even on error before continuing
         if trained_clt_model is not None:
             del trained_clt_model
         if trainer is not None:
             del trainer
-
         # Attempt to clear wandb cache
         try:
             wandb_cache_dir = os.path.expanduser("~/.cache/wandb")
@@ -367,11 +362,36 @@ for sc in sparsity_c_values:
         except OSError as e:
             print(f"[Warning] Failed to remove wandb cache directory {wandb_cache_dir}: {e}")
             traceback.print_exc()
-
         if device == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
-        print("Cleanup complete.")
+        continue
+
+    run_end_time = time.time()
+    print(f"--- Finished Run {run_counter} (sc={sc:.2f}, sl={sl:.1e}) in {run_end_time - run_start_time:.2f}s ---")
+
+    # --- Memory Cleanup ---
+    print("Cleaning up memory before next run...")
+    if trained_clt_model is not None:
+        del trained_clt_model
+    if trainer is not None:
+        del trainer
+
+    # Attempt to clear wandb cache
+    try:
+        wandb_cache_dir = os.path.expanduser("~/.cache/wandb")
+        if os.path.exists(wandb_cache_dir):
+            print(f"Attempting to remove wandb cache directory: {wandb_cache_dir}")
+            shutil.rmtree(wandb_cache_dir)
+            print("Wandb cache directory removed.")
+    except OSError as e:
+        print(f"[Warning] Failed to remove wandb cache directory {wandb_cache_dir}: {e}")
+        traceback.print_exc()
+
+    if device == "cuda":
+        torch.cuda.empty_cache()
+    gc.collect()
+    print("Cleanup complete.")
 
 # %% [markdown]
 # ## 5. Post-Sweep Analysis
@@ -385,6 +405,6 @@ for sc in sparsity_c_values:
 
 # %%
 print("\nHyperparameter Sweep (GPT-2, Local Manifest, Norm=None, Part 1) Complete!")  # Updated print
-print(f"Logs for each run are saved in subdirectories within: {log_base_dir}")
+print(f"Logs for each run are saved in subdirectories within: {script_log_base_dir}")  # Updated path
 
 # %%
