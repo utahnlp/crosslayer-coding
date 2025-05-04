@@ -277,14 +277,7 @@ main_log_dir = "clt_training_logs"
 log_sub_dir = "norm_auto_part1"  # Original: f"clt_training_logs/norm_auto_part1"
 run_counter = 0  # Initialize run counter
 
-# --- Delete the *entire* existing log directory before starting ---
-# WARNING: This deletes ALL logs in clt_training_logs, not just for this script.
-if os.path.exists(main_log_dir):
-    print(f"Deleting entire existing log directory: {main_log_dir}")
-    shutil.rmtree(main_log_dir)
-# ------------------------------------------------------------------
-
-# Recreate the main directory (and script subdir if needed)
+# Create the main directory and script subdir if they don't exist
 script_log_base_dir = os.path.join(main_log_dir, log_sub_dir)
 os.makedirs(script_log_base_dir, exist_ok=True)
 
@@ -382,6 +375,10 @@ for sc, sl in missing_runs_part1:
         if device == "cuda":
             torch.cuda.empty_cache()
         gc.collect()
+        # --- Delete logs after failed run --- #
+        print(f"Deleting log directory after failed run: {main_log_dir}")
+        shutil.rmtree(main_log_dir, ignore_errors=True)
+        # ----------------------------------- #
         continue
 
     run_end_time = time.time()
@@ -407,6 +404,11 @@ for sc, sl in missing_runs_part1:
         torch.cuda.empty_cache()
     gc.collect()
     print("Cleanup complete.")
+
+    # --- Delete logs after successful run --- #
+    print(f"Deleting log directory after successful run: {main_log_dir}")
+    shutil.rmtree(main_log_dir, ignore_errors=True)
+    # --------------------------------------- #
 
 # %% [markdown]
 # ## 5. Post-Sweep Analysis (Optional)
