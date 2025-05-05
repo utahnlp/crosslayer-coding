@@ -15,6 +15,7 @@ from torch.distributed.checkpoint.state_dict_saver import save_state_dict
 from torch.distributed.checkpoint.state_dict_loader import load_state_dict
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner, DefaultLoadPlanner
 from torch.distributed.checkpoint.filesystem import FileSystemWriter, FileSystemReader  # Storage for checkpointing
+from dataclasses import asdict  # Add dataclasses import
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
@@ -1305,6 +1306,30 @@ class CLTTrainer:
 
             print("Saving final metrics...")
             self._save_metrics()
+
+            # --- Save CLT Config to JSON ---
+            config_save_path = os.path.join(self.log_dir, "cfg.json")
+            print(f"Saving CLT configuration to {config_save_path}...")
+            try:
+                # Convert CLTConfig dataclass to dict
+                config_dict = asdict(self.clt_config)
+
+                # Try to add model_name if available from training_config
+                model_name = None
+                if (
+                    hasattr(self.training_config, "generation_config")
+                    and self.training_config.generation_config is not None
+                    and "model_name" in self.training_config.generation_config
+                ):
+                    model_name = self.training_config.generation_config["model_name"]
+                    config_dict["model_name"] = model_name  # Add model_name to the dict
+
+                with open(config_save_path, "w") as f:
+                    json.dump(config_dict, f, indent=2)
+                print(f"Successfully saved configuration to {config_save_path}")
+            except Exception as e:
+                print(f"Rank 0: Warning: Failed to save CLT configuration to JSON: {e}")
+            # --- End Save CLT Config ---
 
             # Log final checkpoint directory as artifact
             self.wandb_logger.log_artifact(artifact_path=final_checkpoint_dir, artifact_type="model", name="clt_final")

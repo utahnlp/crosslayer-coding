@@ -92,8 +92,8 @@ clt_config = CLTConfig(
     num_features=clt_num_features,
     num_layers=gpt2_num_layers,  # Must match the base model
     d_model=gpt2_d_model,  # Must match the base model
-    activation_fn="jumprelu",  # As described in the paper
-    jumprelu_threshold=0.2,  # Default value from paper
+    activation_fn="relu",  # As described in the paper
+    # jumprelu_threshold=0.2,  # Default value from paper
 )
 print("CLT Configuration:")
 print(clt_config)
@@ -101,13 +101,13 @@ print(clt_config)
 # --- Activation Generation Configuration ---
 # Define where activations will be stored and how they should be generated
 # Use a small number of target tokens for the tutorial
-activation_dir = "./tutorial_activations_local_1M_pythia"
+activation_dir = "./tutorial_activations_local_1M_pythia_ln"
 # Fix SyntaxError: remove parenthesis around string assignment
 dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
-    mlp_input_module_path_template="gpt_neox.layers.{}.mlp.input",  # We include the layernorm for linearity
+    mlp_input_module_path_template="gpt_neox.layers.{}.input_layernorm.input",  # We include the layernorm for linearity
     mlp_output_module_path_template="gpt_neox.layers.{}.mlp.output",  # Default for GPT2
     model_dtype=None,  # Use default precision
     # Dataset Source

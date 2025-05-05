@@ -1,5 +1,10 @@
+import json
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Dict, Any
+from typing import Literal, Optional, Dict, Any, TypeVar, Type
+
+
+# Generic type for Config subclasses
+C = TypeVar("C", bound="CLTConfig")
 
 
 @dataclass
@@ -19,6 +24,30 @@ class CLTConfig:
         assert self.num_layers > 0, "Number of layers must be positive"
         assert self.d_model > 0, "Model dimension must be positive"
         assert self.jumprelu_threshold > 0, "JumpReLU threshold must be positive"
+
+    @classmethod
+    def from_json(cls: Type[C], json_path: str) -> C:
+        """Load configuration from a JSON file.
+
+        Args:
+            json_path: Path to the JSON configuration file.
+
+        Returns:
+            An instance of the configuration class.
+        """
+        with open(json_path, "r") as f:
+            config_dict = json.load(f)
+        return cls(**config_dict)
+
+    def to_json(self, json_path: str) -> None:
+        """Save configuration to a JSON file.
+
+        Args:
+            json_path: Path to save the JSON configuration file.
+        """
+        config_dict = self.__dict__
+        with open(json_path, "w") as f:
+            json.dump(config_dict, f, indent=4)
 
 
 @dataclass
