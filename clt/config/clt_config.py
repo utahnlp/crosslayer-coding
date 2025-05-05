@@ -14,6 +14,7 @@ class CLTConfig:
     num_features: int  # Number of features per layer
     num_layers: int  # Number of transformer layers
     d_model: int  # Dimension of model's hidden state
+    model_name: Optional[str] = None  # Optional name for the underlying model
     activation_fn: Literal["jumprelu", "relu"] = "jumprelu"
     jumprelu_threshold: float = 0.03  # Threshold for JumpReLU activation
     clt_dtype: Optional[str] = None  # Optional dtype for the CLT model itself (e.g., "float16")
