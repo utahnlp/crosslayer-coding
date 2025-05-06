@@ -1314,7 +1314,10 @@ class CLTTrainer:
                 # Convert CLTConfig dataclass to dict
                 config_dict = asdict(self.clt_config)
 
-                # Try to add model_name if available from training_config
+                # --- Populate fields relevant for inference from TrainingConfig --- #
+                # (Overwrites defaults in clt_config if training_config has values)
+
+                # Model Name (useful context)
                 model_name = None
                 if (
                     hasattr(self.training_config, "generation_config")
@@ -1323,6 +1326,16 @@ class CLTTrainer:
                 ):
                     model_name = self.training_config.generation_config["model_name"]
                     config_dict["model_name"] = model_name  # Add model_name to the dict
+
+                # Normalization Method (Crucial for inference data handling)
+                if hasattr(self.training_config, "normalization_method"):
+                    config_dict["normalization_method"] = self.training_config.normalization_method
+
+                # Expected Input dtype (Crucial for inference data handling)
+                if hasattr(self.training_config, "activation_dtype"):
+                    config_dict["expected_input_dtype"] = self.training_config.activation_dtype
+
+                # --- End Inference Field Population --- #
 
                 with open(config_save_path, "w") as f:
                     json.dump(config_dict, f, indent=2)

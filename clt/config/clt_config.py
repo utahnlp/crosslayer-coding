@@ -15,9 +15,13 @@ class CLTConfig:
     num_layers: int  # Number of transformer layers
     d_model: int  # Dimension of model's hidden state
     model_name: Optional[str] = None  # Optional name for the underlying model
+    normalization_method: Literal["auto", "estimated_mean_std", "none"] = (
+        "none"  # How activations were normalized during training
+    )
     activation_fn: Literal["jumprelu", "relu"] = "jumprelu"
     jumprelu_threshold: float = 0.03  # Threshold for JumpReLU activation
     clt_dtype: Optional[str] = None  # Optional dtype for the CLT model itself (e.g., "float16")
+    expected_input_dtype: Optional[str] = None  # Expected dtype of input activations
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -25,6 +29,10 @@ class CLTConfig:
         assert self.num_layers > 0, "Number of layers must be positive"
         assert self.d_model > 0, "Model dimension must be positive"
         assert self.jumprelu_threshold > 0, "JumpReLU threshold must be positive"
+        valid_norm_methods = ["auto", "estimated_mean_std", "none"]
+        assert (
+            self.normalization_method in valid_norm_methods
+        ), f"Invalid normalization_method: {self.normalization_method}. Must be one of {valid_norm_methods}"
 
     @classmethod
     def from_json(cls: Type[C], json_path: str) -> C:
