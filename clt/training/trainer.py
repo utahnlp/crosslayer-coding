@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-from typing import Dict, Optional, Union, Any
+from typing import Dict, Literal, Optional, Union, Any
 from tqdm import tqdm  # type: ignore
 import os
 import json
@@ -33,6 +33,8 @@ from clt.nnsight.extractor import (
     ActivationExtractorCLT,
 )  # Keep for StreamingStore usage
 from .evaluator import CLTEvaluator  # Import the new evaluator
+
+import ray
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -286,6 +288,7 @@ class CLTTrainer:
         log_dir: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
         distributed: bool = False,  # Add distributed flag
+        use_ray: Optional[Literal['train', 'tune']] = None,
     ):
         """Initialize the CLT trainer.
 
@@ -482,6 +485,19 @@ class CLTTrainer:
         else:
             # Dummy logger for non-rank-0 processes
             self.wandb_logger = DummyWandBLogger()
+
+
+        if use_ray:
+            if use_ray == 'train':
+                from ray.train import report
+            elif use_ray == 'tune':
+                from ray.tune import report
+
+            self.ray_reporter = report
+
+        else:
+            self.ray_reporter = None
+
 
     @property
     def dead_neurons_mask(self) -> torch.Tensor:
@@ -1250,6 +1266,12 @@ class CLTTrainer:
                 # --- Checkpointing (All ranks participate) ---
                 if save_checkpoint_flag:
                     self._save_checkpoint(step)
+
+                if self.ray_reporter:
+                    ray_metrics = loss_dict
+                    if run_eval_flag:
+                        ray_metrics = ray_metrics | eval_metrics
+                    self.ray_reporter(ray_metrics)
 
             # --- Explicitly delete tensors at the very end of the loop iteration --- #
             # Do this on all ranks
