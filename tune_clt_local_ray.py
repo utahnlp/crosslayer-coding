@@ -11,6 +11,7 @@ from typing import Literal, Optional
 import logging
 import time
 import json
+import ray, ray.tune
 
 # Attempt to import transformers for model dimension detection
 try:
@@ -59,6 +60,26 @@ def get_model_dimensions(model_name: str) -> tuple[int, int]:
             f"Falling back to gpt2 defaults (12 layers, 768 hidden size)."
         )
         return 12, 768
+
+
+def train_loop_per_worker(cfg):
+
+    if 'sparsity_c' in cfg:
+        cfg['training_config'].sparsity_c = cfg['sparsity_c']
+    if 'sparsity_lambda' in cfg:
+        cfg['training_config'].sparsity_lambda = cfg['sparsity_lambda']
+
+
+    trainer = CLTTrainer(
+        clt_config=cfg['clt_config'],
+        training_config=cfg['training_config'],
+        log_dir=cfg['log_dir'],
+        device=cfg['device'],
+        distributed=False,  # Explicitly set for tutorial
+        use_ray='tune'
+    )
+
+    trained_clt_model = trainer.train(eval_every=cfg['training_config'].eval_interval)
 
 
 def parse_args():
@@ -372,28 +393,27 @@ def main():
     )
     logger.info(f"Training Config: {training_config}")
 
-    # --- Initialize Trainer ---
-    logger.info("Initializing CLTTrainer...")
-    try:
-        trainer = CLTTrainer(
-            clt_config=clt_config,
-            training_config=training_config,
-            log_dir=str(output_dir),
-            device=device,
-            distributed=args.distributed,
-        )
-    except Exception as e:
-        logger.exception(f"Failed to initialize CLTTrainer: {e}")  # Use logger.exception
-        raise
+    hps = {
+        'sparsity_c': ray.tune.grid_search([0.01, 0.03, 0.09, 0.27, 0.81, 2.43]),
+        'sparsity_lambda': ray.tune.grid_search([1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3])
+    }
 
-    # --- Start Training ---
-    logger.info("Starting training from local activations...")
+    n_gpus = 1
+    n_parallel_workers = 8
+
+    # --- Start Tuning ---
+    logger.info("Starting hyperparameter tuning from local activations...")
     try:
-        trainer.train()  # eval_every is handled internally now
-        logger.info("Training complete!")
+        tuner = ray.tune.Tuner(
+            ray.tune.with_resources(train_loop_per_worker, {'gpu': n_gpus / n_parallel_workers}),
+            param_space=hps,
+            tune_config=ray.tune.TuneConfig(max_concurrent_trials=n_parallel_workers)
+        )
+        results = tuner.fit()
+        logger.info("Tuning complete!")
         logger.info(f"Final model and logs saved in: {output_dir.resolve()}")
     except Exception as e:
-        logger.exception(f"Training failed: {e}")  # Use logger.exception
+        logger.exception(f"Tuning failed: {e}")  # Use logger.exception
         raise
 
 
