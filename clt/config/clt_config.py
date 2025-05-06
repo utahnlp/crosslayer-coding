@@ -22,6 +22,8 @@ class CLTConfig:
     jumprelu_threshold: float = 0.03  # Threshold for JumpReLU activation
     clt_dtype: Optional[str] = None  # Optional dtype for the CLT model itself (e.g., "float16")
     expected_input_dtype: Optional[str] = None  # Expected dtype of input activations
+    mlp_input_template: Optional[str] = None  # Module path template for MLP input activations
+    mlp_output_template: Optional[str] = None  # Module path template for MLP output activations
 
     def __post_init__(self):
         """Validate configuration parameters."""

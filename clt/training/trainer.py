@@ -1335,6 +1335,17 @@ class CLTTrainer:
                 if hasattr(self.training_config, "activation_dtype"):
                     config_dict["expected_input_dtype"] = self.training_config.activation_dtype
 
+                # Hook Templates (if activations were generated)
+                if (
+                    hasattr(self.training_config, "generation_config")
+                    and self.training_config.generation_config is not None
+                ):
+                    gen_cfg = self.training_config.generation_config
+                    if "mlp_input_template" in gen_cfg:
+                        config_dict["mlp_input_template"] = gen_cfg["mlp_input_template"]
+                    if "mlp_output_template" in gen_cfg:
+                        config_dict["mlp_output_template"] = gen_cfg["mlp_output_template"]
+
                 # --- End Inference Field Population --- #
 
                 with open(config_save_path, "w") as f:
