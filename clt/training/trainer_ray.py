@@ -288,7 +288,7 @@ class CLTTrainerRay(CLTTrainer):
         log_dir: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
         distributed: bool = False,  # Add distributed flag
-        use_ray: Optional[Literal['train', 'tune']] = None,
+        use_ray: Literal['train', 'tune'] = 'tune',
     ):
         """Initialize the CLT trainer.
 
@@ -487,50 +487,19 @@ class CLTTrainerRay(CLTTrainer):
         #     self.wandb_logger = DummyWandBLogger()
 
 
-        # Set up imports for Ray if applicable
-        if use_ray:
-            if use_ray == 'train':
-                from ray.train import report
-                from ray.train import Checkpoint
-            elif use_ray == 'tune':
-                from ray.tune import report
-                from ray.tune import Checkpoint
+        # Set up imports for Ray
+        if use_ray == 'train':
+            from ray.train import report
+            from ray.train import Checkpoint
+        elif use_ray == 'tune':
+            from ray.tune import report
+            from ray.tune import Checkpoint
 
-            import tempfile
+        import tempfile
 
-            self.ray_reporter = report
-            self.ray_checkpoint = Checkpoint
-            self.ray_tempfile = tempfile
-
-        else:
-            self.ray_reporter = None
-            self.ray_checkpoint = None
-            self.ray_tempfile = None
-
-    def _save_checkpoint(self, step: int):
-        """Save a distributed checkpoint of the model and activation store state.
-
-        Uses torch.distributed.checkpoint to save sharded state directly.
-
-        Args:
-            step: Current training step
-        """
-
-        with self.ray_tempfile.TemporaryDirectory() as temp_checkpoint_dir:
-
-            model_checkpoint_path = os.path.join(temp_checkpoint_dir, f"clt_checkpoint_{step}.pt")
-            store_checkpoint_path = os.path.join(temp_checkpoint_dir, f"activation_store_checkpoint_{step}.pt")
-
-            torch.save(self.model.state_dict(), model_checkpoint_path)
-            # TODO: wandb_logger untested with ray reporting
-            # self.wandb_logger.log_artifact(
-            #     artifact_path=model_checkpoint_path, artifact_type="model", name=f"clt_checkpoint_{step}"
-            # )
-            torch.save(self.activation_store.state_dict(), store_checkpoint_path)
-
-            checkpoint = self.ray_checkpoint.from_directory(temp_checkpoint_dir)
-
-        return checkpoint
+        self.ray_reporter = report
+        self.ray_checkpoint = Checkpoint
+        self.ray_tempfile = tempfile
 
 
     def train(self, eval_every: int = 1000) -> CrossLayerTranscoder:
