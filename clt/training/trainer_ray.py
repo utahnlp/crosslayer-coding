@@ -287,7 +287,7 @@ class CLTTrainerRay(CLTTrainer):
         training_config: TrainingConfig,
         log_dir: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
-        distributed: bool = False,  # Add distributed flag
+        distributed: bool = False,  # unused for Ray as of now
         use_ray: Literal['train', 'tune'] = 'tune',
     ):
         """Initialize the CLT trainer.
@@ -299,193 +299,7 @@ class CLTTrainerRay(CLTTrainer):
             device: Device to use for training (ignored if distributed)
             distributed: Whether to use distributed training
         """
-        self.clt_config = clt_config
-        self.training_config = training_config
-        self.distributed = distributed
-
-        # Initialize distributed training if enabled
-        self.rank = 0
-        self.world_size = 1
-        self.local_rank = 0
-        self.process_group: Optional[ProcessGroup] = None  # For tensor parallelism
-
-        if self.distributed:
-            if not dist.is_initialized():
-                # Default backend, consider NCCL for NVIDIA GPUs
-                dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
-            self.rank = dist.get_rank()
-            self.world_size = dist.get_world_size()
-            self.local_rank = int(os.environ.get("LOCAL_RANK", self.rank))  # Get local rank if available
-
-            # Set device based on local_rank when distributed
-            if torch.cuda.is_available():
-                self.device = torch.device(f"cuda:{self.local_rank}")
-                torch.cuda.set_device(self.device)
-            else:
-                # Fallback for CPU distributed testing (not typical)
-                self.device = torch.device("cpu")
-                logger.warning("Distributed training requested but CUDA not available. Using CPU.")
-            # Set the process group for tensor parallelism (using WORLD for now)
-            self.process_group = dist.group.WORLD
-        else:
-            # Original device handling for non-distributed case
-            _device_input = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
-            self.device = torch.device(_device_input) if isinstance(_device_input, str) else _device_input
-            # Process group is None when not distributed
-            self.process_group = None
-
-        # Set up log directory - only rank 0 creates it
-        self.log_dir = log_dir or f"clt_train_{int(time.time())}"
-        if not self.distributed or self.rank == 0:
-            os.makedirs(self.log_dir, exist_ok=True)
-
-        # Record start time
-        self.start_time = time.time()
-
-        # Initialize model, passing device and process group for direct initialization
-        # self.process_group is correctly set to None if not distributed
-        self.model = CrossLayerTranscoder(
-            clt_config, process_group=self.process_group, device=self.device  # Pass the potentially None group
-        )
-
-        # Initialize optimizer - works on local parameters
-        # Explicitly type the kwargs dict for clarity and linting
-        optimizer_kwargs: Dict[str, Any] = {"lr": training_config.learning_rate}
-        beta1 = training_config.optimizer_beta1  # Could be None
-        beta2 = training_config.optimizer_beta2  # Could be None
-
-        # Only add 'betas' if at least one is specified
-        if beta1 is not None or beta2 is not None:
-            # Get defaults if one is None
-            # Default Adam/AdamW betas are (0.9, 0.999)
-            final_beta1 = beta1 if beta1 is not None else 0.9
-            final_beta2 = beta2 if beta2 is not None else 0.999
-            optimizer_kwargs["betas"] = (final_beta1, final_beta2)
-            logger.info(f"Rank {self.rank}: Using optimizer betas: ({final_beta1}, {final_beta2})")
-
-        if training_config.optimizer == "adam":
-            self.optimizer: Any = optim.Adam(self.model.parameters(), **optimizer_kwargs)
-        else:  # "adamw"
-            self.optimizer = optim.AdamW(self.model.parameters(), **optimizer_kwargs)
-
-        # Initialize scheduler
-        self.scheduler: Optional[Any] = None
-        scheduler_type = training_config.lr_scheduler
-        # Get scheduler params from config, default to empty dict if None
-        scheduler_params = training_config.lr_scheduler_params or {}
-
-        if scheduler_type == "linear":
-            # Default params for LinearLR
-            default_linear_params = {
-                "start_factor": 1.0,
-                "end_factor": 0.1,
-                # total_iters is always training_steps for this setup
-            }
-            # Update defaults with user-provided params
-            final_params = {**default_linear_params, **scheduler_params}
-            # Ensure total_iters is not overridden by user params
-            final_params.pop("total_iters", None)
-
-            self.scheduler = optim.lr_scheduler.LinearLR(
-                self.optimizer,
-                total_iters=training_config.training_steps,
-                **final_params,  # Pass start_factor, end_factor, etc.
-            )
-            logger.info(
-                f"Rank {self.rank}: Using LinearLR scheduler with params: {final_params}, total_iters={training_config.training_steps}"
-            )
-
-        elif scheduler_type == "cosine":
-            # Default params for CosineAnnealingLR
-            default_cosine_params = {
-                # T_max defaults to training_steps
-                "eta_min": 0,  # Default minimum LR
-            }
-            # Update defaults with user-provided params
-            final_params = {**default_cosine_params, **scheduler_params}
-            # Set T_max explicitly, allowing override but defaulting to training_steps
-            t_max = final_params.pop("T_max", training_config.training_steps)
-
-            self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
-                self.optimizer, T_max=t_max, **final_params  # Pass eta_min, etc.
-            )
-            logger.info(
-                f"Rank {self.rank}: Using CosineAnnealingLR scheduler with params: {final_params}, T_max={t_max}"
-            )
-
-        elif scheduler_type == "linear_final20":
-            # This scheduler keeps LR constant for the initial fraction of training
-            # and then linearly decays it to 0 over the remaining steps (default 20%).
-            # The fraction can be customized via lr_scheduler_params["decay_start_frac"].
-            decay_start_frac = scheduler_params.get("decay_start_frac", 0.8)  # 0.8 means last 20% decays
-            assert 0.0 < decay_start_frac < 1.0, "decay_start_frac must be between 0 and 1"
-            total_steps = training_config.training_steps
-            decay_start_step = int(decay_start_frac * total_steps)
-
-            def lr_lambda(current_step: int):
-                if current_step < decay_start_step:
-                    return 1.0  # Keep LR constant
-                # Linearly decay from 1 -> 0 over the remaining steps
-                remaining = total_steps - current_step
-                decay_steps = total_steps - decay_start_step
-                return max(remaining / decay_steps, 0.0)
-
-            self.scheduler = optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_lambda)
-            logger.info(
-                "Rank %d: Using linear_final20 LR scheduler with decay_start_frac=%s (start step %d of %d)",
-                self.rank,
-                decay_start_frac,
-                decay_start_step,
-                total_steps,
-            )
-
-        # Add elif blocks here for other potential schedulers
-
-        # Initialize activation store based on config - uses self.rank/world_size now
-        self.activation_store = self._create_activation_store(self.start_time)
-
-        # Pass normalisation statistics (if available) so the loss can be computed in
-        # the *original* scale even when inputs/targets are stored normalised.
-        mean_tg_stats = getattr(self.activation_store, "mean_tg", {})  # type: ignore[arg-type]
-        std_tg_stats = getattr(self.activation_store, "std_tg", {})  # type: ignore[arg-type]
-
-        self.loss_manager = LossManager(
-            training_config,
-            mean_tg=mean_tg_stats,
-            std_tg=std_tg_stats,
-        )
-
-        # Initialize Evaluator - Pass norm stats here too
-        self.evaluator = CLTEvaluator(
-            model=self.model,
-            device=self.device,
-            start_time=self.start_time,
-            mean_tg=mean_tg_stats,  # Pass the same stats
-            std_tg=std_tg_stats,  # Pass the same stats
-        )
-
-        # Initialize dead neuron counters (replicated for now, consider sharding later if needed)
-        self.n_forward_passes_since_fired = torch.zeros(
-            (clt_config.num_layers, clt_config.num_features),
-            device=self.device,
-            dtype=torch.long,
-        )
-
-        # Training metrics (only rank 0 saves, but others might need local copies for some logic)
-        self.metrics: Dict[str, list] = {
-            "train_losses": [],
-            "eval_metrics": [],
-        }
-
-        # # Initialize WandB logger - only on rank 0
-        # if not self.distributed or self.rank == 0:
-        #     self.wandb_logger: Union[WandBLogger, DummyWandBLogger] = WandBLogger(
-        #         training_config=training_config, clt_config=clt_config, log_dir=self.log_dir
-        #     )
-        # else:
-        #     # Dummy logger for non-rank-0 processes
-        #     self.wandb_logger = DummyWandBLogger()
-
+        super().__init__(clt_config, training_config, log_dir, device, False)
 
         # Set up imports for Ray
         if use_ray == 'train':
@@ -770,7 +584,7 @@ class CLTTrainerRay(CLTTrainer):
                     )
 
                     if not self.distributed or self.rank == 0:
-                        # Store evaluation metrics (for saving to JSON)
+                        # # Store evaluation metrics (for saving to JSON)
                         # self.metrics["eval_metrics"].append({"step": step, **eval_metrics})
 
                         # --- Update Progress Bar Postfix ---
