@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-from typing import Dict, Literal, Optional, Union, Any
+from typing import Dict, Optional, Union, Any
 from tqdm import tqdm  # type: ignore
 import os
 import json
@@ -33,7 +33,6 @@ from clt.nnsight.extractor import (
     ActivationExtractorCLT,
 )  # Keep for StreamingStore usage
 from .evaluator import CLTEvaluator  # Import the new evaluator
-
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -287,7 +286,6 @@ class CLTTrainer:
         log_dir: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
         distributed: bool = False,  # Add distributed flag
-        use_ray: Optional[Literal['train', 'tune']] = None,
     ):
         """Initialize the CLT trainer.
 
@@ -484,28 +482,6 @@ class CLTTrainer:
         else:
             # Dummy logger for non-rank-0 processes
             self.wandb_logger = DummyWandBLogger()
-
-
-        # Set up imports for Ray if applicable
-        if use_ray:
-            if use_ray == 'train':
-                from ray.train import report
-                from ray.train import Checkpoint
-            elif use_ray == 'tune':
-                from ray.tune import report
-                from ray.tune import Checkpoint
-
-            import tempfile
-
-            self.ray_reporter = report
-            self.ray_checkpoint = Checkpoint
-            self.ray_tempfile = tempfile
-
-        else:
-            self.ray_reporter = None
-            self.ray_checkpoint = None
-            self.ray_tempfile = None
-
 
     @property
     def dead_neurons_mask(self) -> torch.Tensor:
@@ -1272,33 +1248,8 @@ class CLTTrainer:
                         dist.barrier()
 
                 # --- Checkpointing (All ranks participate) ---
-                if save_checkpoint_flag and not self.ray_reporter:
+                if save_checkpoint_flag:
                     self._save_checkpoint(step)
-
-                # Report to ray if enabled
-                if self.ray_reporter:
-                    # Make metrics dict to report
-                    ray_metrics = loss_dict
-                    if run_eval_flag:
-                        ray_metrics = ray_metrics | eval_metrics
-
-                    with self.ray_tempfile.TemporaryDirectory() as temp_checkpoint_dir:
-                        checkpoint = None
-
-                        if save_checkpoint_flag:
-                            model_checkpoint_path = os.path.join(temp_checkpoint_dir, f"clt_checkpoint_{step}.pt")
-                            store_checkpoint_path = os.path.join(temp_checkpoint_dir, f"activation_store_checkpoint_{step}.pt")
-
-                            torch.save(self.model.state_dict(), model_checkpoint_path)
-                            # TODO: wandb_logger untested with ray reporting
-                            # self.wandb_logger.log_artifact(
-                            #     artifact_path=model_checkpoint_path, artifact_type="model", name=f"clt_checkpoint_{step}"
-                            # )
-                            torch.save(self.activation_store.state_dict(), store_checkpoint_path)
-
-                            checkpoint = self.ray_checkpoint.from_directory(temp_checkpoint_dir)
-
-                        self.ray_reporter(ray_metrics, checkpoint=checkpoint)
 
             # --- Explicitly delete tensors at the very end of the loop iteration --- #
             # Do this on all ranks
