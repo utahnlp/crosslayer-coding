@@ -253,6 +253,18 @@ def parse_args():
         help="Coefficient for the pre-activation MSE loss term.",
     )
     train_group.add_argument(
+        "--aux-loss-factor",
+        type=float,
+        default=None,
+        help="Coefficient for the auxiliary reconstruction loss (e.g., for dead latents). If None, loss is not applied.",
+    )
+    train_group.add_argument(
+        "--apply-sparsity-penalty-to-batchtopk",
+        action=argparse.BooleanOptionalAction,  # Allows --apply-sparsity-penalty-to-batchtopk or --no-apply-sparsity-penalty-to-batchtopk
+        default=True,  # Matches TrainingConfig default
+        help="Apply standard L1 sparsity penalty to BatchTopK activations. Default is True. Use --no-apply-sparsity-penalty-to-batchtopk to disable.",
+    )
+    train_group.add_argument(
         "--optimizer",
         type=str,
         choices=["adam", "adamw"],
@@ -507,6 +519,8 @@ def main():
         sparsity_lambda_delay_frac=args.sparsity_lambda_delay_frac,
         sparsity_c=args.sparsity_c,
         preactivation_coef=args.preactivation_coef,
+        aux_loss_factor=args.aux_loss_factor,
+        apply_sparsity_penalty_to_batchtopk=args.apply_sparsity_penalty_to_batchtopk,
         # Optimizer & Scheduler
         optimizer=args.optimizer,
         optimizer_beta1=args.optimizer_beta1,
