@@ -1,5 +1,5 @@
 # %% [markdown]
-# # Tutorial 1: End-to-End CLT Training on GPT-2 Small
+# # Tutorial 1: End-to-End CLT Training on Pythia-160M
 #
 # This tutorial demonstrates the complete process of training a Cross-Layer Transcoder (CLT)
 # using the `clt` library. We will:
@@ -61,7 +61,7 @@ else:
 print(f"Using device: {device}")
 
 # Base model for activation extraction
-BASE_MODEL_NAME = "EleutherAI/pythia-70m"  # Using GPT-2 small
+BASE_MODEL_NAME = "EleutherAI/pythia-160m"
 # %%
 from transformers import AutoModelForCausalLM
 
@@ -82,9 +82,9 @@ print(model)
 # %%
 # --- CLT Architecture Configuration ---
 # We need to match the base model's dimensions
-gpt2_num_layers = 6
-gpt2_d_model = 512
-expansion_factor = 4
+gpt2_num_layers = 12
+gpt2_d_model = 768
+expansion_factor = 32
 
 # For the tutorial, let's use a smaller number of features than d_model
 clt_num_features = gpt2_d_model * expansion_factor
@@ -101,13 +101,13 @@ print(clt_config)
 # --- Activation Generation Configuration ---
 # Define where activations will be stored and how they should be generated
 # Use a small number of target tokens for the tutorial
-activation_dir = "./tutorial_activations_local_1M_pythia_ln"
+activation_dir = "./tutorial_activations_local_1M_pythia_160m"
 # Fix SyntaxError: remove parenthesis around string assignment
 dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
-    mlp_input_module_path_template="gpt_neox.layers.{}.input_layernorm.input",  # We include the layernorm for linearity
+    mlp_input_module_path_template="gpt_neox.layers.{}.mlp.input",  # We include the layernorm for linearity
     mlp_output_module_path_template="gpt_neox.layers.{}.mlp.output",  # Default for GPT2
     model_dtype=None,  # Use default precision
     # Dataset Source
@@ -153,8 +153,8 @@ expected_activation_path = os.path.join(
 # Values needed for the name (replace with actual config values if different)
 _lr = 1e-4
 _batch_size = 1024
-_sparsity_lambda = 0.0001
-_sparsity_c = 0.1
+_sparsity_lambda = 0.00001
+_sparsity_c = 1.0
 
 wdb_run_name = (
     f"{clt_config.num_features}-width-"
@@ -176,9 +176,9 @@ training_config = TrainingConfig(
     activation_dtype="float32",  # Specify dtype for loading/training
     # Training batch size
     train_batch_size_tokens=_batch_size,
-    sampling_strategy="random_chunk",
+    sampling_strategy="sequential",
     # Normalization for training (use stored stats)
-    normalization_method="auto",  # Use stats from norm_stats.json generated earlier
+    normalization_method="none",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
     sparsity_lambda=_sparsity_lambda,
     sparsity_lambda_schedule="linear",
@@ -305,6 +305,7 @@ except Exception as train_err:
     print(f"\n[ERROR] Training failed: {train_err}")
     traceback.print_exc()
     raise
+
 
 # %% [markdown]
 # ## 5. Saving and Loading the Trained Model
