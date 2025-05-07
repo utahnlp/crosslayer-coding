@@ -64,22 +64,96 @@ def get_model_dimensions(model_name: str) -> tuple[int, int]:
 
 def train_loop_per_worker(cfg):
 
-    if 'sparsity_c' in cfg:
-        cfg['training_config'].sparsity_c = cfg['sparsity_c']
-    if 'sparsity_lambda' in cfg:
-        cfg['training_config'].sparsity_lambda = cfg['sparsity_lambda']
+    # --- Determine Device ---
+    if cfg['device']:
+        device = cfg['device']
+    else:
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
+    logger.info(f"Using device: {device}")
 
+    # --- Determine Base Model Dimensions ---
+    # Use the provided --model-name to get dimensions for the CLT config.
+    # This ensures the CLT matches the architecture activations were generated from.
+    base_model_name = cfg['model_name']
+    num_layers, d_model = get_model_dimensions(base_model_name)
+    if num_layers is None or d_model is None:
+        # Added error handling if dimensions couldn't be determined
+        logger.error(f"Could not determine dimensions for model '{base_model_name}'. Exiting.")
+        return
+
+    # --- Create CLT Configuration ---
+    clt_config = CLTConfig(
+        num_features=cfg['num_features'],
+        num_layers=num_layers,
+        d_model=d_model,
+        activation_fn=cfg['activation_fn'],
+        jumprelu_threshold=cfg['jumprelu_threshold'],
+        clt_dtype=cfg['clt_dtype'],
+    )
+    logger.info(f"CLT Config: {clt_config}")
+
+    # --- Create Training Configuration ---
+    # Handle 'none' scheduler case
+    lr_scheduler_arg: Optional[Literal["linear", "cosine", "linear_final20"]] = (
+        cfg['lr_scheduler'] if cfg['lr_scheduler'] != "none" else None
+    )
+
+    # Simplified TrainingConfig instantiation for local source only
+    training_config = TrainingConfig(
+        # Core Training
+        learning_rate=cfg['learning_rate'],
+        training_steps=cfg['training_steps'],
+        seed=cfg['seed'],
+        train_batch_size_tokens=cfg['train_batch_size_tokens'],
+        # Activation Source (hardcoded to local_manifest)
+        activation_source="local_manifest",
+        activation_path=cfg['activation_path'],
+        activation_dtype=cfg['activation_dtype'],
+        # Normalization
+        normalization_method=cfg['normalization_method'],
+        # Sampling Strategy
+        sampling_strategy=cfg['sampling_strategy'],
+        # Loss Coeffs
+        sparsity_lambda=cfg['sparsity_lambda'],
+        sparsity_c=cfg['sparsity_c'],
+        preactivation_coef=cfg['preactivation_coef'],
+        # Optimizer & Scheduler
+        optimizer=cfg['optimizer'],
+        optimizer_beta1=cfg['optimizer_beta1'],
+        optimizer_beta2=cfg['optimizer_beta2'],
+        lr_scheduler=lr_scheduler_arg,
+        # Logging & Checkpointing
+        log_interval=cfg['log_interval'],
+        eval_interval=cfg['eval_interval'],
+        checkpoint_interval=cfg['checkpoint_interval'],
+        # Dead Features
+        dead_feature_window=cfg['dead_feature_window'],
+        # WandB
+        enable_wandb=cfg['enable_wandb'],
+        wandb_project=cfg['wandb_project'],
+        wandb_entity=cfg['wandb_entity'],
+        wandb_run_name=cfg['wandb_run_name'],
+        wandb_tags=cfg['wandb_tags'],
+        # Remote config is not handled by this script
+        remote_config=None,
+    )
+    logger.info(f"Training Config: {training_config}")
 
     trainer = CLTTrainer(
-        clt_config=cfg['clt_config'],
-        training_config=cfg['training_config'],
+        clt_config=clt_config,
+        training_config=training_config,
         log_dir=cfg['log_dir'],
-        device=cfg['device'],
+        device=device,
         distributed=False,  # Explicitly set for tutorial
         use_ray='tune'
     )
 
-    # trained_clt_model = trainer.train(eval_every=cfg['training_config'].eval_interval)
+    trained_clt_model = trainer.train(eval_every=training_config.eval_interval)
 
 
 def parse_args():
@@ -327,94 +401,12 @@ def main():
     except Exception as e:
         logger.warning(f"Could not save command-line args: {e}")
 
-    # --- Determine Device ---
-    if args.device:
-        device = args.device
-    else:
-        if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
-        else:
-            device = "cpu"
-    logger.info(f"Using device: {device}")
-
-    # --- Determine Base Model Dimensions ---
-    # Use the provided --model-name to get dimensions for the CLT config.
-    # This ensures the CLT matches the architecture activations were generated from.
-    base_model_name = args.model_name
-    num_layers, d_model = get_model_dimensions(base_model_name)
-    if num_layers is None or d_model is None:
-        # Added error handling if dimensions couldn't be determined
-        logger.error(f"Could not determine dimensions for model '{base_model_name}'. Exiting.")
-        return
-
-    # --- Create CLT Configuration ---
-    clt_config = CLTConfig(
-        num_features=args.num_features,
-        num_layers=num_layers,
-        d_model=d_model,
-        activation_fn=args.activation_fn,
-        jumprelu_threshold=args.jumprelu_threshold,
-        clt_dtype=args.clt_dtype,
-    )
-    logger.info(f"CLT Config: {clt_config}")
-
-    # --- Create Training Configuration ---
-    # Handle 'none' scheduler case
-    lr_scheduler_arg: Optional[Literal["linear", "cosine", "linear_final20"]] = (
-        args.lr_scheduler if args.lr_scheduler != "none" else None
-    )
-
-    # Simplified TrainingConfig instantiation for local source only
-    training_config = TrainingConfig(
-        # Core Training
-        learning_rate=args.learning_rate,
-        training_steps=args.training_steps,
-        seed=args.seed,
-        train_batch_size_tokens=args.train_batch_size_tokens,
-        # Activation Source (hardcoded to local_manifest)
-        activation_source="local_manifest",
-        activation_path=args.activation_path,
-        activation_dtype=args.activation_dtype,
-        # Normalization
-        normalization_method=args.normalization_method,
-        # Sampling Strategy
-        sampling_strategy=args.sampling_strategy,
-        # Loss Coeffs
-        sparsity_lambda=args.sparsity_lambda,
-        sparsity_c=args.sparsity_c,
-        preactivation_coef=args.preactivation_coef,
-        # Optimizer & Scheduler
-        optimizer=args.optimizer,
-        optimizer_beta1=args.optimizer_beta1,
-        optimizer_beta2=args.optimizer_beta2,
-        lr_scheduler=lr_scheduler_arg,
-        # Logging & Checkpointing
-        log_interval=args.log_interval,
-        eval_interval=args.eval_interval,
-        checkpoint_interval=args.checkpoint_interval,
-        # Dead Features
-        dead_feature_window=args.dead_feature_window,
-        # WandB
-        enable_wandb=args.enable_wandb,
-        wandb_project=args.wandb_project,
-        wandb_entity=args.wandb_entity,
-        wandb_run_name=args.wandb_run_name,
-        wandb_tags=args.wandb_tags,
-        # Remote config is not handled by this script
-        remote_config=None,
-    )
-    logger.info(f"Training Config: {training_config}")
-
 
     # --- Start Tuning ---
-    # configs to pass to workers
+    # config to pass to workers
     hps = {
-        'training_config': training_config,
-        'clt_config': clt_config,
-        'log_dir': str(output_dir),
-        'device': device
+        'log_dir': str(output_dir.resolve()),
+        **vars(args)
     }
     # add actual hyperparameters
     hps |= {
@@ -429,7 +421,8 @@ def main():
         tuner = ray.tune.Tuner(
             ray.tune.with_resources(train_loop_per_worker, {'gpu': args.n_gpus / args.n_workers}),
             param_space=hps,
-            tune_config=ray.tune.TuneConfig(max_concurrent_trials=args.n_workers)
+            tune_config=ray.tune.TuneConfig(max_concurrent_trials=args.n_workers),
+            run_config=ray.tune.RunConfig(storage_path=str(output_dir.resolve()))
         )
         results = tuner.fit()
         logger.info("Tuning complete!")
