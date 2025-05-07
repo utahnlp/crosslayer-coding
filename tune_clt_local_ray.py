@@ -13,6 +13,8 @@ import time
 import json
 import ray, ray.tune
 
+from clt.training.trainer_ray import CLTTrainerRay
+
 # Attempt to import transformers for model dimension detection
 try:
     from transformers import AutoConfig
@@ -144,12 +146,12 @@ def train_loop_per_worker(cfg):
     )
     logger.info(f"Training Config: {training_config}")
 
-    trainer = CLTTrainer(
+    trainer = CLTTrainerRay(
         clt_config=clt_config,
         training_config=training_config,
         log_dir=cfg['log_dir'],
         device=device,
-        distributed=False,  # Explicitly set for tutorial
+        distributed=False,  # distributing model across gpus within a ray tune worker not implemented
         use_ray='tune'
     )
 
@@ -410,16 +412,14 @@ def main():
     }
     # add actual hyperparameters
     hps |= {
-        # 'sparsity_c': ray.tune.grid_search([0.01, 0.03, 0.09, 0.27, 0.81, 2.43]),
-        # 'sparsity_lambda': ray.tune.grid_search([1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3]),
-        'sparsity_c': ray.tune.grid_search([0.01]),
-        'sparsity_lambda': ray.tune.grid_search([1e-5]),
+        'sparsity_c': ray.tune.grid_search([0.01, 0.03, 0.09, 0.27, 0.81, 2.43]),
+        'sparsity_lambda': ray.tune.grid_search([1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3]),
     }
 
     logger.info("Starting hyperparameter tuning from local activations...")
     try:
         tuner = ray.tune.Tuner(
-            ray.tune.with_resources(train_loop_per_worker, {'gpu': args.n_gpus / args.n_workers}),
+            ray.tune.with_resources(train_loop_per_worker, {'cpu': 1, 'gpu': args.n_gpus / args.n_workers}),
             param_space=hps,
             tune_config=ray.tune.TuneConfig(max_concurrent_trials=args.n_workers),
             run_config=ray.tune.RunConfig(storage_path=str(output_dir.resolve()))
