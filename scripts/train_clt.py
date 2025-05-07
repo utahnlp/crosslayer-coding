@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Script to train a Cross-Layer Transcoder (CLT) using activations from a remote server.
+Script to train a Cross-Layer Transcoder (CLT) using activations from
+either a local manifest or a remote server.
 Handles configuration parsing from command-line arguments and initiates training.
 """
 
 import argparse
 import torch
 from pathlib import Path
-from typing import Literal, Optional, Dict, Any  # Added Dict, Any
+from typing import Literal, Optional, Dict, Any
 import logging
 import time
 import json
@@ -34,15 +35,15 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def get_model_dimensions(model_name: str) -> tuple[int, int]:
+def get_model_dimensions(model_name: str) -> tuple[Optional[int], Optional[int]]:
     """Attempt to dynamically get num_layers and d_model from model_name."""
     if AutoConfig is None:
         logger.warning(
             "Transformers library not found. Cannot dynamically detect model dimensions."
-            " Falling back to gpt2 defaults (12 layers, 768 hidden size)."
+            " Falling back to gpt2 defaults (12 layers, 768 hidden size) if not otherwise specified."
             " Install transformers (`pip install transformers`) for auto-detection."
         )
-        return 12, 768  # Default to gpt2 small
+        return None, None  # Indicate failure to auto-detect
 
     try:
         config = AutoConfig.from_pretrained(model_name)
@@ -50,38 +51,48 @@ def get_model_dimensions(model_name: str) -> tuple[int, int]:
         d_model = getattr(config, "hidden_size", None) or getattr(config, "n_embd", None)
 
         if num_layers is None or d_model is None:
-            raise ValueError(f"Could not automatically determine num_layers or d_model for {model_name}")
+            logger.warning(
+                f"Could not automatically determine num_layers or d_model for {model_name}. "
+                "Will rely on defaults or error out if not sufficient."
+            )
+            return None, None
         logger.info(f"Detected model dimensions for {model_name}: {num_layers} layers, {d_model} hidden size.")
         return num_layers, d_model
     except Exception as e:
         logger.warning(
             f"Failed to get model dimensions for {model_name}: {e}. "
-            f"Falling back to gpt2 defaults (12 layers, 768 hidden size)."
+            "Will rely on defaults or error out if not sufficient."
         )
-        return 12, 768
+        return None, None
 
 
 def parse_args():
     """Parse command-line arguments."""
     parser = argparse.ArgumentParser(
-        description="Train a Cross-Layer Transcoder (CLT) using activations from a remote server.",
+        description="Train a Cross-Layer Transcoder (CLT) from local or remote activations.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # --- Core Training Parameters ---
     core_group = parser.add_argument_group("Core Training Parameters")
-    # Removed --activation-path
+    core_group.add_argument(
+        "--activation-source",
+        type=str,
+        choices=["local_manifest", "remote"],
+        required=True,
+        help="Source of activations: 'local_manifest' or 'remote' server.",
+    )
     core_group.add_argument(
         "--output-dir",
         type=str,
-        default=f"clt_train_remote_{int(time.time())}",  # Changed default name
+        default=f"clt_train_{int(time.time())}",
         help="Directory to save logs, checkpoints, and final model.",
     )
     core_group.add_argument(
         "--model-name",
         type=str,
         required=True,
-        help="Base model name or path (e.g., 'gpt2', 'gpt2-medium'). Must match the model used for activation generation on the server.",
+        help="Base model name or path (e.g., 'gpt2', 'EleutherAI/pythia-70m'). Used for activation generation context and CLT dimension inference.",
     )
     core_group.add_argument(
         "--device",
@@ -95,18 +106,29 @@ def parse_args():
         help="Enable distributed training (requires torchrun/appropriate launcher).",
     )
 
+    # --- Local Activation Source Parameters ---
+    local_group = parser.add_argument_group(
+        "Local Activation Source Parameters (if --activation-source=local_manifest)"
+    )
+    local_group.add_argument(
+        "--activation-path",
+        type=str,
+        default=None,  # Required if local_manifest, checked in main
+        help="Path to the directory containing pre-generated activations (e.g., .../index.bin, metadata.json).",
+    )
+
     # --- Remote Activation Server Parameters ---
-    remote_group = parser.add_argument_group("Remote Activation Server Parameters")
+    remote_group = parser.add_argument_group("Remote Activation Server Parameters (if --activation-source=remote)")
     remote_group.add_argument(
         "--server-url",
         type=str,
-        required=True,
+        default=None,  # Required if remote, checked in main
         help="URL of the remote activation storage server (e.g., 'http://localhost:8000').",
     )
     remote_group.add_argument(
         "--dataset-id",
         type=str,
-        required=True,
+        default=None,  # Required if remote, checked in main
         help="Unique identifier for the dataset on the remote server (e.g., 'gpt2/pile-10k_train').",
     )
     remote_group.add_argument(
@@ -124,11 +146,11 @@ def parse_args():
     remote_group.add_argument(
         "--remote-prefetch-batches",
         type=int,
-        default=16,
+        default=16,  # Default from train_clt_remote
         help="Number of batches to prefetch from the server.",
     )
 
-    # --- CLT Model Architecture ---
+    # --- CLT Model Architecture (CLTConfig) ---
     clt_group = parser.add_argument_group("CLT Model Architecture (CLTConfig)")
     clt_group.add_argument(
         "--num-features",
@@ -136,11 +158,11 @@ def parse_args():
         required=True,
         help="Number of features per layer in the CLT.",
     )
-    # num_layers and d_model are derived from the base model
+    # num_layers and d_model are derived from the base model if not explicitly set
     clt_group.add_argument(
         "--activation-fn",
         type=str,
-        choices=["jumprelu", "relu"],
+        choices=["jumprelu", "relu", "batchtopk"],
         default="jumprelu",
         help="Activation function for the CLT.",
     )
@@ -151,13 +173,30 @@ def parse_args():
         help="Threshold for JumpReLU activation (if used).",
     )
     clt_group.add_argument(
+        "--batchtopk-k",
+        type=int,
+        default=None,
+        help="Absolute k for BatchTopK activation (if used). Only one of k or frac.",
+    )
+    clt_group.add_argument(
+        "--batchtopk-frac",
+        type=float,
+        default=None,
+        help="Fraction of features to keep for BatchTopK (if used). Only one of k or frac.",
+    )
+    clt_group.add_argument(
+        "--disable-batchtopk-straight-through",
+        action="store_true",  # If flag is present, disable is true. Default behavior is enabled.
+        help="Disable straight-through estimator for BatchTopK. (BatchTopK default is True).",
+    )
+    clt_group.add_argument(
         "--clt-dtype",
         type=str,
         default=None,
         help="Optional data type for the CLT model parameters (e.g., 'float16', 'bfloat16').",
     )
 
-    # --- Training Hyperparameters ---
+    # --- Training Hyperparameters (TrainingConfig) ---
     train_group = parser.add_argument_group("Training Hyperparameters (TrainingConfig)")
     train_group.add_argument("--learning-rate", type=float, default=3e-4, help="Optimizer learning rate.")
     train_group.add_argument(
@@ -175,11 +214,11 @@ def parse_args():
     train_group.add_argument(
         "--normalization-method",
         type=str,
-        choices=["auto", "none"],
+        choices=["auto", "none", "estimated_mean_std"],  # Added estimated_mean_std from TrainingConfig
         default="auto",
         help=(
-            "Normalization for activation store. 'auto' expects the server to provide stats. "
-            "'none' disables normalization."
+            "Normalization for activation store. 'auto' expects server/local store to provide stats. "
+            "'estimated_mean_std' forces estimation (if store supports it). 'none' disables."
         ),
     )
     train_group.add_argument(
@@ -187,6 +226,19 @@ def parse_args():
         type=float,
         default=1e-3,
         help="Coefficient for the L1 sparsity penalty.",
+    )
+    train_group.add_argument(
+        "--sparsity-lambda-schedule",
+        type=str,
+        choices=["linear", "delayed_linear"],
+        default="linear",
+        help="Schedule for applying sparsity lambda.",
+    )
+    train_group.add_argument(
+        "--sparsity-lambda-delay-frac",
+        type=float,
+        default=0.1,
+        help="Fraction of steps to delay lambda increase for 'delayed_linear' schedule.",
     )
     train_group.add_argument(
         "--sparsity-c",
@@ -230,16 +282,22 @@ def parse_args():
         ),
     )
     train_group.add_argument(
+        "--gradient-clip-val",
+        type=float,
+        default=None,
+        help="Value for gradient clipping. If None, no clipping.",
+    )
+    train_group.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="Random seed for reproducibility (primarily affects local operations like weight init).",
+        help="Random seed for reproducibility.",
     )
     train_group.add_argument(
         "--activation-dtype",
         type=str,
-        default="float32",
-        help="Data type to process fetched activations as (e.g., 'float32', 'bfloat16').",
+        default="float32",  # Consistent default
+        help="Data type to process/load activations as (e.g., 'float32', 'bfloat16').",
     )
     train_group.add_argument(
         "--dead-feature-window",
@@ -247,15 +305,20 @@ def parse_args():
         default=1000,
         help="Number of steps of inactivity before a feature is considered 'dead' for evaluation.",
     )
+    train_group.add_argument(
+        "--compute-sparsity-diagnostics",
+        action="store_true",
+        help="Enable computation of detailed sparsity diagnostics during evaluation.",
+    )
 
-    # --- Sampling Strategy --- Added Group
+    # --- Sampling Strategy ---
     sampling_group = parser.add_argument_group("Sampling Strategy (TrainingConfig)")
     sampling_group.add_argument(
         "--sampling-strategy",
         type=str,
         choices=["sequential", "random_chunk"],
         default="sequential",
-        help="Sampling strategy: 'sequential' processes chunks in order per epoch, 'random_chunk' picks a random valid chunk each step.",
+        help="Sampling strategy for manifest-based stores: 'sequential' or 'random_chunk'.",
     )
 
     # --- Logging & Checkpointing ---
@@ -278,7 +341,6 @@ def parse_args():
         default=1000,
         help="Save a training checkpoint every N steps.",
     )
-    # WandB arguments
     log_group.add_argument("--enable-wandb", action="store_true", help="Enable Weights & Biases logging.")
     log_group.add_argument("--wandb-project", type=str, default=None, help="WandB project name.")
     log_group.add_argument(
@@ -291,20 +353,33 @@ def parse_args():
         "--wandb-run-name",
         type=str,
         default=None,
-        help="Custom name for the WandB run (defaults to a timestamp).",
+        help="Custom name for the WandB run. Auto-generated if None.",
     )
     log_group.add_argument("--wandb-tags", nargs="+", default=None, help="List of tags for the WandB run.")
 
     args = parser.parse_args()
 
-    # --- Validation ---
-    # Server URL and dataset ID are required by argparse
+    # --- Validate conditional arguments ---
+    if args.activation_source == "remote":
+        if not args.server_url:
+            parser.error("--server-url is required when --activation-source is 'remote'")
+        if not args.dataset_id:
+            parser.error("--dataset-id is required when --activation-source is 'remote'")
+    elif args.activation_source == "local_manifest":
+        if not args.activation_path:
+            parser.error("--activation-path is required when --activation-source is 'local_manifest'")
+
+    if args.activation_fn == "batchtopk":
+        if (args.batchtopk_k is None and args.batchtopk_frac is None) or (
+            args.batchtopk_k is not None and args.batchtopk_frac is not None
+        ):
+            parser.error("For BatchTopK, exactly one of --batchtopk-k or --batchtopk-frac must be specified.")
 
     return args
 
 
 def main():
-    """Main function to configure and run the CLTTrainer for remote activations."""
+    """Main function to configure and run the CLTTrainer."""
     args = parse_args()
 
     # --- Setup Output Directory ---
@@ -321,84 +396,115 @@ def main():
 
     # --- Determine Device ---
     if args.device:
-        device = args.device
+        device_str = args.device
     else:
         if torch.cuda.is_available():
-            device = "cuda"
-        elif torch.backends.mps.is_available():
-            device = "mps"
+            device_str = "cuda"
+        elif torch.backends.mps.is_available():  # For Apple Silicon
+            device_str = "mps"
         else:
-            device = "cpu"
-    logger.info(f"Using device: {device}")
+            device_str = "cpu"
+    logger.info(f"Using device: {device_str}")
+    # Trainer will handle torch.device object creation
 
     # --- Determine Base Model Dimensions ---
-    # Use the provided --model-name to get dimensions for the CLT config.
-    # This ensures the CLT matches the architecture activations were generated from.
     base_model_name = args.model_name
-    num_layers, d_model = get_model_dimensions(base_model_name)
-    if num_layers is None or d_model is None:
-        logger.error(f"Could not determine dimensions for model '{base_model_name}'. Exiting.")
-        return
+    num_layers_auto, d_model_auto = get_model_dimensions(base_model_name)
+    if num_layers_auto is None or d_model_auto is None:
+        # This case implies get_model_dimensions failed or returned Nones.
+        # CLTConfig requires num_layers and d_model.
+        # If they couldn't be auto-detected, it's a fatal error.
+        logger.error(
+            f"Could not determine dimensions (num_layers, d_model) for model '{base_model_name}'. "
+            "These are required for CLTConfig. Please ensure the model name is correct and visible "
+            "to the Hugging Face AutoConfig, or that the CLT library can derive them."
+        )
+        return  # Exit if dimensions are critical and not found
 
     # --- Create CLT Configuration ---
     clt_config = CLTConfig(
         num_features=args.num_features,
-        num_layers=num_layers,
-        d_model=d_model,
+        num_layers=num_layers_auto,  # d_model and num_layers are now from auto-detection
+        d_model=d_model_auto,
+        model_name=base_model_name,  # Store for reference
         activation_fn=args.activation_fn,
         jumprelu_threshold=args.jumprelu_threshold,
+        batchtopk_k=args.batchtopk_k,
+        batchtopk_frac=args.batchtopk_frac,
+        batchtopk_straight_through=(not args.disable_batchtopk_straight_through),
         clt_dtype=args.clt_dtype,
     )
     logger.info(f"CLT Config: {clt_config}")
 
     # --- Create Training Configuration ---
-    # Handle 'none' scheduler case
     lr_scheduler_arg: Optional[Literal["linear", "cosine", "linear_final20"]] = (
         args.lr_scheduler if args.lr_scheduler != "none" else None
     )
 
-    # Create remote_config dictionary
-    remote_config_dict: Dict[str, Any] = {
-        "server_url": args.server_url,
-        "dataset_id": args.dataset_id,
-        "timeout": args.remote_timeout,
-        "max_retries": args.remote_max_retries,
-        "prefetch_batches": args.remote_prefetch_batches,
-    }
+    activation_path_arg: Optional[str] = None
+    remote_config_dict: Optional[Dict[str, Any]] = None
+
+    if args.activation_source == "local_manifest":
+        activation_path_arg = args.activation_path
+        logger.info(f"Using local activation source: {activation_path_arg}")
+    elif args.activation_source == "remote":
+        remote_config_dict = {
+            "server_url": args.server_url,
+            "dataset_id": args.dataset_id,
+            "timeout": args.remote_timeout,
+            "max_retries": args.remote_max_retries,
+            "prefetch_batches": args.remote_prefetch_batches,
+        }
+        logger.info(f"Using remote activation source: {args.server_url}, dataset: {args.dataset_id}")
 
     # --- Determine WandB Run Name ---
-    if args.wandb_run_name:
-        wandb_run_name = args.wandb_run_name
-    else:
-        # Construct the name based on the specified format
-        # Format: {width}-width-{batch_size}-batch-{lr}-lr-{slambda}-slambda-{sc}-sc
-        wandb_run_name = (
-            f"{args.num_features}-width-"
-            f"{args.train_batch_size_tokens}-batch-"
-            f"{args.learning_rate:.1e}-lr-"  # Added learning rate
-            f"{args.sparsity_lambda:.1e}-slambda-"  # Use scientific notation for lambda
-            f"{args.sparsity_c:.1f}-sc"  # Use one decimal place for c
-        )
+    wandb_run_name = args.wandb_run_name
+    if not wandb_run_name and args.enable_wandb:  # Auto-generate if not provided and wandb is enabled
+        name_parts = [f"{args.num_features}-width"]
+        if args.activation_fn == "batchtopk":
+            name_parts.append("batchtopk")
+            if args.batchtopk_k is not None:
+                name_parts.append(f"k{args.batchtopk_k}")
+            elif args.batchtopk_frac is not None:
+                name_parts.append(f"kfrac{args.batchtopk_frac:.3f}")  # Format frac to 3 decimal places
+        else:  # jumprelu or relu
+            name_parts.append(args.activation_fn)
+            name_parts.append(f"{args.sparsity_lambda:.1e}-slambda")
+            name_parts.append(f"{args.sparsity_c:.1f}-sc")
+
+        name_parts.append(f"{args.train_batch_size_tokens}-batch")
+        name_parts.append(f"{args.learning_rate:.1e}-lr")
+        if args.activation_source == "remote" and args.dataset_id:
+            # Sanitize dataset_id for use in filename/run name
+            sanitized_dataset_id = args.dataset_id.replace("/", "_")
+            name_parts.append(f"ds_{sanitized_dataset_id[:20]}")  # Truncate if too long
+        elif args.activation_source == "local_manifest" and args.activation_path:
+            path_basename = Path(args.activation_path).name
+            name_parts.append(f"path_{path_basename[:20]}")
+
+        wandb_run_name = "-".join(name_parts)
         logger.info(f"Generated WandB run name: {wandb_run_name}")
 
-    # TrainingConfig instantiation for remote source
     training_config = TrainingConfig(
         # Core Training
         learning_rate=args.learning_rate,
         training_steps=args.training_steps,
         seed=args.seed,
+        gradient_clip_val=args.gradient_clip_val,
         train_batch_size_tokens=args.train_batch_size_tokens,
-        # Activation Source (hardcoded to remote)
-        activation_source="remote",
-        remote_config=remote_config_dict,  # Use the populated dict
+        # Activation Source
+        activation_source=args.activation_source,  # Directly from args
+        activation_path=activation_path_arg,  # Populated if local
+        remote_config=remote_config_dict,  # Populated if remote
         activation_dtype=args.activation_dtype,
-        # Removed activation_path
         # Normalization
         normalization_method=args.normalization_method,
         # Sampling Strategy
         sampling_strategy=args.sampling_strategy,
         # Loss Coeffs
         sparsity_lambda=args.sparsity_lambda,
+        sparsity_lambda_schedule=args.sparsity_lambda_schedule,
+        sparsity_lambda_delay_frac=args.sparsity_lambda_delay_frac,
         sparsity_c=args.sparsity_c,
         preactivation_coef=args.preactivation_coef,
         # Optimizer & Scheduler
@@ -410,25 +516,26 @@ def main():
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         checkpoint_interval=args.checkpoint_interval,
-        # Dead Features
+        # Dead Features & Diagnostics
         dead_feature_window=args.dead_feature_window,
+        compute_sparsity_diagnostics=args.compute_sparsity_diagnostics,
         # WandB
         enable_wandb=args.enable_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
-        wandb_run_name=wandb_run_name,  # Use the determined name
+        wandb_run_name=wandb_run_name,
         wandb_tags=args.wandb_tags,
     )
     logger.info(f"Training Config: {training_config}")
 
     # --- Initialize Trainer ---
-    logger.info("Initializing CLTTrainer for remote training...")
+    logger.info(f"Initializing CLTTrainer for {args.activation_source} training...")
     try:
         trainer = CLTTrainer(
             clt_config=clt_config,
             training_config=training_config,
             log_dir=str(output_dir),
-            device=device,
+            device=device_str,  # Pass the string, trainer handles torch.device
             distributed=args.distributed,
         )
     except Exception as e:
@@ -436,9 +543,13 @@ def main():
         raise
 
     # --- Start Training ---
-    logger.info(f"Starting training from remote server {args.server_url} using dataset {args.dataset_id}...")
+    if args.activation_source == "remote":
+        logger.info(f"Starting training from remote server {args.server_url} using dataset {args.dataset_id}...")
+    else:  # local_manifest
+        logger.info(f"Starting training from local activations at {args.activation_path}...")
+
     try:
-        trainer.train()
+        trainer.train()  # eval_every is handled by eval_interval in TrainingConfig
         logger.info("Training complete!")
         logger.info(f"Final model and logs saved in: {output_dir.resolve()}")
     except Exception as e:
