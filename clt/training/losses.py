@@ -29,6 +29,8 @@ class LossManager:
         # Store normalisation stats if provided
         self.mean_tg = mean_tg or {}
         self.std_tg = std_tg or {}
+        self.aux_loss_factor = config.aux_loss_factor  # New: coefficient for auxiliary loss
+        self.apply_sparsity_penalty_to_batchtopk = config.apply_sparsity_penalty_to_batchtopk
 
         # Validate sparsity schedule params
         assert self.config.sparsity_lambda_schedule in ["linear", "delayed_linear"], "Invalid sparsity_lambda_schedule"
@@ -183,6 +185,10 @@ class LossManager:
         # Main sparsity penalty (tanh on activations)
         main_penalty = lambda_factor * total_penalty
 
+        # Skip sparsity penalty if using BatchTopK and config says so
+        if model.config.activation_fn == "batchtopk" and not self.apply_sparsity_penalty_to_batchtopk:
+            return torch.tensor(0.0, device=next(iter(model.parameters())).device), 0.0
+
         return main_penalty, lambda_factor
 
     def compute_preactivation_loss(self, model: CrossLayerTranscoder, inputs: Dict[int, torch.Tensor]) -> torch.Tensor:
@@ -229,6 +235,74 @@ class LossManager:
         else:
             return torch.tensor(0.0, device=device)
 
+    def compute_auxiliary_loss(
+        self,
+        model: CrossLayerTranscoder,
+        inputs: Dict[int, torch.Tensor],
+        residuals: Dict[int, torch.Tensor],
+        dead_mask: Optional[torch.Tensor] = None,
+        k_aux_default: int = 512,
+    ) -> torch.Tensor:
+        """Compute the auxiliary reconstruction loss for BatchTopK dead features.
+
+        This follows the AuxK strategy from the TopK/BatchTopK papers: use the top-k dead
+        latents to reconstruct the residual error.
+        """
+        if self.aux_loss_factor is None or self.aux_loss_factor == 0:
+            return torch.tensor(0.0, device=next(iter(model.parameters())).device)
+        if dead_mask is None:
+            return torch.tensor(0.0, device=next(iter(model.parameters())).device)
+
+        # Prepare hidden pre-activations (encoder linear output before nonlinearity)
+        hidden_pre: Dict[int, torch.Tensor] = {}
+        for layer_idx, x in inputs.items():
+            try:
+                pre = model.get_preactivations(x, layer_idx)
+                hidden_pre[layer_idx] = pre  # shape [batch_tokens, num_features]
+            except Exception:
+                continue
+
+        aux_loss_total = torch.tensor(0.0, device=next(iter(model.parameters())).device)
+
+        for layer_idx, pre in hidden_pre.items():
+            if pre.numel() == 0:
+                continue
+            if layer_idx >= dead_mask.shape[0]:
+                continue  # Safety
+            dead_layer_mask = dead_mask[layer_idx]  # [num_features] bool
+            num_dead = int(dead_layer_mask.sum().item())
+            if num_dead == 0:
+                continue
+            # Exclude living latents by setting them to -inf so they won't be selected in topk
+            pre_dead = pre.clone()
+            live_mask = ~dead_layer_mask
+            pre_dead[:, live_mask] = -float("inf")
+
+            k_aux = min(k_aux_default, num_dead)
+            k_aux = max(1, k_aux)
+            # topk over feature dim
+            topk_vals, topk_idx = pre_dead.topk(k_aux, dim=-1)
+            aux_acts = torch.zeros_like(pre)
+            aux_acts.scatter_(-1, topk_idx, topk_vals)
+
+            # Reconstruct residual using only these aux acts
+            aux_input_dict = {layer_idx: aux_acts}
+            try:
+                recon_aux = model.decode(aux_input_dict, layer_idx)
+            except Exception:
+                continue
+
+            if layer_idx not in residuals:
+                continue
+            residual_layer = residuals[layer_idx].to(recon_aux.device, recon_aux.dtype)
+            aux_loss_layer = F.mse_loss(recon_aux, residual_layer)
+            scale = min(num_dead / k_aux, 1.0)
+            aux_loss_total += scale * aux_loss_layer
+
+        # Scale by coefficient alpha
+        aux_loss_total = self.aux_loss_factor * aux_loss_total
+        return aux_loss_total
+
     def compute_total_loss(
         self,
         model: CrossLayerTranscoder,
@@ -237,6 +311,7 @@ class LossManager:
         current_step: int,
         total_steps: int,
         precomputed_activations: Optional[Dict[int, torch.Tensor]] = None,
+        dead_neuron_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """Compute the total loss for CLT training.
 
@@ -248,6 +323,7 @@ class LossManager:
             total_steps: Total number of training steps
             precomputed_activations: Optional dictionary of feature activations that have already been
                 computed outside this function. Supplying this avoids redundant encoder forward passes.
+            dead_neuron_mask: Optional tensor indicating dead neurons
 
         Returns:
             Tuple of (total loss, dictionary of individual loss components)
@@ -267,8 +343,19 @@ class LossManager:
         self.current_sparsity_lambda = current_lambda  # Store the lambda
         preactivation_loss = self.compute_preactivation_loss(model, inputs)
 
+        # Compute residuals for auxiliary loss if needed
+        residuals = {}
+        for layer_idx in predictions:
+            if layer_idx in targets:
+                residuals[layer_idx] = targets[layer_idx] - predictions[layer_idx]
+
+        # Compute auxiliary loss (only if configured and using BatchTopK)
+        aux_loss = torch.tensor(0.0, device=reconstruction_loss.device)
+        if model.config.activation_fn == "batchtopk":
+            aux_loss = self.compute_auxiliary_loss(model, inputs, residuals, dead_neuron_mask)
+
         # Compute total loss
-        total_loss = reconstruction_loss + sparsity_penalty + preactivation_loss
+        total_loss = reconstruction_loss + sparsity_penalty + preactivation_loss + aux_loss
 
         # Return loss components
         return total_loss, {
@@ -276,6 +363,7 @@ class LossManager:
             "reconstruction": reconstruction_loss.item(),
             "sparsity": sparsity_penalty.item(),
             "preactivation": preactivation_loss.item(),
+            "auxiliary": aux_loss.item(),
         }
 
     def get_current_sparsity_lambda(self) -> float:

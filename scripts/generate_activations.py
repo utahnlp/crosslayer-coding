@@ -134,6 +134,32 @@ def parse_arguments():
         help="Data type for storing activations (e.g., 'float32', 'bfloat16').",
     )
 
+    # --- Upload Parameters (for remote storage) ---
+    parser.add_argument(
+        "--delete_after_upload",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Delete local chunk files after successful remote upload.",
+    )
+    parser.add_argument(
+        "--upload_max_retries",
+        type=int,
+        default=5,
+        help="Maximum number of upload retries per chunk file (default: 5).",
+    )
+    parser.add_argument(
+        "--upload_initial_backoff",
+        type=float,
+        default=1.0,
+        help="Initial backoff delay in seconds for upload retries (default: 1.0).",
+    )
+    parser.add_argument(
+        "--upload_max_backoff",
+        type=float,
+        default=30.0,
+        help="Maximum backoff delay in seconds for upload retries (default: 30.0).",
+    )
+
     # --- Normalization ---
     parser.add_argument(
         "--compute_norm_stats",
@@ -218,6 +244,10 @@ def main():
         nnsight_invoker_args=nnsight_invoker_args,
         remote_server_url=args.remote_server_url,
         activation_dtype=args.activation_dtype,
+        delete_after_upload=args.delete_after_upload,
+        upload_max_retries=args.upload_max_retries,
+        upload_initial_backoff=args.upload_initial_backoff,
+        upload_max_backoff=args.upload_max_backoff,
     )
 
     # Instantiate the generator, passing the config and optional device override

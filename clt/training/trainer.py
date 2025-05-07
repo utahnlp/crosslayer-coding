@@ -151,6 +151,8 @@ class WandBLogger:
                 metrics["training/reconstruction_loss"] = value
             elif key == "preactivation":
                 metrics["training/preactivation_loss"] = value
+            elif key == "auxiliary":
+                metrics["training/auxiliary_loss"] = value
             else:
                 # Keep other potential keys, prepending 'training/'
                 metrics[f"training/{key}"] = value
@@ -558,6 +560,9 @@ class CLTTrainer:
                 prepend_bos=gen_cfg.get("prepend_bos", False),
                 nnsight_tracer_kwargs=gen_cfg.get("nnsight_tracer_kwargs"),
                 nnsight_invoker_args=gen_cfg.get("nnsight_invoker_args"),
+                # Pass BatchTopK params from clt_config if they exist
+                batchtopk_k=self.clt_config.batchtopk_k if hasattr(self.clt_config, "batchtopk_k") else None,
+                batchtopk_frac=self.clt_config.batchtopk_frac if hasattr(self.clt_config, "batchtopk_frac") else None,
             )
 
             # --- Create Generator from dataset_params --- #
@@ -1100,6 +1105,7 @@ class CLTTrainer:
                     step,
                     self.training_config.training_steps,
                     precomputed_activations=feature_activations_batch,
+                    dead_neuron_mask=self.dead_neurons_mask,
                 )
 
                 # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
