@@ -79,7 +79,7 @@ def train_loop_per_worker(cfg):
         use_ray='tune'
     )
 
-    trained_clt_model = trainer.train(eval_every=cfg['training_config'].eval_interval)
+    # trained_clt_model = trainer.train(eval_every=cfg['training_config'].eval_interval)
 
 
 def parse_args():
@@ -241,6 +241,20 @@ def parse_args():
         help="Number of steps of inactivity before a feature is considered 'dead' for evaluation.",
     )
 
+    tune_group = parser.add_argument_group("Hyperparameter Tuning Parameters")
+    tune_group.add_argument(
+        "--n-gpus",
+        type=int,
+        default=1,
+        help="Number of GPUs available for hyperparameter tuning."
+    )
+    tune_group.add_argument(
+        "--n-workers",
+        type=int,
+        default=1,
+        help="Number of trainers to run in parallel for hyperparameter tuning."
+    )
+
     # --- Sampling Strategy --- Added Group
     sampling_group = parser.add_argument_group("Sampling Strategy (TrainingConfig)")
     sampling_group.add_argument(
@@ -393,21 +407,29 @@ def main():
     )
     logger.info(f"Training Config: {training_config}")
 
-    hps = {
-        'sparsity_c': ray.tune.grid_search([0.01, 0.03, 0.09, 0.27, 0.81, 2.43]),
-        'sparsity_lambda': ray.tune.grid_search([1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3])
-    }
-
-    n_gpus = 1
-    n_parallel_workers = 8
 
     # --- Start Tuning ---
+    # configs to pass to workers
+    hps = {
+        'training_config': training_config,
+        'clt_config': clt_config,
+        'log_dir': str(output_dir),
+        'device': device
+    }
+    # add actual hyperparameters
+    hps |= {
+        # 'sparsity_c': ray.tune.grid_search([0.01, 0.03, 0.09, 0.27, 0.81, 2.43]),
+        # 'sparsity_lambda': ray.tune.grid_search([1e-5, 3e-5, 9e-5, 2.7e-4, 8.1e-4, 2.43e-3]),
+        'sparsity_c': ray.tune.grid_search([0.01]),
+        'sparsity_lambda': ray.tune.grid_search([1e-5]),
+    }
+
     logger.info("Starting hyperparameter tuning from local activations...")
     try:
         tuner = ray.tune.Tuner(
-            ray.tune.with_resources(train_loop_per_worker, {'gpu': n_gpus / n_parallel_workers}),
+            ray.tune.with_resources(train_loop_per_worker, {'gpu': args.n_gpus / args.n_workers}),
             param_space=hps,
-            tune_config=ray.tune.TuneConfig(max_concurrent_trials=n_parallel_workers)
+            tune_config=ray.tune.TuneConfig(max_concurrent_trials=args.n_workers)
         )
         results = tuner.fit()
         logger.info("Tuning complete!")
