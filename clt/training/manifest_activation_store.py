@@ -487,22 +487,28 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
                 # Inputs
                 if "inputs" in stats and "mean" in stats["inputs"] and "std" in stats["inputs"]:
-                    self.mean_in[layer_idx] = torch.tensor(
-                        stats["inputs"]["mean"],
-                        device=self.device,
-                        dtype=torch.float32,  # Compute in float32
-                    ).unsqueeze(
-                        0
-                    )  # Add batch dim
-                    # Create std tensor, add epsilon
-                    std_tensor_in = (
-                        torch.tensor(
-                            stats["inputs"]["std"],
+                    try:
+                        self.mean_in[layer_idx] = torch.tensor(
+                            stats["inputs"]["mean"],
                             device=self.device,
-                            dtype=torch.float32,
+                            dtype=torch.float32,  # Compute in float32
+                        ).unsqueeze(0)
+                        # Create std tensor, add epsilon
+                        std_tensor_in = (
+                            torch.tensor(
+                                stats["inputs"]["std"],
+                                device=self.device,
+                                dtype=torch.float32,
+                            )
+                            + 1e-6
                         )
-                        + 1e-6
-                    )
+                    except (ValueError, TypeError) as e:
+                        logger.warning(
+                            f"Layer {layer_idx} input mean/std failed tensor conversion: {e}. Disabling normalization."
+                        )
+                        self.apply_normalization = False
+                        break  # Exit loop
+
                     # Check for non-positive values AFTER adding epsilon
                     if torch.any(std_tensor_in <= 0):
                         logger.warning(
@@ -512,26 +518,44 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                         break  # Exit the loop over layers if an issue is found
                     self.std_in[layer_idx] = std_tensor_in.unsqueeze(0)  # Add batch dim
                 else:
-                    logger.warning(f"Missing input mean/std for layer {layer_idx} in norm stats.")
+                    # Log which keys might be missing
+                    missing_keys_in = []
+                    if "inputs" not in stats:
+                        missing_keys_in.append("'inputs'")
+                    elif "mean" not in stats["inputs"]:
+                        missing_keys_in.append("'inputs.mean'")
+                    elif "std" not in stats["inputs"]:
+                        missing_keys_in.append("'inputs.std'")
+                    logger.warning(
+                        f"Missing structure ({', '.join(missing_keys_in)}) for layer {layer_idx} inputs in norm stats. Disabling normalization."
+                    )
                     self.apply_normalization = False  # Disable if structure is wrong
                     break  # Exit loop
 
                 # Targets
                 if "targets" in stats and "mean" in stats["targets"] and "std" in stats["targets"]:
-                    self.mean_tg[layer_idx] = torch.tensor(
-                        stats["targets"]["mean"],
-                        device=self.device,
-                        dtype=torch.float32,
-                    ).unsqueeze(0)
-                    # Create std tensor, add epsilon
-                    std_tensor_tg = (
-                        torch.tensor(
-                            stats["targets"]["std"],
+                    try:
+                        self.mean_tg[layer_idx] = torch.tensor(
+                            stats["targets"]["mean"],
                             device=self.device,
                             dtype=torch.float32,
+                        ).unsqueeze(0)
+                        # Create std tensor, add epsilon
+                        std_tensor_tg = (
+                            torch.tensor(
+                                stats["targets"]["std"],
+                                device=self.device,
+                                dtype=torch.float32,
+                            )
+                            + 1e-6
                         )
-                        + 1e-6
-                    )
+                    except (ValueError, TypeError) as e:
+                        logger.warning(
+                            f"Layer {layer_idx} target mean/std failed tensor conversion: {e}. Disabling normalization."
+                        )
+                        self.apply_normalization = False
+                        break  # Exit loop
+
                     # Check for non-positive values AFTER adding epsilon
                     if torch.any(std_tensor_tg <= 0):
                         logger.warning(
@@ -541,7 +565,17 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                         break  # Exit loop
                     self.std_tg[layer_idx] = std_tensor_tg.unsqueeze(0)
                 else:
-                    logger.warning(f"Missing target mean/std for layer {layer_idx} in norm stats.")
+                    # Log which keys might be missing
+                    missing_keys_tg = []
+                    if "targets" not in stats:
+                        missing_keys_tg.append("'targets'")
+                    elif "mean" not in stats["targets"]:
+                        missing_keys_tg.append("'targets.mean'")
+                    elif "std" not in stats["targets"]:
+                        missing_keys_tg.append("'targets.std'")
+                    logger.warning(
+                        f"Missing structure ({', '.join(missing_keys_tg)}) for layer {layer_idx} targets in norm stats. Disabling normalization."
+                    )
                     self.apply_normalization = False  # Disable if structure is wrong
                     break  # Exit loop
 
