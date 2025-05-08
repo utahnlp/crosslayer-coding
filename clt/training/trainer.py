@@ -642,6 +642,7 @@ class CLTTrainer:
                 seed=self.training_config.seed,
                 timeout=remote_cfg.get("timeout", 60),
                 sampling_strategy=sampling_strategy,
+                normalization_method=self.training_config.normalization_method,
             )
             # Fix: Check instance type before accessing subclass-specific attributes
             if isinstance(store, RemoteActivationStore):
