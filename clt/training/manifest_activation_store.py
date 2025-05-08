@@ -398,6 +398,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         else:
             self.apply_normalization = bool(self.norm_stats_data)
         if self.apply_normalization:
+            logger.info(f"Preparing normalization stats. Expecting layers: {self.layer_indices}")
             self._prep_norm()
         else:
             # Initialize empty dicts with types for linter
@@ -578,6 +579,9 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                     )
                     self.apply_normalization = False  # Disable if structure is wrong
                     break  # Exit loop
+
+            # Log state of missing_layers *after* the loop
+            logger.debug(f"_prep_norm loop finished. Final missing_layers: {missing_layers}")
 
             if not self.apply_normalization:  # Check if loop was broken
                 # Clear out potentially partially filled stats if we broke early
