@@ -494,18 +494,27 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                     ).unsqueeze(
                         0
                     )  # Add batch dim
-                    self.std_in[layer_idx] = (
+                    # Create std tensor, add epsilon
+                    std_tensor_in = (
                         torch.tensor(
                             stats["inputs"]["std"],
                             device=self.device,
                             dtype=torch.float32,
                         )
                         + 1e-6
-                    ).unsqueeze(
-                        0
-                    )  # Add batch dim and epsilon
+                    )
+                    # Check for non-positive values AFTER adding epsilon
+                    if torch.any(std_tensor_in <= 0):
+                        logger.warning(
+                            f"Layer {layer_idx} input std contains non-positive values after adding epsilon. Disabling normalization."
+                        )
+                        self.apply_normalization = False
+                        break  # Exit the loop over layers if an issue is found
+                    self.std_in[layer_idx] = std_tensor_in.unsqueeze(0)  # Add batch dim
                 else:
                     logger.warning(f"Missing input mean/std for layer {layer_idx} in norm stats.")
+                    self.apply_normalization = False  # Disable if structure is wrong
+                    break  # Exit loop
 
                 # Targets
                 if "targets" in stats and "mean" in stats["targets"] and "std" in stats["targets"]:
@@ -514,18 +523,32 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                         device=self.device,
                         dtype=torch.float32,
                     ).unsqueeze(0)
-                    self.std_tg[layer_idx] = (
+                    # Create std tensor, add epsilon
+                    std_tensor_tg = (
                         torch.tensor(
                             stats["targets"]["std"],
                             device=self.device,
                             dtype=torch.float32,
                         )
                         + 1e-6
-                    ).unsqueeze(0)
+                    )
+                    # Check for non-positive values AFTER adding epsilon
+                    if torch.any(std_tensor_tg <= 0):
+                        logger.warning(
+                            f"Layer {layer_idx} target std contains non-positive values after adding epsilon. Disabling normalization."
+                        )
+                        self.apply_normalization = False
+                        break  # Exit loop
+                    self.std_tg[layer_idx] = std_tensor_tg.unsqueeze(0)
                 else:
                     logger.warning(f"Missing target mean/std for layer {layer_idx} in norm stats.")
+                    self.apply_normalization = False  # Disable if structure is wrong
+                    break  # Exit loop
 
-            if missing_layers:
+            if not self.apply_normalization:  # Check if loop was broken
+                # Clear out potentially partially filled stats if we broke early
+                self.mean_in, self.std_in, self.mean_tg, self.std_tg = {}, {}, {}, {}
+            elif missing_layers:  # Check if loop completed but layers were missing
                 # Add specific logging here
                 logger.warning(
                     f"Normalization stats missing for layers: {sorted(list(missing_layers))}. Disabling normalization."
