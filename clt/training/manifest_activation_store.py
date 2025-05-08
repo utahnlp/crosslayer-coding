@@ -393,13 +393,28 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
         # --- Load Normalization Stats (optional, subclass responsibility) ---
         self.norm_stats_data = self._load_norm_stats()
+        # # Log the loaded data immediately for debugging
+        # if self.norm_stats_data is None:
+        #     logger.debug("Loaded norm_stats_data is None.")
+        # else:
+        #     logger.debug(f"Loaded norm_stats_data type: {type(self.norm_stats_data)}, Is empty? {not bool(self.norm_stats_data)}")
+        #     # Optionally log the keys if it's a dict and not empty, to verify content further
+        #     if isinstance(self.norm_stats_data, dict) and self.norm_stats_data:
+        #         logger.debug(f"Loaded norm_stats_data keys: {list(self.norm_stats_data.keys())}")
+
+        self.apply_normalization = False
         if normalization_method == "none":
             self.apply_normalization = False
         else:
             self.apply_normalization = bool(self.norm_stats_data)
+        # logger.debug(f"Post-decision self.apply_normalization = {self.apply_normalization}") # Log the result
+
         if self.apply_normalization:
+            # logger.debug("Entering block to call _prep_norm...") # Log entry to IF block
+            # logger.info(f"Preparing normalization stats. Expecting layers: {self.layer_indices}") # Keep this?
             self._prep_norm()
         else:
+            # logger.debug("Skipping _prep_norm because self.apply_normalization is False.") # Log entry to ELSE block
             # Initialize empty dicts with types for linter
             self.mean_in: Dict[int, torch.Tensor] = {}
             self.std_in: Dict[int, torch.Tensor] = {}
@@ -487,45 +502,97 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
                 # Inputs
                 if "inputs" in stats and "mean" in stats["inputs"] and "std" in stats["inputs"]:
-                    self.mean_in[layer_idx] = torch.tensor(
-                        stats["inputs"]["mean"],
-                        device=self.device,
-                        dtype=torch.float32,  # Compute in float32
-                    ).unsqueeze(
-                        0
-                    )  # Add batch dim
-                    self.std_in[layer_idx] = (
-                        torch.tensor(
-                            stats["inputs"]["std"],
+                    try:
+                        self.mean_in[layer_idx] = torch.tensor(
+                            stats["inputs"]["mean"],
                             device=self.device,
                             dtype=torch.float32,
+                        ).unsqueeze(0)
+                        # Create std tensor, add epsilon
+                        std_tensor_in = (
+                            torch.tensor(
+                                stats["inputs"]["std"],
+                                device=self.device,
+                                dtype=torch.float32,
+                            )
+                            + 1e-6
                         )
-                        + 1e-6
-                    ).unsqueeze(
-                        0
-                    )  # Add batch dim and epsilon
+                    except (ValueError, TypeError) as e:
+                        # logger.warning(f"Layer {layer_idx} input mean/std failed tensor conversion: {e}. Disabling normalization.")
+                        self.apply_normalization = False
+                        break  # Exit loop
+
+                    # Check for non-positive values AFTER adding epsilon
+                    if torch.any(std_tensor_in <= 0):
+                        logger.warning(
+                            f"Layer {layer_idx} input std contains non-positive values after adding epsilon. Disabling normalization."
+                        )
+                        self.apply_normalization = False
+                        break  # Exit the loop over layers if an issue is found
+                    self.std_in[layer_idx] = std_tensor_in.unsqueeze(0)  # Add batch dim
                 else:
-                    logger.warning(f"Missing input mean/std for layer {layer_idx} in norm stats.")
+                    # Log which keys might be missing
+                    missing_keys_in = []
+                    if "inputs" not in stats:
+                        missing_keys_in.append("'inputs'")
+                    elif "mean" not in stats["inputs"]:
+                        missing_keys_in.append("'inputs.mean'")
+                    elif "std" not in stats["inputs"]:
+                        missing_keys_in.append("'inputs.std'")
+                    # logger.warning(f"Missing structure ({', '.join(missing_keys_in)}) for layer {layer_idx} inputs in norm stats. Disabling normalization.")
+                    self.apply_normalization = False  # Disable if structure is wrong
+                    break  # Exit loop
 
                 # Targets
                 if "targets" in stats and "mean" in stats["targets"] and "std" in stats["targets"]:
-                    self.mean_tg[layer_idx] = torch.tensor(
-                        stats["targets"]["mean"],
-                        device=self.device,
-                        dtype=torch.float32,
-                    ).unsqueeze(0)
-                    self.std_tg[layer_idx] = (
-                        torch.tensor(
-                            stats["targets"]["std"],
+                    try:
+                        self.mean_tg[layer_idx] = torch.tensor(
+                            stats["targets"]["mean"],
                             device=self.device,
                             dtype=torch.float32,
+                        ).unsqueeze(0)
+                        # Create std tensor, add epsilon
+                        std_tensor_tg = (
+                            torch.tensor(
+                                stats["targets"]["std"],
+                                device=self.device,
+                                dtype=torch.float32,
+                            )
+                            + 1e-6
                         )
-                        + 1e-6
-                    ).unsqueeze(0)
-                else:
-                    logger.warning(f"Missing target mean/std for layer {layer_idx} in norm stats.")
+                    except (ValueError, TypeError) as e:
+                        # logger.warning(f"Layer {layer_idx} target mean/std failed tensor conversion: {e}. Disabling normalization.")
+                        self.apply_normalization = False
+                        break  # Exit loop
 
-            if missing_layers:
+                    # Check for non-positive values AFTER adding epsilon
+                    if torch.any(std_tensor_tg <= 0):
+                        logger.warning(
+                            f"Layer {layer_idx} target std contains non-positive values after adding epsilon. Disabling normalization."
+                        )
+                        self.apply_normalization = False
+                        break  # Exit loop
+                    self.std_tg[layer_idx] = std_tensor_tg.unsqueeze(0)
+                else:
+                    # Log which keys might be missing
+                    missing_keys_tg = []
+                    if "targets" not in stats:
+                        missing_keys_tg.append("'targets'")
+                    elif "mean" not in stats["targets"]:
+                        missing_keys_tg.append("'targets.mean'")
+                    elif "std" not in stats["targets"]:
+                        missing_keys_tg.append("'targets.std'")
+                    # logger.warning(f"Missing structure ({', '.join(missing_keys_tg)}) for layer {layer_idx} targets in norm stats. Disabling normalization.")
+                    self.apply_normalization = False  # Disable if structure is wrong
+                    break  # Exit loop
+
+            # Log state of missing_layers *after* the loop
+            # logger.debug(f"_prep_norm loop finished. Final missing_layers: {missing_layers}")
+
+            if not self.apply_normalization:  # Check if loop was broken
+                # Clear out potentially partially filled stats if we broke early
+                self.mean_in, self.std_in, self.mean_tg, self.std_tg = {}, {}, {}, {}
+            elif missing_layers:  # Check if loop completed but layers were missing
                 # Add specific logging here
                 logger.warning(
                     f"Normalization stats missing for layers: {sorted(list(missing_layers))}. Disabling normalization."

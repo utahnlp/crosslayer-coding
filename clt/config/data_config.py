@@ -13,12 +13,8 @@ class ActivationConfig:
     # --- Dataset Source Identification ---
     dataset_path: str  # Path or name of the Hugging Face dataset
     # --- Fields with Defaults --- #
-    model_dtype: Optional[str] = (
-        None  # Optional dtype for the model ('float16', 'bfloat16')
-    )
-    activation_dtype: Literal["bfloat16", "float16", "float32"] = (
-        "bfloat16"  # Precision for storing activations
-    )
+    model_dtype: Optional[str] = None  # Optional dtype for the model ('float16', 'bfloat16')
+    activation_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"  # Precision for storing activations
     dataset_split: str = "train"  # Dataset split to use
     dataset_text_column: str = "text"  # Column containing text data
 
@@ -31,35 +27,28 @@ class ActivationConfig:
     # --- Dataset Handling Parameters (for generation) ---
     streaming: bool = True  # Use HF dataset streaming during generation
     dataset_trust_remote_code: bool = False  # Trust remote code for HF dataset
-    cache_path: Optional[str] = (
-        None  # Optional cache path for HF dataset (if not streaming)
-    )
+    cache_path: Optional[str] = None  # Optional cache path for HF dataset (if not streaming)
 
     # --- Generation Output Control ---
-    target_total_tokens: Optional[int] = (
-        None  # Target num tokens to generate (approximate)
-    )
+    target_total_tokens: Optional[int] = None  # Target num tokens to generate (approximate)
 
     # --- Storage Parameters (for generation output) ---
     activation_dir: str = "./activations"  # Base directory to save activation datasets
     output_format: Literal["hdf5", "npz"] = "hdf5"  # Format to save activations
-    compression: Optional[str] = (
-        "gzip"  # Compression for saved files ('lz4', 'gzip', None)
-    )
-    chunk_token_threshold: int = (
-        1_000_000  # Minimum tokens to accumulate before saving a chunk
-    )
+    compression: Optional[str] = "gzip"  # Compression for saved files ('lz4', 'gzip', None)
+    chunk_token_threshold: int = 1_000_000  # Minimum tokens to accumulate before saving a chunk
     # Note: 'storage_type' (local/remote) is handled by the generator script/workflow,
     # not stored intrinsically here, as the generated data itself is local.
 
     # --- Normalization Computation (during generation) ---
-    compute_norm_stats: bool = (
-        True  # Compute mean/std during generation and save to norm_stats.json
-    )
+    compute_norm_stats: bool = True  # Compute mean/std during generation and save to norm_stats.json
 
     # --- Remote Storage Parameters ---
     remote_server_url: Optional[str] = None  # Base URL of the remote activation server
     delete_after_upload: bool = False  # Delete local chunk after successful upload
+    upload_max_retries: int = 5  # Max number of upload retries per chunk
+    upload_initial_backoff: float = 1.0  # Initial backoff delay in seconds for retries
+    upload_max_backoff: float = 30.0  # Maximum backoff delay in seconds for retries
 
     # --- NNsight Parameters (Optional) ---
     # Use field to allow mutable default dict
@@ -80,9 +69,7 @@ class ActivationConfig:
             try:
                 import h5py  # noqa: F401 - Check if h5py is available if format is hdf5
             except ImportError:
-                raise ImportError(
-                    "h5py is required for HDF5 output format. Install with: pip install h5py"
-                )
+                raise ImportError("h5py is required for HDF5 output format. Install with: pip install h5py")
         if self.compression not in ["lz4", "gzip", None, False]:
             print(
                 f"Warning: Unsupported compression '{self.compression}'. Will attempt without compression for {self.output_format}."

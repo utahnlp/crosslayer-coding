@@ -154,7 +154,7 @@ expected_activation_path = os.path.join(
 _lr = 1e-4
 _batch_size = 1024
 _sparsity_lambda = 0.00001
-_sparsity_c = 1.0
+_sparsity_c = 0.5
 
 wdb_run_name = (
     f"{clt_config.num_features}-width-"
@@ -184,7 +184,7 @@ training_config = TrainingConfig(
     sparsity_lambda_schedule="linear",
     # sparsity_lambda_delay_frac=0.10,
     sparsity_c=_sparsity_c,
-    preactivation_coef=3e-6,
+    preactivation_coef=3e-5,
     # Optimizer & Scheduler
     optimizer="adamw",
     lr_scheduler="linear_final20",

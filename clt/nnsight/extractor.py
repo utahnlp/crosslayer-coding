@@ -29,6 +29,8 @@ class ActivationExtractorCLT:
         prepend_bos: bool = False,
         nnsight_tracer_kwargs: Optional[Dict] = None,
         nnsight_invoker_args: Optional[Dict] = None,
+        batchtopk_k: Optional[int] = None,
+        batchtopk_frac: Optional[float] = None,
     ):
         """
         Initializes the ActivationExtractorCLT.
@@ -53,11 +55,11 @@ class ActivationExtractorCLT:
             prepend_bos: Whether to prepend the BOS token (required by some models).
             nnsight_tracer_kwargs: Additional kwargs for nnsight model.trace().
             nnsight_invoker_args: Additional invoker_args for nnsight model.trace().
+            batchtopk_k: Optional k parameter for BatchTopK.
+            batchtopk_frac: Optional fraction parameter for BatchTopK.
         """
         self.model_name = model_name
-        self.device = device or (
-            torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-        )
+        self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         self.model_dtype = self._resolve_dtype(model_dtype)
         self.context_size = context_size
         self.inference_batch_size = inference_batch_size
@@ -65,6 +67,11 @@ class ActivationExtractorCLT:
         self.mlp_output_module_path_template = mlp_output_module_path_template
         self.exclude_special_tokens = exclude_special_tokens
         self.prepend_bos = prepend_bos
+
+        # Store BatchTopK params if provided, though not directly used by current extractor logic
+        # This is for potential future use or if downstream components expect them via this config path
+        self.batchtopk_k = batchtopk_k
+        self.batchtopk_frac = batchtopk_frac
 
         # Tokenizer arguments
         self.tokenizer_args = {
@@ -85,9 +92,7 @@ class ActivationExtractorCLT:
         self.model, self.tokenizer = self._load_model_and_tokenizer()
         self.num_layers = self._get_num_layers()
 
-    def _resolve_dtype(
-        self, dtype_input: Optional[Union[str, torch.dtype]]
-    ) -> Optional[torch.dtype]:
+    def _resolve_dtype(self, dtype_input: Optional[Union[str, torch.dtype]]) -> Optional[torch.dtype]:
         """Converts string dtype names to torch.dtype objects."""
         if isinstance(dtype_input, torch.dtype):
             return dtype_input
@@ -185,9 +190,7 @@ class ActivationExtractorCLT:
         tokens = self.tokenizer.encode(text, add_special_tokens=False)
 
         # If token length fits within context size (allowing for potential BOS/EOS later)
-        if (
-            len(tokens) <= self.context_size - (1 if self.prepend_bos else 0) - 1
-        ):  # -1 for potential EOS
+        if len(tokens) <= self.context_size - (1 if self.prepend_bos else 0) - 1:  # -1 for potential EOS
             return [text]
 
         # Split into chunks, leaving room for special tokens if needed
@@ -201,9 +204,7 @@ class ActivationExtractorCLT:
             )
             return []
 
-        token_chunks = [
-            tokens[i : i + chunk_size] for i in range(0, len(tokens), chunk_size)
-        ]
+        token_chunks = [tokens[i : i + chunk_size] for i in range(0, len(tokens), chunk_size)]
 
         # Convert token chunks back to strings
         text_chunks = [self.tokenizer.decode(chunk) for chunk in token_chunks]
@@ -235,9 +236,7 @@ class ActivationExtractorCLT:
             Tensor shape: (n_valid_tokens, d_model)
         """
         # Handle the case where dataset_trust_remote_code is None
-        trust_remote_code = (
-            False if dataset_trust_remote_code is None else dataset_trust_remote_code
-        )
+        trust_remote_code = False if dataset_trust_remote_code is None else dataset_trust_remote_code
 
         dataset = load_dataset(
             dataset_path,
@@ -248,9 +247,7 @@ class ActivationExtractorCLT:
         )
 
         if not isinstance(dataset, (Dataset, IterableDataset)):
-            raise TypeError(
-                "Loaded dataset is not a Hugging Face Dataset or IterableDataset."
-            )
+            raise TypeError("Loaded dataset is not a Hugging Face Dataset or IterableDataset.")
 
         batch_texts: List[str] = []
 
@@ -268,9 +265,7 @@ class ActivationExtractorCLT:
 
                 try:
                     # Pre-tokenize the batch of text (key change from notebook)
-                    tokenized_inputs = self.tokenizer(
-                        current_batch, **self.tokenizer_args
-                    )
+                    tokenized_inputs = self.tokenizer(current_batch, **self.tokenizer_args)
 
                     # Move to device
                     input_ids = tokenized_inputs["input_ids"].to(self.device)
@@ -282,14 +277,10 @@ class ActivationExtractorCLT:
 
                     # Using simpler tracing approach from notebook
                     with torch.no_grad():
-                        with self.model.trace(input_ids) as tracer:
+                        with self.model.trace(input_ids):
                             for layer_idx in range(self.num_layers):
-                                saved_mlp_inputs[layer_idx] = self._get_module_proxy(
-                                    layer_idx, "input"
-                                ).save()
-                                saved_mlp_outputs[layer_idx] = self._get_module_proxy(
-                                    layer_idx, "output"
-                                ).save()
+                                saved_mlp_inputs[layer_idx] = self._get_module_proxy(layer_idx, "input").save()
+                                saved_mlp_outputs[layer_idx] = self._get_module_proxy(layer_idx, "output").save()
 
                             # Ensure trace executes
                             _ = self.model.output.logits.shape
@@ -299,7 +290,6 @@ class ActivationExtractorCLT:
                     batch_inputs_dict: Dict[int, torch.Tensor] = {}
                     batch_targets_dict: Dict[int, torch.Tensor] = {}
                     d_model = -1
-                    total_valid_tokens = 0
 
                     # Process each layer's activations
                     for layer_idx in range(self.num_layers):
@@ -307,9 +297,7 @@ class ActivationExtractorCLT:
                         mlp_output_proxy = saved_mlp_outputs.get(layer_idx)
 
                         if mlp_input_proxy is None or mlp_output_proxy is None:
-                            logger.warning(
-                                f"Missing input/output proxy for layer {layer_idx}. Skipping."
-                            )
+                            logger.warning(f"Missing input/output proxy for layer {layer_idx}. Skipping.")
                             continue
 
                         # Get actual tensor values
@@ -318,18 +306,12 @@ class ActivationExtractorCLT:
 
                         # Handle tuple outputs
                         if isinstance(mlp_input_acts, tuple):
-                            mlp_input_acts = (
-                                mlp_input_acts[0] if mlp_input_acts else None
-                            )
+                            mlp_input_acts = mlp_input_acts[0] if mlp_input_acts else None
                         if isinstance(mlp_output_acts, tuple):
-                            mlp_output_acts = (
-                                mlp_output_acts[0] if mlp_output_acts else None
-                            )
+                            mlp_output_acts = mlp_output_acts[0] if mlp_output_acts else None
 
                         if mlp_input_acts is None or mlp_output_acts is None:
-                            logger.warning(
-                                f"Activation value is None for layer {layer_idx}. Skipping."
-                            )
+                            logger.warning(f"Activation value is None for layer {layer_idx}. Skipping.")
                             continue
 
                         # Ensure tensors are on correct device
@@ -337,11 +319,7 @@ class ActivationExtractorCLT:
                         mlp_output_acts = mlp_output_acts.to(self.device)
 
                         # Infer d_model (hidden dimension size)
-                        if (
-                            d_model == -1
-                            and hasattr(mlp_input_acts, "shape")
-                            and mlp_input_acts.ndim == 3
-                        ):
+                        if d_model == -1 and hasattr(mlp_input_acts, "shape") and mlp_input_acts.ndim == 3:
                             d_model = mlp_input_acts.shape[-1]
 
                         # Expected shape: [batch_size, sequence_length, d_model]
@@ -364,16 +342,12 @@ class ActivationExtractorCLT:
 
                             # Count tokens only for the first layer to avoid duplication
                             if layer_idx == 0:
-                                total_valid_tokens = valid_input_acts.shape[0]
+                                pass
                         else:
-                            logger.warning(
-                                f"Unexpected activation shape at layer {layer_idx}. Skipping."
-                            )
+                            logger.warning(f"Unexpected activation shape at layer {layer_idx}. Skipping.")
 
                     # Yield the processed activations
-                    if batch_inputs_dict and any(
-                        t.numel() > 0 for t in batch_inputs_dict.values()
-                    ):
+                    if batch_inputs_dict and any(t.numel() > 0 for t in batch_inputs_dict.values()):
                         yield batch_inputs_dict, batch_targets_dict
 
                 except Exception as e:
@@ -395,14 +369,10 @@ class ActivationExtractorCLT:
                 saved_mlp_outputs = {}
 
                 with torch.no_grad():
-                    with self.model.trace(input_ids) as tracer:
+                    with self.model.trace(input_ids):
                         for layer_idx in range(self.num_layers):
-                            saved_mlp_inputs[layer_idx] = self._get_module_proxy(
-                                layer_idx, "input"
-                            ).save()
-                            saved_mlp_outputs[layer_idx] = self._get_module_proxy(
-                                layer_idx, "output"
-                            ).save()
+                            saved_mlp_inputs[layer_idx] = self._get_module_proxy(layer_idx, "input").save()
+                            saved_mlp_outputs[layer_idx] = self._get_module_proxy(layer_idx, "output").save()
                         # Ensure trace executes
                         _ = self.model.output.logits.shape
 
@@ -410,16 +380,13 @@ class ActivationExtractorCLT:
                 batch_inputs_dict = {}
                 batch_targets_dict = {}
                 d_model = -1
-                total_valid_tokens = 0
 
                 for layer_idx in range(self.num_layers):
                     mlp_input_proxy = saved_mlp_inputs.get(layer_idx)
                     mlp_output_proxy = saved_mlp_outputs.get(layer_idx)
 
                     if mlp_input_proxy is None or mlp_output_proxy is None:
-                        logger.warning(
-                            f"(Final Batch) Missing proxy layer {layer_idx}. Skipping."
-                        )
+                        logger.warning(f"(Final Batch) Missing proxy layer {layer_idx}. Skipping.")
                         continue
 
                     # Get tensor values
@@ -430,14 +397,10 @@ class ActivationExtractorCLT:
                     if isinstance(mlp_input_acts, tuple):
                         mlp_input_acts = mlp_input_acts[0] if mlp_input_acts else None
                     if isinstance(mlp_output_acts, tuple):
-                        mlp_output_acts = (
-                            mlp_output_acts[0] if mlp_output_acts else None
-                        )
+                        mlp_output_acts = mlp_output_acts[0] if mlp_output_acts else None
 
                     if mlp_input_acts is None or mlp_output_acts is None:
-                        logger.warning(
-                            f"(Final Batch) Activation value is None for layer {layer_idx}. Skipping."
-                        )
+                        logger.warning(f"(Final Batch) Activation value is None for layer {layer_idx}. Skipping.")
                         continue
 
                     # Ensure tensors are on correct device
@@ -445,11 +408,7 @@ class ActivationExtractorCLT:
                     mlp_output_acts = mlp_output_acts.to(self.device)
 
                     # Infer d_model
-                    if (
-                        d_model == -1
-                        and hasattr(mlp_input_acts, "shape")
-                        and mlp_input_acts.ndim == 3
-                    ):
+                    if d_model == -1 and hasattr(mlp_input_acts, "shape") and mlp_input_acts.ndim == 3:
                         d_model = mlp_input_acts.shape[-1]
 
                     # Process activations
@@ -469,22 +428,16 @@ class ActivationExtractorCLT:
 
                         # Count tokens only for the first layer to avoid duplication
                         if layer_idx == 0:
-                            total_valid_tokens = valid_input_acts.shape[0]
+                            pass
                     else:
-                        logger.warning(
-                            f"(Final Batch) Unexpected activation shape layer {layer_idx}. Skipping."
-                        )
+                        logger.warning(f"(Final Batch) Unexpected activation shape layer {layer_idx}. Skipping.")
 
                 # Yield the final batch
-                if batch_inputs_dict and any(
-                    t.numel() > 0 for t in batch_inputs_dict.values()
-                ):
+                if batch_inputs_dict and any(t.numel() > 0 for t in batch_inputs_dict.values()):
                     yield batch_inputs_dict, batch_targets_dict
 
             except Exception as e:
-                logger.warning(
-                    f"Error processing final batch: {e}. Skipping.", exc_info=True
-                )
+                logger.warning(f"Error processing final batch: {e}. Skipping.", exc_info=True)
 
     def close(self):
         """Clean up resources (if any)."""

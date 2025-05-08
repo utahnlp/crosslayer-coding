@@ -1,0 +1,13 @@
+{
+  "num_features": 24576,
+  "num_layers": 12,
+  "d_model": 768,
+  "model_name": "gpt2",
+  "normalization_method": "auto",
+  "activation_fn": "relu",
+  "jumprelu_threshold": 0.03,
+  "clt_dtype": null,
+  "expected_input_dtype": "float32",
+  "mlp_input_template": "transformer.h.{}.ln_2.input",
+  "mlp_output_template": "transformer.h.{}.mlp.output"
+} 

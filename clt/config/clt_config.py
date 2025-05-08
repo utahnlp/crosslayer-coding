@@ -18,12 +18,18 @@ class CLTConfig:
     normalization_method: Literal["auto", "estimated_mean_std", "none"] = (
         "none"  # How activations were normalized during training
     )
-    activation_fn: Literal["jumprelu", "relu"] = "jumprelu"
+    activation_fn: Literal["jumprelu", "relu", "batchtopk"] = "jumprelu"
     jumprelu_threshold: float = 0.03  # Threshold for JumpReLU activation
+    # BatchTopK parameters
+    batchtopk_k: Optional[int] = None  # Absolute k for BatchTopK
+    batchtopk_frac: Optional[float] = None  # Fraction of features to keep for BatchTopK
+    batchtopk_straight_through: bool = True  # Whether to use straight-through estimator for BatchTopK
     clt_dtype: Optional[str] = None  # Optional dtype for the CLT model itself (e.g., "float16")
     expected_input_dtype: Optional[str] = None  # Expected dtype of input activations
     mlp_input_template: Optional[str] = None  # Module path template for MLP input activations
     mlp_output_template: Optional[str] = None  # Module path template for MLP output activations
+    tl_input_template: Optional[str] = None  # TransformerLens hook point pattern before MLP
+    tl_output_template: Optional[str] = None  # TransformerLens hook point pattern after MLP
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -35,6 +41,20 @@ class CLTConfig:
         assert (
             self.normalization_method in valid_norm_methods
         ), f"Invalid normalization_method: {self.normalization_method}. Must be one of {valid_norm_methods}"
+        valid_activation_fns = ["jumprelu", "relu", "batchtopk"]
+        assert (
+            self.activation_fn in valid_activation_fns
+        ), f"Invalid activation_fn: {self.activation_fn}. Must be one of {valid_activation_fns}"
+
+        if self.activation_fn == "batchtopk":
+            if self.batchtopk_k is not None and self.batchtopk_frac is not None:
+                raise ValueError("Only one of batchtopk_k or batchtopk_frac can be specified.")
+            if self.batchtopk_k is None and self.batchtopk_frac is None:
+                raise ValueError("One of batchtopk_k or batchtopk_frac must be specified for BatchTopK.")
+            if self.batchtopk_k is not None and self.batchtopk_k <= 0:
+                raise ValueError("batchtopk_k must be positive.")
+            if self.batchtopk_frac is not None and not (0 < self.batchtopk_frac <= 1):
+                raise ValueError("batchtopk_frac must be between 0 (exclusive) and 1 (inclusive).")
 
     @classmethod
     def from_json(cls: Type[C], json_path: str) -> C:
@@ -108,6 +128,8 @@ class TrainingConfig:
     )
     sparsity_c: float = 1.0  # Parameter affecting sparsity penalty shape
     preactivation_coef: float = 3e-6  # Coefficient for pre-activation loss
+    aux_loss_factor: Optional[float] = None  # Coefficient for the auxiliary reconstruction loss (e.g. for dead latents)
+    apply_sparsity_penalty_to_batchtopk: bool = True  # Whether to apply sparsity penalty when using BatchTopK
 
     # Optimizer parameters
     optimizer: Literal["adam", "adamw"] = "adamw"
