@@ -108,8 +108,8 @@ class WandBLogger:
             dir=log_dir,
             tags=training_config.wandb_tags,
             config={
-                **training_config.__dict__,
                 **clt_config.__dict__,
+                **training_config.__dict__,
                 "log_dir": log_dir,
             },
         )
