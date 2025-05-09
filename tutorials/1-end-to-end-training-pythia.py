@@ -82,18 +82,24 @@ print(model)
 # %%
 # --- CLT Architecture Configuration ---
 # We need to match the base model's dimensions
-gpt2_num_layers = 12
-gpt2_d_model = 768
+num_layers = 12
+d_model = 768
 expansion_factor = 32
 
+# Recommended sparsity fraction for BatchTopK
+batchtopk_sparsity_fraction = 0.002  # Keep top 0.2% (590 with expansion factor 32) of features across all layers
+
+
 # For the tutorial, let's use a smaller number of features than d_model
-clt_num_features = gpt2_d_model * expansion_factor
+clt_num_features = d_model * expansion_factor
 clt_config = CLTConfig(
     num_features=clt_num_features,
-    num_layers=gpt2_num_layers,  # Must match the base model
-    d_model=gpt2_d_model,  # Must match the base model
-    activation_fn="relu",  # As described in the paper
-    # jumprelu_threshold=0.2,  # Default value from paper
+    num_layers=num_layers,  # Must match the base model
+    d_model=d_model,  # Must match the base model
+    activation_fn="batchtopk",  # As described in the paper
+    batchtopk_k=None,  # Specify k or frac
+    batchtopk_frac=batchtopk_sparsity_fraction,  # Keep top 2% features globally
+    batchtopk_straight_through=True,  # Use STE for gradients
 )
 print("CLT Configuration:")
 print(clt_config)
@@ -153,8 +159,8 @@ expected_activation_path = os.path.join(
 # Values needed for the name (replace with actual config values if different)
 _lr = 1e-4
 _batch_size = 1024
-_sparsity_lambda = 0.00001
-_sparsity_c = 0.5
+_sparsity_lambda = 0.0
+_sparsity_c = 0.0
 
 wdb_run_name = (
     f"{clt_config.num_features}-width-"
@@ -184,7 +190,9 @@ training_config = TrainingConfig(
     sparsity_lambda_schedule="linear",
     # sparsity_lambda_delay_frac=0.10,
     sparsity_c=_sparsity_c,
-    preactivation_coef=3e-5,
+    preactivation_coef=0,
+    aux_loss_factor=1 / 32,  # Enable AuxK loss with typical factor from paper
+    apply_sparsity_penalty_to_batchtopk=False,  # Ensure standard sparsity penalty is off for BatchTopK
     # Optimizer & Scheduler
     optimizer="adamw",
     lr_scheduler="linear_final20",

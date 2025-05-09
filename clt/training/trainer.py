@@ -1218,6 +1218,25 @@ class CLTTrainer:
                         dead_neuron_mask=current_dead_mask,
                     )
 
+                    # --- Log per-layer standard deviation of pre-activations ---
+                    # This requires getting the pre-activations first.
+                    # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
+                    preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
+                    layerwise_preact_std_dev: Dict[str, float] = {}
+                    if preactivations_eval_dict:
+                        for layer_idx, preact_tensor in preactivations_eval_dict.items():
+                            if preact_tensor.numel() > 0:
+                                # Calculate std dev of all elements in the preactivation tensor for this layer
+                                std_dev_val = preact_tensor.std().item()
+                                layerwise_preact_std_dev[f"layer_{layer_idx}"] = std_dev_val
+                            else:
+                                layerwise_preact_std_dev[f"layer_{layer_idx}"] = float("nan")  # Or 0.0
+
+                    # Add to eval_metrics for WandB logging
+                    if layerwise_preact_std_dev:
+                        eval_metrics["layerwise/preactivation_std_dev"] = layerwise_preact_std_dev
+                    # --- End logging pre-activation std dev ---
+
                     if not self.distributed or self.rank == 0:
                         # Store evaluation metrics (for saving to JSON)
                         self.metrics["eval_metrics"].append({"step": step, **eval_metrics})

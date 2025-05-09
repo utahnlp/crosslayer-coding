@@ -242,10 +242,10 @@ class CLTEvaluator:
             reconstructions: Dictionary mapping layer indices to reconstructed activations.
 
         Returns:
-            Dictionary with 'reconstruction/explained_variance' and 'reconstruction/total_mse'.
+            Dictionary with 'reconstruction/explained_variance' and 'reconstruction/normalized_mean_reconstruction_error'.
         """
-        total_mse = 0.0
         total_explained_variance = 0.0
+        total_nmse = 0.0
         num_layers = 0
 
         for layer_idx, target_act in targets.items():
@@ -255,52 +255,63 @@ class CLTEvaluator:
             recon_act = reconstructions[layer_idx]
 
             # --- De-normalise if stats available ---
+            target_act_denorm = target_act
+            recon_act_denorm = recon_act
             if layer_idx in self.mean_tg and layer_idx in self.std_tg:
                 mean = self.mean_tg[layer_idx].to(recon_act.device, recon_act.dtype)
                 std = self.std_tg[layer_idx].to(recon_act.device, recon_act.dtype)
                 # Ensure broadcast shape
-                target_act = target_act * std + mean
-                recon_act = recon_act * std + mean
+                target_act_denorm = target_act * std + mean
+                recon_act_denorm = recon_act * std + mean
             # --- End De-normalisation ---
 
             # Ensure shapes match (flatten if necessary)
-            target_flat = target_act.view(-1, target_act.shape[-1])
-            recon_flat = recon_act.view(-1, recon_act.shape[-1])
+            target_flat = target_act_denorm.view(-1, target_act_denorm.shape[-1])
+            recon_flat = recon_act_denorm.view(-1, recon_act_denorm.shape[-1])
 
             if target_flat.shape != recon_flat.shape or target_flat.numel() == 0:
                 continue
 
-            # Calculate MSE
-            mse = F.mse_loss(recon_flat, target_flat, reduction="mean").item()
-            total_mse += mse
+            # Calculate MSE (de-normalized)
+            mse_layer = F.mse_loss(recon_flat, target_flat, reduction="mean").item()
 
-            # Calculate Explained Variance (EV)
-            # EV = 1 - Var(Target - Recon) / Var(Target)
-            # Variance across batch/seq dim, averaged over features
-            target_variance = torch.var(target_flat, dim=0, unbiased=False).mean().item()
-            error_variance = torch.var(target_flat - recon_flat, dim=0, unbiased=False).mean().item()
+            # Calculate Explained Variance (EV) - uses de-normalized values
+            target_variance_layer = torch.var(target_flat, dim=0, unbiased=False).mean().item()
+            error_variance_layer = torch.var(target_flat - recon_flat, dim=0, unbiased=False).mean().item()
 
-            if target_variance > 1e-9:  # Avoid division by zero or near-zero
-                explained_variance = 1.0 - (error_variance / target_variance)
+            explained_variance_layer = 0.0
+            if target_variance_layer > 1e-9:  # Avoid division by zero or near-zero
+                explained_variance_layer = 1.0 - (error_variance_layer / target_variance_layer)
             else:
-                # If target variance is zero, EV is 1 if error is also zero, else 0
-                explained_variance = 1.0 if error_variance < 1e-9 else 0.0
+                # If target variance is zero, EV is 1 if error is also zero, else 0 or undefined.
+                # Let's be consistent: if target var is ~0, EV is 1 if error var is also ~0, else 0.
+                explained_variance_layer = 1.0 if error_variance_layer < 1e-9 else 0.0
+            total_explained_variance += explained_variance_layer
 
-            total_explained_variance += explained_variance
+            # Calculate NMSE for the layer (de-normalized)
+            nmse_layer = 0.0
+            if target_variance_layer > 1e-9:
+                nmse_layer = mse_layer / target_variance_layer
+            elif mse_layer < 1e-9:  # Target variance is zero and MSE is also zero
+                nmse_layer = 0.0
+            else:  # Target variance is zero but MSE is non-zero (implies error, NMSE is effectively infinite)
+                nmse_layer = float("inf")  # Or a large number, or handle as NaN depending on preference
+            total_nmse += nmse_layer
+
             num_layers += 1
 
-        avg_mse = total_mse / num_layers if num_layers > 0 else 0.0
         avg_explained_variance = total_explained_variance / num_layers if num_layers > 0 else 0.0
+        avg_normalized_mean_reconstruction_error = total_nmse / num_layers if num_layers > 0 else 0.0
+
         # Clamp EV between 0 and 1 for robustness
         avg_explained_variance = max(0.0, min(1.0, avg_explained_variance))
 
-        # Calculate Normalized Mean Reconstruction Error (as a fraction)
-        normalized_error_fraction = np.sqrt(avg_mse) if avg_mse >= 0 else 0.0
+        # avg_normalized_mean_reconstruction_error can be inf, handle this if it needs to be bounded or logged carefully.
+        # For now, log as is.
 
         return {
             "reconstruction/explained_variance": avg_explained_variance,
-            "reconstruction/total_mse": avg_mse,
-            "reconstruction/normalized_mean_reconstruction_error": normalized_error_fraction,
+            "reconstruction/normalized_mean_reconstruction_error": avg_normalized_mean_reconstruction_error,
         }
 
     def _compute_feature_density(self, activations: Dict[int, torch.Tensor]) -> Dict[str, Any]:

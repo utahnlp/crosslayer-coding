@@ -162,7 +162,10 @@ class CrossLayerTranscoder(BaseTranscoder):
         # across data parallel replicas, but for TP, we might need manual handling if issues arise.
         # For now, keep as standard parameter.
         if self.config.activation_fn == "jumprelu":
-            initial_threshold_val = torch.ones(config.num_features) * torch.log(torch.tensor(config.jumprelu_threshold))
+            # Initialize per-layer thresholds
+            initial_threshold_val = torch.ones(
+                config.num_layers, config.num_features  # Shape: [num_layers, num_features]
+            ) * torch.log(torch.tensor(config.jumprelu_threshold))
             self.log_threshold = nn.Parameter(initial_threshold_val.to(device=self.device, dtype=self.dtype))
 
         self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
@@ -194,10 +197,20 @@ class CrossLayerTranscoder(BaseTranscoder):
                 return torch.float32
         return torch.float32
 
-    def jumprelu(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply JumpReLU activation function."""
-        # Threshold is replicated, use it directly
-        threshold = torch.exp(self.log_threshold).to(x.device, x.dtype)
+    def jumprelu(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
+        """Apply JumpReLU activation function for a specific layer."""
+        # Select the threshold for the given layer
+        if not hasattr(self, "log_threshold") or self.log_threshold is None:
+            # This should ideally not happen if config.activation_fn == "jumprelu"
+            logger.error(f"Rank {self.rank}: log_threshold not initialized for JumpReLU. Returning input.")
+            return x
+        if layer_idx >= self.log_threshold.shape[0]:
+            logger.error(
+                f"Rank {self.rank}: Invalid layer_idx {layer_idx} for log_threshold with shape {self.log_threshold.shape}. Returning input."
+            )
+            return x
+
+        threshold = torch.exp(self.log_threshold[layer_idx]).to(x.device, x.dtype)
         # Apply JumpReLU - This needs the *full* preactivation dimension
         # Cast output to Tensor to satisfy linter
         return cast(torch.Tensor, JumpReLU.apply(x, threshold, self.bandwidth))
@@ -338,35 +351,53 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         batch_tokens_dim = first_valid_preact.shape[0]
 
-        ordered_preactivations: List[torch.Tensor] = []
+        ordered_preactivations_original: List[torch.Tensor] = []
+        ordered_preactivations_normalized: List[torch.Tensor] = []
         layer_feature_sizes: List[Tuple[int, int]] = []
 
         for layer_idx in range(self.config.num_layers):
             if layer_idx in preactivations_dict:
-                preact = preactivations_dict[layer_idx]  # Already on correct device/dtype from _encode_all_layers
-                if preact.shape[0] != batch_tokens_dim and preact.numel() > 0:
+                preact_orig = preactivations_dict[layer_idx]  # Already on correct device/dtype
+
+                current_num_features = self.config.num_features  # Default
+                if preact_orig.numel() > 0:
+                    current_num_features = preact_orig.shape[1]
+
+                if preact_orig.shape[0] != batch_tokens_dim and preact_orig.numel() > 0:
                     logger.warning(
                         f"Rank {self.rank}: Inconsistent batch_tokens dim for layer {layer_idx}. "
-                        f"Expected {batch_tokens_dim}, got {preact.shape[0]}. Using zero tensor."
+                        f"Expected {batch_tokens_dim}, got {preact_orig.shape[0]}. Using zero tensor."
                     )
-                    num_f = self.config.num_features
-                    ordered_preactivations.append(torch.zeros((batch_tokens_dim, num_f), device=device, dtype=dtype))
-                    layer_feature_sizes.append((layer_idx, num_f))
-                elif preact.numel() == 0 and batch_tokens_dim > 0:
-                    num_f = self.config.num_features
-                    ordered_preactivations.append(torch.zeros((batch_tokens_dim, num_f), device=device, dtype=dtype))
-                    layer_feature_sizes.append((layer_idx, num_f))
-                elif preact.numel() > 0:
-                    ordered_preactivations.append(preact)
-                    layer_feature_sizes.append((layer_idx, preact.shape[1]))
+                    zero_tensor_orig = torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
+                    ordered_preactivations_original.append(zero_tensor_orig)
+                    ordered_preactivations_normalized.append(
+                        torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
+                    )  # Norm of zeros is zeros (or NaN, but zeros is fine for ranking)
+                    layer_feature_sizes.append((layer_idx, current_num_features))
+                elif preact_orig.numel() == 0 and batch_tokens_dim > 0:
+                    zero_tensor_orig = torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
+                    ordered_preactivations_original.append(zero_tensor_orig)
+                    ordered_preactivations_normalized.append(
+                        torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
+                    )
+                    layer_feature_sizes.append((layer_idx, current_num_features))
+                elif preact_orig.numel() > 0:
+                    ordered_preactivations_original.append(preact_orig)
+                    # Normalize preact_orig for ranking (mean and std over token dimension for each feature)
+                    mean = preact_orig.mean(dim=0, keepdim=True)
+                    std = preact_orig.std(dim=0, keepdim=True)
+                    preact_norm = (preact_orig - mean) / (std + 1e-6)  # Add epsilon to std
+                    ordered_preactivations_normalized.append(preact_norm)
+                    layer_feature_sizes.append((layer_idx, preact_orig.shape[1]))
 
-        if not ordered_preactivations:
+        if not ordered_preactivations_original:
             logger.warning(
                 f"Rank {self.rank}: No preactivations found for layers 0 to {self.config.num_layers - 1} after filtering. Returning empty dict."
             )
             return {}
 
-        concatenated_preactivations = torch.cat(ordered_preactivations, dim=1)
+        concatenated_preactivations_original = torch.cat(ordered_preactivations_original, dim=1)
+        concatenated_preactivations_normalized = torch.cat(ordered_preactivations_normalized, dim=1)
 
         k_val: float
         if self.config.batchtopk_k is not None:
@@ -375,10 +406,13 @@ class CrossLayerTranscoder(BaseTranscoder):
             k_val = self.config.batchtopk_frac
         else:
             logger.error(f"Rank {self.rank}: BatchTopK k or frac not specified. Defaulting to keeping all features.")
-            k_val = float(concatenated_preactivations.size(1))
+            k_val = float(concatenated_preactivations_original.size(1))
 
         activated_concatenated = BatchTopK.apply(
-            concatenated_preactivations, k_val, self.config.batchtopk_straight_through
+            concatenated_preactivations_original,  # Pass original for values and STE path
+            k_val,
+            self.config.batchtopk_straight_through,
+            concatenated_preactivations_normalized,  # Pass normalized for ranking
         )
 
         activations_dict: Dict[int, torch.Tensor] = {}
@@ -436,7 +470,7 @@ class CrossLayerTranscoder(BaseTranscoder):
             else:
                 # Apply activation function to the full preactivation tensor
                 if self.config.activation_fn == "jumprelu":
-                    activated = self.jumprelu(preact)
+                    activated = self.jumprelu(preact, layer_idx)
                 elif self.config.activation_fn == "relu":  # "relu"
                     activated = F.relu(preact)
                 elif self.config.activation_fn == "batchtopk":

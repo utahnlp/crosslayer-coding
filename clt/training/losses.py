@@ -201,6 +201,22 @@ class LossManager:
         Returns:
             Pre-activation loss
         """
+        # Early exit if coefficient is None or effectively zero
+        if self.config.preactivation_coef is None or abs(self.config.preactivation_coef) < 1e-9:
+            # Determine device for the zero tensor
+            # If inputs is not empty, use the device of the first tensor in inputs
+            # Otherwise, attempt to get device from model or default to CPU
+            if inputs:
+                device = next(iter(inputs.values())).device
+            else:
+                # Fallback: try model's device if model is accessible here, or default to CPU
+                # This part might need adjustment if model isn't directly accessible
+                # or if a more robust way to get a default device is needed.
+                # For now, assuming a CPU fallback is acceptable if inputs is empty.
+                device = torch.device("cpu")
+                # A more robust way if model was passed: device = next(model.parameters()).device
+            return torch.tensor(0.0, device=device)
+
         if not inputs:
             return torch.tensor(0.0)
 

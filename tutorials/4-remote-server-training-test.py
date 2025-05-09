@@ -106,7 +106,7 @@ HEALTH_CHECK_URL = urljoin(SERVER_URL, "/api/v1/health")
 SERVER_STORAGE_DIR = os.path.join(project_root, "temp_tutorial_server_data")
 
 # --- Base Model --- #
-BASE_MODEL_NAME = "gpt2"  # Using GPT-2 small
+BASE_MODEL_NAME = "EleutherAI/pythia-70m"  # Using GPT-2 small
 
 server_process = None  # Global variable to hold the server process
 
@@ -122,22 +122,23 @@ server_process = None  # Global variable to hold the server process
 # %%
 # --- CLT Architecture Configuration ---
 # (Same as Tutorial 1 for simplicity)
-gpt2_num_layers = 12
-gpt2_d_model = 768
+num_layers = 6
+d_model = 512
 expansion_factor = 4  # Use smaller expansion factor for speed
 
-clt_num_features = gpt2_d_model * expansion_factor
+clt_num_features = d_model * expansion_factor
 clt_config = CLTConfig(
     num_features=clt_num_features,
-    num_layers=gpt2_num_layers,
-    d_model=gpt2_d_model,
+    num_layers=num_layers,
+    d_model=d_model,
     activation_fn="relu",
+    normalization_method="auto",
 )
 print("CLT Configuration:")
 print(clt_config)
 
 # --- Activation Generation Configuration (Remote) ---
-dataset_id = "gpt2/pile-uncopyrighted_train"
+dataset_id = "EleutherAI/pythia-70m/pile-uncopyrighted_train"
 training_config = TrainingConfig(
     # Training loop parameters
     learning_rate=1e-4,
