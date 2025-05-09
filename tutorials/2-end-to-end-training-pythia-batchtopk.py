@@ -163,7 +163,7 @@ training_config = TrainingConfig(
     train_batch_size_tokens=_batch_size,
     sampling_strategy="sequential",
     # Normalization
-    normalization_method="none",  # Use pre-calculated stats
+    normalization_method="auto",  # Use pre-calculated stats
     # Loss function coefficients
     sparsity_lambda=0.0,  # Disable standard sparsity penalty
     sparsity_lambda_schedule="linear",
