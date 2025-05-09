@@ -23,6 +23,7 @@ import os
 import time
 import sys
 import traceback
+import json
 
 # Need transformers for the import check below
 from transformers import AutoModelForCausalLM
@@ -179,7 +180,7 @@ training_config = TrainingConfig(
     log_interval=10,
     eval_interval=50,
     checkpoint_interval=500,
-    dead_feature_window=1000,
+    dead_feature_window=200,
     # WandB (Optional)
     enable_wandb=True,
     wandb_project="clt-hp-sweeps-pythia-70m",
@@ -321,4 +322,53 @@ print(f"Loaded model is on device: {next(loaded_clt_model.parameters()).device}"
 print("\nBatchTopK Tutorial Complete!")
 print(f"The trained BatchTopK CLT model and logs are saved in: {log_dir}")
 
+# %%
+weights = torch.load("/Users/curttigges/Projects/crosslayer-coding/clt_checkpoint_latest.pt")
+# %%
+weights.keys()
+# %%
+from torch.distributed.checkpoint import load_state_dict
+from torch.distributed.checkpoint.filesystem import FileSystemReader
+
+# Assuming 'final_checkpoint_dir' is the path to '.../final/'
+final_checkpoint_dir = "/Users/curttigges/Projects/crosslayer-coding/tutorials/clt_training_logs/clt_pythia_batchtopk_train_1746818858/final/"  # Replace <timestamp>
+
+# Load the config
+config_path = os.path.join(final_checkpoint_dir, "cfg.json")
+with open(config_path, "r") as f:
+    loaded_config_dict = json.load(f)
+loaded_clt_config = CLTConfig(**loaded_config_dict)
+
+# Ensure it's configured for JumpReLU for loading the final converted model
+# The trainer should have already updated this in the saved cfg.json
+assert loaded_clt_config.activation_fn == "jumprelu", "The final saved model should be JumpReLU. Check cfg.json."
+
+# Instantiate the model (adjust device as needed)
+device_to_load_on = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+model_to_load = CrossLayerTranscoder(
+    config=loaded_clt_config, process_group=None, device=torch.device(device_to_load_on)  # For non-distributed loading
+)
+model_to_load.eval()  # Set to evaluation mode
+
+# %%
+
+# Create an empty state dict matching the model structure
+# (or the state_dict() of the model instance you just created)
+state_dict_to_populate = model_to_load.state_dict()
+
+load_state_dict(
+    state_dict=state_dict_to_populate,
+    storage_reader=FileSystemReader(final_checkpoint_dir),
+    no_dist=True,  # Important for loading a sharded checkpoint into a non-distributed model
+)
+
+# After this, state_dict_to_populate is filled.
+# Now, load it into your model instance:
+model_to_load.load_state_dict(state_dict_to_populate)
+
+print("Model loaded successfully from distributed checkpoint.")
+print(f"Model is on device: {next(model_to_load.parameters()).device}")
+
+# %%
+print(model_to_load.log_threshold.shape)
 # %%

@@ -184,7 +184,7 @@ training_config = TrainingConfig(
     train_batch_size_tokens=_batch_size,
     sampling_strategy="sequential",
     # Normalization for training (use stored stats)
-    normalization_method="none",  # Use stats from norm_stats.json generated earlier
+    normalization_method="auto",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
     sparsity_lambda=_sparsity_lambda,
     sparsity_lambda_schedule="linear",

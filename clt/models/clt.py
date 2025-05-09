@@ -95,6 +95,7 @@ class CrossLayerTranscoder(BaseTranscoder):
 
     # --- Cache --- #
     _cached_decoder_norms: Optional[torch.Tensor] = None
+    _min_selected_preact: Optional[torch.Tensor]
 
     def __init__(
         self,
@@ -169,6 +170,22 @@ class CrossLayerTranscoder(BaseTranscoder):
             self.log_threshold = nn.Parameter(initial_threshold_val.to(device=self.device, dtype=self.dtype))
 
         self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
+
+        # Buffer for on-the-fly theta calculation if using BatchTopK
+        if self.config.activation_fn == "batchtopk":
+            self.register_buffer(
+                "_min_selected_preact",
+                torch.full(
+                    (config.num_layers, config.num_features),
+                    float("inf"),
+                    dtype=self.dtype,  # Initialize with model's dtype
+                    device=self.device,
+                ),
+                persistent=False,  # Not part of the standard state_dict unless explicitly requested
+            )
+        else:
+            # Ensure the attribute exists even if not used, for type consistency / hasattr checks
+            self.register_buffer("_min_selected_preact", None, persistent=False)
 
         # No need to call _init_parameters separately, it's handled in ParallelLinear init
         # self._init_parameters() # Remove this call
@@ -328,6 +345,70 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         return preactivations_dict, original_shapes_info, device, dtype
 
+    @torch.no_grad()
+    def _update_min_selected_preactivations(
+        self,
+        concatenated_preactivations_original: torch.Tensor,
+        activated_concatenated: torch.Tensor,
+        layer_feature_sizes: List[Tuple[int, int]],
+    ):
+        """
+        Updates the _min_selected_preact buffer with minimum pre-activation values
+        for features selected by BatchTopK during the current step.
+        This function operates with no_grad.
+        """
+        if not hasattr(self, "_min_selected_preact") or self._min_selected_preact is None:
+            if self.config.activation_fn == "batchtopk":
+                logger.warning(f"Rank {self.rank}: _min_selected_preact buffer not found. Skipping theta update.")
+            return
+
+        assert self._min_selected_preact is not None  # For type hinting after the check
+
+        current_total_feature_offset = 0
+        for i, (original_layer_idx, num_features_this_layer) in enumerate(layer_feature_sizes):
+            if original_layer_idx >= self._min_selected_preact.shape[0]:
+                logger.warning(
+                    f"Rank {self.rank}: Invalid original_layer_idx {original_layer_idx} for _min_selected_preact update. Skipping layer."
+                )
+                current_total_feature_offset += num_features_this_layer
+                continue
+
+            preact_orig_this_layer = concatenated_preactivations_original[
+                :, current_total_feature_offset : current_total_feature_offset + num_features_this_layer
+            ]
+            gated_acts_segment = activated_concatenated[
+                :, current_total_feature_offset : current_total_feature_offset + num_features_this_layer
+            ]
+
+            if gated_acts_segment.shape == preact_orig_this_layer.shape:
+                # Vectorised per-feature min calculation that avoids CPU-only ops like nonzero on MPS.
+                mask_active = gated_acts_segment > 0  # Active features after gating
+
+                if mask_active.any():
+                    # Replace inactive entries by +inf and take per-feature minimum across tokens
+                    masked_preact = torch.where(
+                        mask_active,
+                        preact_orig_this_layer,
+                        torch.full_like(preact_orig_this_layer, float("inf")),
+                    )
+
+                    per_feature_min_this_batch = masked_preact.amin(dim=0)
+
+                    current_min_for_layer = self._min_selected_preact[original_layer_idx]
+                    updated_min_for_layer = torch.minimum(current_min_for_layer, per_feature_min_this_batch)
+
+                    # In-place update of the running minimum buffer
+                    self._min_selected_preact[original_layer_idx].copy_(updated_min_for_layer)
+            else:
+                logger.warning(
+                    f"Rank {self.rank}: Shape mismatch for theta update, layer {original_layer_idx}. "
+                    f"Original: {preact_orig_this_layer.shape}, Gated: {gated_acts_segment.shape}"
+                )
+
+            current_total_feature_offset += num_features_this_layer
+
+        # Function now purely updates the buffer – it no longer recurses or returns a value.
+
     def _apply_batch_topk(
         self,
         preactivations_dict: Dict[int, torch.Tensor],
@@ -415,18 +496,21 @@ class CrossLayerTranscoder(BaseTranscoder):
             concatenated_preactivations_normalized,  # Pass normalized for ranking
         )
 
+        # --- On-the-fly theta update for BatchTopK ---
+        if self.config.activation_fn == "batchtopk":
+            self._update_min_selected_preactivations(
+                concatenated_preactivations_original, activated_concatenated, layer_feature_sizes
+            )
+        # --- End on-the-fly theta update ---
+
         activations_dict: Dict[int, torch.Tensor] = {}
         current_feature_offset = 0
-        # original_shapes_map = {info[0]: (info[1], info[2]) for info in original_shapes_info} # Removed as reshaping is no longer done here
 
         for original_layer_idx, num_features_this_layer in layer_feature_sizes:
             layer_activated_flat = activated_concatenated[
                 :, current_feature_offset : current_feature_offset + num_features_this_layer
             ]
-
-            # Always store the flat [batch_tokens, num_features] tensor
             activations_dict[original_layer_idx] = layer_activated_flat
-
             current_feature_offset += num_features_this_layer
 
         return activations_dict
@@ -774,14 +858,113 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         return full_decoder_norms
 
-    # Add save/load methods that handle sharded parameters
-    # For now, rely on Trainer using FSDP-style full state dict save/load logic
-    # or implement manual gathering/scattering.
-    # def save(self, path: str):
-    #     # Gather parameters on rank 0 and save
-    #     pass
-    #
-    # @classmethod
-    # def load(cls, path: str, process_group: ProcessGroup, device: torch.device):
-    #     # Load on rank 0, broadcast/scatter to other ranks
-    #     pass
+    @torch.no_grad()
+    def convert_to_jumprelu_inplace(self, default_theta_value: float = 1e6) -> None:
+        """
+        Converts the model to use JumpReLU activation based on learned BatchTopK thresholds.
+        This method should be called after training with BatchTopK.
+        It finalizes the _min_selected_preact buffer, updates the model config,
+        and sets the log_threshold parameter.
+
+        Args:
+            default_theta_value: Value to use for features that were never activated.
+        """
+        if self.config.activation_fn != "batchtopk":
+            logger.warning(
+                f"Rank {self.rank}: Model original activation_fn was {self.config.activation_fn}, not batchtopk. "
+                "Skipping conversion to JumpReLU based on learned thetas."
+            )
+            # If it was already jumprelu and has log_threshold, it's fine.
+            # If it was relu, it cannot be converted this way.
+            if self.config.activation_fn == "relu":
+                logger.error(f"Rank {self.rank}: Model is ReLU, cannot convert to JumpReLU via learned thetas.")
+            return
+
+        if not hasattr(self, "_min_selected_preact") or self._min_selected_preact is None:
+            logger.error(
+                f"Rank {self.rank}: _min_selected_preact buffer not found or is None. "
+                "Cannot convert to JumpReLU. Was the model trained with BatchTopK and the buffer initialized?"
+            )
+            return
+
+        logger.info(f"Rank {self.rank}: Starting conversion of BatchTopK model to JumpReLU.")
+        assert self._min_selected_preact is not None  # For type hinting after the check
+
+        theta = (
+            self._min_selected_preact.clone()
+        )  # Clone to avoid modifying buffer if reduction happens elsewhere or fails
+
+        # If distributed, perform all-reduce to get global minimums
+        if self.process_group is not None and dist.is_initialized() and self.world_size > 1:
+            dist.all_reduce(theta, op=dist.ReduceOp.MIN, group=self.process_group)
+            logger.info(f"Rank {self.rank}: Reduced _min_selected_preact across {self.world_size} ranks.")
+
+        # Handle features that were never selected (still float('inf'))
+        num_inf_before = torch.isinf(theta).sum().item()
+        theta[torch.isinf(theta)] = default_theta_value
+        num_set_to_default = (
+            torch.isinf(self._min_selected_preact).sum().item()
+        )  # Count on original before it might be changed by others
+        if self.rank == 0:  # Log only on rank 0 to avoid spam
+            logger.info(
+                f"Rank {self.rank}: {num_inf_before} features had inf theta, set to default_theta_value: {default_theta_value}"
+            )
+            logger.info(
+                f"Rank {self.rank}: (Original buffer on this rank had {num_set_to_default} inf values before reduction if distributed)"
+            )
+
+        # Ensure no zero or negative thresholds before log, as log(non_positive) is NaN/Inf
+        # Clamping to a small positive value if they are not strictly positive.
+        # The threshold for JumpReLU should be > 0.
+        # If default_theta_value was set to 0 or negative, this clamp is important.
+        clamped_count = (theta <= 1e-9).sum().item()
+        if clamped_count > 0:
+            logger.warning(f"Rank {self.rank}: Clamping {clamped_count} theta values (<= 1e-9) to 1e-9 before log.")
+        theta.clamp_min_(1e-9)
+
+        log_theta = torch.log(theta)
+
+        # Update config
+        self.config.activation_fn = "jumprelu"
+        # The original jumprelu_threshold in config is a scalar, now we have per-feature, per-layer.
+        # The JumpReLU function itself uses self.log_threshold if available.
+        # We mark the original config field to signify it's superseded.
+        self.config.jumprelu_threshold = 0.0  # Mark as effectively superseded
+        self.config.batchtopk_k = None
+        self.config.batchtopk_frac = None
+
+        # Create or update self.log_threshold as an nn.Parameter
+        if not hasattr(self, "log_threshold") or self.log_threshold is None:
+            self.log_threshold = nn.Parameter(log_theta.to(device=self.device, dtype=self.dtype))
+        else:
+            if not isinstance(self.log_threshold, nn.Parameter):
+                # If it exists but is not a Parameter, re-assign it as one
+                self.log_threshold = nn.Parameter(
+                    log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
+                )
+            # Update data in-place, ensuring it's on the correct device and dtype
+            self.log_threshold.data = log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
+
+        # Remove the _min_selected_preact buffer as it has served its purpose
+        # Check existence again in case it was already deleted or None
+        if hasattr(self, "_min_selected_preact") and self._min_selected_preact is not None:
+            # assert self._min_selected_preact is not None # Redundant here due to the and condition
+            del self._min_selected_preact
+            # For safety, set it to None after del if other parts of code might check for its existence
+            # though ideally, after conversion, it shouldn't be accessed.
+            self._min_selected_preact = None
+
+        logger.info(f"Rank {self.rank}: Model converted to JumpReLU. activation_fn='{self.config.activation_fn}'.")
+        if self.rank == 0:
+            min_log_thresh = (
+                self.log_threshold.data.min().item() if self.log_threshold.data.numel() > 0 else float("nan")
+            )
+            max_log_thresh = (
+                self.log_threshold.data.max().item() if self.log_threshold.data.numel() > 0 else float("nan")
+            )
+            mean_log_thresh = (
+                self.log_threshold.data.mean().item() if self.log_threshold.data.numel() > 0 else float("nan")
+            )
+            logger.info(
+                f"Rank {self.rank}: Final log_threshold stats: min={min_log_thresh:.4f}, max={max_log_thresh:.4f}, mean={mean_log_thresh:.4f}"
+            )

@@ -1303,6 +1303,25 @@ class CLTTrainer:
         if self.distributed:
             dist.barrier()
 
+        # --- Convert to JumpReLU if originally BatchTopK, before final save --- #
+        if self.clt_config.activation_fn == "batchtopk":  # Check original config
+            if not self.distributed or self.rank == 0:  # Log message only from rank 0
+                logger.info("Original model was BatchTopK. Converting to JumpReLU before final save...")
+            try:
+                # All ranks must participate in case of distributed reduction inside convert_to_jumprelu_inplace
+                self.model.convert_to_jumprelu_inplace(
+                    default_theta_value=self.training_config.jumprelu_default_theta_on_convert
+                )
+                if self.distributed:  # Barrier after conversion to ensure all ranks are done
+                    dist.barrier()
+                if not self.distributed or self.rank == 0:  # Log success from rank 0
+                    logger.info("Model successfully converted to JumpReLU.")
+            except Exception as e:
+                if not self.distributed or self.rank == 0:  # Log error only from rank 0
+                    logger.error(f"Error during BatchTopK to JumpReLU conversion: {e}", exc_info=True)
+                # If conversion fails, proceed to save the original BatchTopK model
+                # The config will still reflect batchtopk in this case.
+
         # --- Save final model and metrics --- (Rank 0 handles metrics/store, all ranks save model state)
         final_checkpoint_dir = os.path.join(self.log_dir, "final")
         final_store_path = os.path.join(final_checkpoint_dir, "activation_store_final.pt")  # Store inside final dir
@@ -1352,6 +1371,12 @@ class CLTTrainer:
                 ):
                     model_name = self.training_config.generation_config["model_name"]
                     config_dict["model_name"] = model_name  # Add model_name to the dict
+                elif (
+                    hasattr(self.training_config, "activation_config")
+                    and hasattr(self.training_config.activation_config, "model_name")
+                    and self.training_config.activation_config.model_name is not None
+                ):
+                    config_dict["model_name"] = self.training_config.activation_config.model_name
 
                 # Normalization Method (Crucial for inference data handling)
                 if hasattr(self.training_config, "normalization_method"):
@@ -1361,16 +1386,36 @@ class CLTTrainer:
                 if hasattr(self.training_config, "activation_dtype"):
                     config_dict["expected_input_dtype"] = self.training_config.activation_dtype
 
-                # Hook Templates (if activations were generated)
+                # Hook Templates and context size (if activations were generated on the fly or from a known source config)
+                source_cfg_for_hooks = None
                 if (
                     hasattr(self.training_config, "generation_config")
                     and self.training_config.generation_config is not None
                 ):
-                    gen_cfg = self.training_config.generation_config
-                    if "mlp_input_template" in gen_cfg:
-                        config_dict["mlp_input_template"] = gen_cfg["mlp_input_template"]
-                    if "mlp_output_template" in gen_cfg:
-                        config_dict["mlp_output_template"] = gen_cfg["mlp_output_template"]
+                    source_cfg_for_hooks = self.training_config.generation_config
+                elif (
+                    hasattr(self.training_config, "activation_config")
+                    and self.training_config.activation_config is not None
+                ):
+                    # If using local_manifest or remote, activation_config from TrainingConfig might hold these
+                    # Need to ensure activation_config is part of TrainingConfig or accessible
+                    # For now, let's assume it might be under a similar structure or needs to be explicitly passed/set
+                    # This part might need adjustment based on how ActivationConfig is actually stored/accessed when not using on-the-fly generation
+                    # Assuming self.training_config.activation_config exists and is an ActivationConfig object
+                    act_cfg = self.training_config.activation_config
+                    # Convert ActivationConfig to a dict-like structure if it's a dataclass
+                    if hasattr(act_cfg, "__dict__"):  # A simple check if it has attributes like a dataclass or object
+                        source_cfg_for_hooks = act_cfg.__dict__
+                    elif isinstance(act_cfg, dict):
+                        source_cfg_for_hooks = act_cfg
+
+                if source_cfg_for_hooks:
+                    if "mlp_input_module_path_template" in source_cfg_for_hooks:
+                        config_dict["mlp_input_template"] = source_cfg_for_hooks["mlp_input_module_path_template"]
+                    if "mlp_output_module_path_template" in source_cfg_for_hooks:
+                        config_dict["mlp_output_template"] = source_cfg_for_hooks["mlp_output_module_path_template"]
+                    if "context_size" in source_cfg_for_hooks:
+                        config_dict["context_size"] = source_cfg_for_hooks["context_size"]
 
                 # --- End Inference Field Population --- #
 

@@ -157,6 +157,8 @@ class TrainingConfig:
     wandb_entity: Optional[str] = None  # WandB entity/organization name
     wandb_run_name: Optional[str] = None  # WandB run name, defaults to timestamp if None
     wandb_tags: Optional[list] = field(default_factory=list)
+    # Default theta for BatchTopK to JumpReLU conversion for never-activated features
+    jumprelu_default_theta_on_convert: float = 1e6
 
     def __post_init__(self):
         """Validate training parameters."""
