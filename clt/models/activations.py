@@ -18,51 +18,41 @@ class BatchTopK(torch.autograd.Function):
         Returns:
             Output tensor with BatchTopK applied.
         """
-        if k < 1:
-            # k is a fraction, convert to an absolute number of features
-            k_abs = max(1, int(round(k * x.size(-1))))
-        else:
-            k_abs = int(k)
-
-        # Ensure k is not larger than the number of features
-        k_abs = min(k_abs, x.size(-1))
-
-        ranking_tensor_to_use = x_for_ranking if x_for_ranking is not None else x
-
-        if k_abs == 0 and x.size(-1) > 0:  # Avoid issues with topk if k_abs is 0 but features exist
-            # If k_abs is 0, return a zero tensor of the same shape and type as x
+        B = x.size(0)
+        # k is now an integer representing desired features *per token*
+        k_per_token = int(k)
+        if k_per_token <= 0:
+            # If k_per_token is 0 or negative, return a zero tensor
             if straight_through:
                 ctx.save_for_backward(torch.zeros_like(x, dtype=torch.bool))
             return torch.zeros_like(x)
 
-        # Handle case where ranking tensor might be empty but k_abs > 0 (e.g. if x_for_ranking was bad)
-        if k_abs > 0 and ranking_tensor_to_use.numel() == 0:
-            if x.numel() > 0:  # If x has elements, use x for ranking as a fallback
-                ranking_tensor_to_use = x
-            else:  # Both x and ranking_tensor are empty, return zeros
-                if straight_through:
-                    ctx.save_for_backward(torch.zeros_like(x, dtype=torch.bool))
-                return torch.zeros_like(x)
+        # Total features to keep across the batch
+        # Clamp to F_total (x.numel()) to avoid errors if k_per_token * B > F_total
+        # Also handle the case where x is empty (x.numel() == 0)
+        F_total_batch = x.numel()
+        if F_total_batch == 0:  # If input is empty, return empty tensor
+            if straight_through:
+                ctx.save_for_backward(torch.zeros_like(x, dtype=torch.bool))
+            return torch.zeros_like(x)
+
+        k_total_batch = min(k_per_token * B, F_total_batch)
+
+        ranking_tensor_to_use = x_for_ranking if x_for_ranking is not None else x
+
+        # Flatten input and ranking tensor for global top-k
+        x_flat = x.reshape(-1)  # [B*F_total]
+        ranking_flat = ranking_tensor_to_use.reshape(-1)
 
         indices: Optional[torch.Tensor] = None
-        if k_abs > 0:  # Only compute topk if k_abs > 0 and ranking tensor has elements
-            if ranking_tensor_to_use.numel() > 0:
-                _, indices = torch.topk(ranking_tensor_to_use, k_abs, dim=-1, sorted=False)
-            else:  # ranking_tensor is empty, cannot compute topk, treat as k_abs = 0
-                k_abs = 0  # effectively
-                indices = torch.empty(
-                    (ranking_tensor_to_use.size(0), 0), dtype=torch.long, device=ranking_tensor_to_use.device
-                )
-        elif x.size(-1) == 0:  # k_abs is 0 and features are empty
-            indices = torch.empty(
-                (ranking_tensor_to_use.size(0), 0), dtype=torch.long, device=ranking_tensor_to_use.device
-            )
-        # else: k_abs is 0 and x.size(-1) > 0, handled by the first conditional block returning zeros.
-
-        # Create a mask from the indices, based on the shape of x
-        mask = torch.zeros_like(x, dtype=torch.bool)
-        if indices is not None and indices.numel() > 0 and k_abs > 0:  # only scatter if there are indices and k_abs > 0
-            mask.scatter_(-1, indices, True)
+        if k_total_batch > 0:
+            # Global top-k on the flattened ranking tensor
+            _, flat_indices = torch.topk(ranking_flat, k_total_batch, sorted=False)
+            mask_flat = torch.zeros_like(x_flat, dtype=torch.bool)
+            mask_flat[flat_indices] = True
+            mask = mask_flat.view_as(x)  # Reshape mask to original x shape
+        else:  # k_total_batch is 0 (either k_per_token was 0 or input was empty)
+            mask = torch.zeros_like(x, dtype=torch.bool)
 
         if straight_through:
             ctx.save_for_backward(mask)

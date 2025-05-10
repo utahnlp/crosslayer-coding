@@ -21,8 +21,7 @@ class CLTConfig:
     activation_fn: Literal["jumprelu", "relu", "batchtopk"] = "jumprelu"
     jumprelu_threshold: float = 0.03  # Threshold for JumpReLU activation
     # BatchTopK parameters
-    batchtopk_k: Optional[int] = None  # Absolute k for BatchTopK
-    batchtopk_frac: Optional[float] = None  # Fraction of features to keep for BatchTopK
+    batchtopk_k: Optional[int] = None  # Absolute k for BatchTopK (per token)
     batchtopk_straight_through: bool = True  # Whether to use straight-through estimator for BatchTopK
     clt_dtype: Optional[str] = None  # Optional dtype for the CLT model itself (e.g., "float16")
     expected_input_dtype: Optional[str] = None  # Expected dtype of input activations
@@ -47,14 +46,10 @@ class CLTConfig:
         ), f"Invalid activation_fn: {self.activation_fn}. Must be one of {valid_activation_fns}"
 
         if self.activation_fn == "batchtopk":
-            if self.batchtopk_k is not None and self.batchtopk_frac is not None:
-                raise ValueError("Only one of batchtopk_k or batchtopk_frac can be specified.")
-            if self.batchtopk_k is None and self.batchtopk_frac is None:
-                raise ValueError("One of batchtopk_k or batchtopk_frac must be specified for BatchTopK.")
+            if self.batchtopk_k is None:
+                raise ValueError("batchtopk_k must be specified for BatchTopK.")
             if self.batchtopk_k is not None and self.batchtopk_k <= 0:
                 raise ValueError("batchtopk_k must be positive.")
-            if self.batchtopk_frac is not None and not (0 < self.batchtopk_frac <= 1):
-                raise ValueError("batchtopk_frac must be between 0 (exclusive) and 1 (inclusive).")
 
     @classmethod
     def from_json(cls: Type[C], json_path: str) -> C:

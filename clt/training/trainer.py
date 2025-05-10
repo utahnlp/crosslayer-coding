@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-from typing import Dict, Optional, Union, Any, List
+from typing import Dict, Optional, Union, Any, List, Literal
 from tqdm import tqdm  # type: ignore
 import os
 import json
@@ -577,7 +577,7 @@ class CLTTrainer:
                 nnsight_invoker_args=gen_cfg.get("nnsight_invoker_args"),
                 # Pass BatchTopK params from clt_config if they exist
                 batchtopk_k=self.clt_config.batchtopk_k if hasattr(self.clt_config, "batchtopk_k") else None,
-                batchtopk_frac=self.clt_config.batchtopk_frac if hasattr(self.clt_config, "batchtopk_frac") else None,
+                # batchtopk_frac=self.clt_config.batchtopk_frac if hasattr(self.clt_config, "batchtopk_frac") else None, # DELETED
             )
 
             # --- Create Generator from dataset_params --- #

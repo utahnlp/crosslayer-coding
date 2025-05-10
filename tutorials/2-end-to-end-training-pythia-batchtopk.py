@@ -86,16 +86,14 @@ d_model = 512
 expansion_factor = 32
 clt_num_features = d_model * expansion_factor
 
-# Recommended sparsity fraction for BatchTopK
-batchtopk_sparsity_fraction = 0.005  # Keep top 0.2% (590 with expansion factor 32) of features across all layers
+batchtopk_k = 500
 
 clt_config = CLTConfig(
     num_features=clt_num_features,
     num_layers=num_layers,
     d_model=d_model,
     activation_fn="batchtopk",  # Use BatchTopK activation
-    batchtopk_k=None,  # Specify k or frac
-    batchtopk_frac=batchtopk_sparsity_fraction,  # Keep top 2% features globally
+    batchtopk_k=batchtopk_k,  # Specify k directly
     batchtopk_straight_through=True,  # Use STE for gradients
     # jumprelu_threshold is not used for batchtopk
 )
@@ -153,11 +151,11 @@ expected_activation_path = os.path.join(
 # --- Determine WandB Run Name (using config values) ---
 _lr = 1e-4
 _batch_size = 1024
-_k_frac = clt_config.batchtopk_frac  # Use frac for name
+_k_int = clt_config.batchtopk_k  # ADDED: Use k for name
 
 wdb_run_name = (
     f"{clt_config.num_features}-width-"
-    f"batchtopk-kfrac{_k_frac:.3f}-"  # Indicate BatchTopK and frac
+    f"batchtopk-k{_k_int}-"  # ADDED: Indicate BatchTopK and k
     f"{_batch_size}-batch-"
     f"{_lr:.1e}-lr"
     # Sparsity lambda/c less relevant when apply_sparsity_penalty_to_batchtopk=False
@@ -531,8 +529,7 @@ else:
                 num_layers=6,
                 d_model=512,
                 activation_fn="batchtopk",  # Start with BatchTopK config
-                batchtopk_k=None,
-                batchtopk_frac=0.005,
+                batchtopk_k=batchtopk_k,  # Specify k directly
                 batchtopk_straight_through=True,
                 clt_dtype="float32",  # Match model dtype for consistency during load
             )

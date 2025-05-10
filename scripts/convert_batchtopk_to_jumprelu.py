@@ -191,8 +191,10 @@ def main(args):
     except Exception as e_l0_fetch:
         logger.warning(f"Error fetching batch for L0 check: {e_l0_fetch}. L0 check will use zero input.")
 
+    model_for_l0_check = model  # Always use the converted model, no more overriding k for L0 check here
+
     avg_empirical_l0, expected_l0 = run_quick_l0_checks_script(
-        model, sample_batch_for_l0_inputs, args.num_tokens_for_l0_check_script
+        model_for_l0_check, sample_batch_for_l0_inputs, args.num_tokens_for_l0_check_script
     )
     logger.info(
         f"  Average Empirical L0 (Layer 0, {args.num_tokens_for_l0_check_script} random tokens): {avg_empirical_l0:.2f}"

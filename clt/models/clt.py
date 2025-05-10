@@ -506,18 +506,16 @@ class CrossLayerTranscoder(BaseTranscoder):
         concatenated_preactivations_original = torch.cat(ordered_preactivations_original, dim=1)
         concatenated_preactivations_normalized = torch.cat(ordered_preactivations_normalized, dim=1)
 
-        k_val: float
+        k_val_int: int
         if self.config.batchtopk_k is not None:
-            k_val = float(self.config.batchtopk_k)
-        elif self.config.batchtopk_frac is not None:
-            k_val = self.config.batchtopk_frac
+            k_val_int = int(self.config.batchtopk_k)
         else:
-            logger.error(f"Rank {self.rank}: BatchTopK k or frac not specified. Defaulting to keeping all features.")
-            k_val = float(concatenated_preactivations_original.size(1))
+            logger.error(f"Rank {self.rank}: BatchTopK k not specified. Defaulting to keeping all features.")
+            k_val_int = concatenated_preactivations_original.size(1)
 
         activated_concatenated = BatchTopK.apply(
             concatenated_preactivations_original,  # Pass original for values and STE path
-            k_val,
+            float(k_val_int),  # BatchTopK.forward still expects float for k, but it will be int-like
             self.config.batchtopk_straight_through,
             concatenated_preactivations_normalized,  # Pass normalized for ranking
         )
@@ -584,18 +582,13 @@ class CrossLayerTranscoder(BaseTranscoder):
                     logger.warning(
                         f"Rank {self.rank}: 'encode' called for BatchTopK on layer {layer_idx}. This applies TopK per-layer, not globally. Use 'get_feature_activations' for global BatchTopK."
                     )
-                    k_val_local: float
+                    k_val_local_int: int
                     if self.config.batchtopk_k is not None:
-                        k_val_local = (
-                            float(self.config.batchtopk_k) / self.config.num_layers
-                        )  # Crude approximation for per-layer k
-                        k_val_local = max(1.0, k_val_local)  # Ensure at least 1
-                    elif self.config.batchtopk_frac is not None:
-                        k_val_local = self.config.batchtopk_frac  # Apply frac directly per layer
-                    else:  # Should not happen
-                        k_val_local = float(preact.size(1))
+                        k_val_local_int = int(self.config.batchtopk_k)
+                    else:
+                        k_val_local_int = preact.size(1)
 
-                    activated = BatchTopK.apply(preact, k_val_local, self.config.batchtopk_straight_through)
+                    activated = BatchTopK.apply(preact, float(k_val_local_int), self.config.batchtopk_straight_through)
 
         except Exception as e:
             logger.error(f"Rank {self.rank}: Error during encode layer {layer_idx}: {e}", exc_info=True)
@@ -1039,17 +1032,15 @@ class CrossLayerTranscoder(BaseTranscoder):
             concatenated_preactivations_original_posthoc = torch.cat(ordered_preactivations_original_posthoc, dim=1)
             concatenated_preactivations_normalized_posthoc = torch.cat(ordered_preactivations_normalized_posthoc, dim=1)
 
-            k_val_posthoc: float
+            k_val_int: int
             if self.config.batchtopk_k is not None:
-                k_val_posthoc = float(self.config.batchtopk_k)
-            elif self.config.batchtopk_frac is not None:
-                k_val_posthoc = self.config.batchtopk_frac
+                k_val_int = int(self.config.batchtopk_k)
             else:
-                k_val_posthoc = float(concatenated_preactivations_original_posthoc.size(1))
+                k_val_int = concatenated_preactivations_original_posthoc.size(1)
 
             activated_concatenated_posthoc = BatchTopK.apply(
                 concatenated_preactivations_original_posthoc,
-                k_val_posthoc,
+                float(k_val_int),
                 self.config.batchtopk_straight_through,
                 concatenated_preactivations_normalized_posthoc,
             )
@@ -1270,7 +1261,6 @@ class CrossLayerTranscoder(BaseTranscoder):
         # We mark the original config field to signify it's superseded.
         self.config.jumprelu_threshold = 0.0  # Mark as effectively superseded
         self.config.batchtopk_k = None
-        self.config.batchtopk_frac = None
 
         # Create or update self.log_threshold as an nn.Parameter
         if not hasattr(self, "log_threshold") or self.log_threshold is None:
