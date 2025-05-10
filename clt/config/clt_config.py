@@ -144,6 +144,8 @@ class TrainingConfig:
     log_interval: int = 100  # How often to log metrics
     eval_interval: int = 1000  # How often to run evaluation
     checkpoint_interval: int = 1000  # How often to save checkpoints
+    diag_every_n_eval_steps: Optional[int] = None  # How often to run detailed diagnostics (every N eval steps)
+    max_features_for_diag_hist: Optional[int] = None  # Max features for histogram diagnostics
 
     # Optional diagnostic metrics (can be slow)
     compute_sparsity_diagnostics: bool = False  # Whether to compute detailed sparsity diagnostics during eval
@@ -157,6 +159,8 @@ class TrainingConfig:
     wandb_entity: Optional[str] = None  # WandB entity/organization name
     wandb_run_name: Optional[str] = None  # WandB run name, defaults to timestamp if None
     wandb_tags: Optional[list] = field(default_factory=list)
+    # Default theta for BatchTopK to JumpReLU conversion for never-activated features
+    jumprelu_default_theta_on_convert: float = 1e6
 
     def __post_init__(self):
         """Validate training parameters."""
