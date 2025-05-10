@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-from typing import Dict, Optional, Union, Any
+from typing import Dict, Optional, Union, Any, List
 from tqdm import tqdm  # type: ignore
 import os
 import json
@@ -232,6 +232,21 @@ class WandBLogger:
             elif isinstance(value, (float, int)):  # Handle top-level scalars
                 # Log directly, e.g., 'reconstruction/mse', 'sparsity/avg_l0', 'dead_features/total_eval'
                 wandb_log_dict[key] = value
+            else:
+                # Pass through other wandb-compatible objects such as wandb.Histogram directly
+                # This ensures histograms prepared upstream (e.g., BatchTopK diagnostics) are logged.
+                try:
+                    # Attempt to reference wandb.Histogram to avoid circular import issues
+                    import wandb as _wb
+
+                    if isinstance(value, _wb.Histogram):
+                        wandb_log_dict[key] = value
+                    else:
+                        # For any other types, attempt to add directly if they are serializable by wandb
+                        wandb_log_dict[key] = value
+                except Exception:
+                    # If wandb import fails or value is not compatible, skip silently to avoid breaking logging
+                    pass
             # Add other specific handling if needed (e.g., for specific non-scalar, non-layerwise data)
 
         # Log the prepared dictionary to wandb
@@ -1270,6 +1285,250 @@ class CLTTrainer:
                             if not self.distributed or self.rank == 0:
                                 self.wandb_logger.log_evaluation(step, eval_metrics)
 
+                    # ---- Start: Logging for H1/H2/H3 diagnostics ----
+                    # Outer gate for rank 0 and wandb availability check
+                    if not self.distributed or self.rank == 0:
+                        _wandb_available = False
+                        try:
+                            import wandb  # Import wandb here to check for its availability
+
+                            if wandb.run:
+                                _wandb_available = True
+                        except ImportError:
+                            if logger.isEnabledFor(logging.DEBUG):  # Only log info if debug is on
+                                logger.info("WandB not installed, some debug histograms will be skipped.")
+
+                        # Conditional debug message for starting diagnostics
+                        if logger.isEnabledFor(logging.DEBUG):
+                            logger.debug(
+                                f"Rank {self.rank} Step {step}: Starting evaluation diagnostics for activation_fn='{self.model.config.activation_fn}'"
+                            )
+
+                        DIAG_EVERY_N_EVAL_STEPS = (
+                            self.training_config.diag_every_n_eval_steps or 50
+                        )  # Default to 50 if not set
+                        MAX_FEATURES_FOR_DIAG_HIST = (
+                            self.training_config.max_features_for_diag_hist or 1000
+                        )  # Default to 1000
+
+                        if (
+                            step % (eval_interval * DIAG_EVERY_N_EVAL_STEPS) == 0
+                            or step == self.training_config.training_steps - 1
+                        ):
+                            # --- Part D: Sanity-check the raw data feeding θ (during BatchTopK training) ---
+                            if self.model.config.activation_fn == "batchtopk":
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(
+                                        f"Rank {self.rank} Step {step}: Logging pre-activation stats for BatchTopK model."
+                                    )
+
+                                stats_summary: Dict[str, Dict[str, List[float]]] = {}
+                                for l_idx in range(self.model.config.num_layers):
+                                    if l_idx not in preactivations_eval_dict or l_idx not in feature_activations_batch:
+                                        continue
+                                    preacts_orig_layer = preactivations_eval_dict[l_idx]
+                                    acts_gated_layer = feature_activations_batch[l_idx]
+
+                                    if preacts_orig_layer.numel() == 0 or acts_gated_layer.numel() == 0:
+                                        continue
+
+                                    # Downsample features for histogram creation to avoid performance issues
+                                    num_features_total = preacts_orig_layer.shape[1]
+                                    if num_features_total > MAX_FEATURES_FOR_DIAG_HIST:
+                                        feats_to_sample = torch.randperm(
+                                            num_features_total, device=preacts_orig_layer.device
+                                        )[:MAX_FEATURES_FOR_DIAG_HIST]
+                                        preacts_orig_layer_sampled = preacts_orig_layer[:, feats_to_sample]
+                                        acts_gated_layer_sampled = acts_gated_layer[:, feats_to_sample]
+                                    else:
+                                        preacts_orig_layer_sampled = preacts_orig_layer
+                                        acts_gated_layer_sampled = acts_gated_layer
+
+                                    layer_stats: Dict[str, List[float]] = {}
+                                    for f_idx_sampled in range(
+                                        preacts_orig_layer_sampled.shape[1]
+                                    ):  # Iterate over sampled features
+                                        selected_mask_feat = acts_gated_layer_sampled[:, f_idx_sampled] != 0
+                                        if selected_mask_feat.sum() == 0:
+                                            continue
+                                        preacts_for_selected_tokens = preacts_orig_layer_sampled[:, f_idx_sampled][
+                                            selected_mask_feat
+                                        ]
+                                        if preacts_for_selected_tokens.numel() > 0:
+                                            layer_stats.setdefault("preacts_selected_min", []).append(
+                                                preacts_for_selected_tokens.min().item()
+                                            )
+                                            layer_stats.setdefault("preacts_selected_p05", []).append(
+                                                torch.quantile(preacts_for_selected_tokens.float(), 0.05).item()
+                                            )
+                                            layer_stats.setdefault("preacts_selected_median", []).append(
+                                                torch.median(preacts_for_selected_tokens.float()).item()
+                                            )
+                                            positive_preacts_selected = preacts_for_selected_tokens[
+                                                preacts_for_selected_tokens > 0
+                                            ]
+                                            if positive_preacts_selected.numel() > 0:
+                                                layer_stats.setdefault("positive_preacts_selected_min", []).append(
+                                                    positive_preacts_selected.min().item()
+                                                )
+                                                layer_stats.setdefault("positive_preacts_selected_p05", []).append(
+                                                    torch.quantile(positive_preacts_selected.float(), 0.05).item()
+                                                )
+                                                layer_stats.setdefault("positive_preacts_selected_median", []).append(
+                                                    torch.median(positive_preacts_selected.float()).item()
+                                                )
+                                    stats_summary[f"layer_{l_idx}"] = layer_stats  # Storing lists of stats per feature
+
+                                if _wandb_available and stats_summary:
+                                    wandb_log_payload_batchtopk = {}
+                                    for layer_key, l_stats_dict in stats_summary.items():
+                                        for (
+                                            stat_key,
+                                            val_list,  # val_list contains stats for MAX_FEATURES_FOR_DIAG_HIST features
+                                        ) in (
+                                            l_stats_dict.items()
+                                        ):  # val_list contains stats for MAX_FEATURES_FOR_DIAG_HIST features
+                                            if val_list:
+                                                if logger.isEnabledFor(logging.DEBUG):
+                                                    logger.debug(
+                                                        f"  {layer_key} - {stat_key}: min={min(val_list):.4f}, mean={sum(val_list) / len(val_list):.4f}, max={max(val_list):.4f} (from {len(val_list)} features)"
+                                                    )
+                                                wandb_log_payload_batchtopk[
+                                                    f"debug/batchtopk_eval/{layer_key}/{stat_key}_hist"
+                                                ] = wandb.Histogram(
+                                                    val_list
+                                                )  # Already a list of floats
+
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.debug(
+                                            f"Rank {self.rank} Step {step}: wandb_log_payload_batchtopk for BatchTopK has {len(wandb_log_payload_batchtopk)} items. stats_summary has {len(stats_summary)} items."
+                                        )
+                                        if stats_summary:
+                                            for layer_k_debug, stat_d_debug in stats_summary.items():
+                                                if not stat_d_debug:
+                                                    logger.debug(
+                                                        f"  Layer {layer_k_debug} in stats_summary is an empty dict."
+                                                    )
+                                                for stat_k_inner_debug, val_l_inner_debug in stat_d_debug.items():
+                                                    logger.debug(
+                                                        f"    {layer_k_debug}/{stat_k_inner_debug}: len={len(val_l_inner_debug)}, content (first 5): {val_l_inner_debug[:5]}"
+                                                    )
+                                        elif not stats_summary:  # Explicitly log if stats_summary is empty
+                                            logger.debug(
+                                                f"  stats_summary is empty for step {step}, layer {self.model.config.num_layers} (BatchTopK diagnostics)."
+                                            )
+
+                                    if wandb_log_payload_batchtopk:
+                                        try:
+                                            self.wandb_logger.log_evaluation(step, wandb_log_payload_batchtopk)
+                                        except Exception as e_wandb_agg:
+                                            logger.error(
+                                                f"Rank {self.rank} Step {step}: Error logging BatchTopK aggregated preact stats to WandB: {e_wandb_agg}"
+                                            )
+
+                            # --- Part C & B: Activation frequency and theta relationship (after conversion to JumpReLU) ---
+                            if self.model.config.activation_fn == "jumprelu":
+                                if logger.isEnabledFor(logging.DEBUG):
+                                    logger.debug(f"Rank {self.rank} Step {step}: Logging JumpReLU activation stats.")
+
+                                if not hasattr(self.model, "log_threshold") or self.model.log_threshold is None:
+                                    if logger.isEnabledFor(logging.DEBUG):
+                                        logger.warning(
+                                            "Model is JumpReLU but log_threshold is not set. Skipping these WandB diagnostics."
+                                        )
+                                else:
+                                    current_thetas = torch.exp(self.model.log_threshold.data)
+                                    acts_jumprelu_output_all_layers = feature_activations_batch
+
+                                    all_fire_rates_hist_data = []  # For histogram of all sampled feature fire rates
+                                    all_log10_ratios_hist_data = []  # For histogram of all sampled log10_ratios
+
+                                    for l_idx in range(self.model.config.num_layers):
+                                        if (
+                                            l_idx not in acts_jumprelu_output_all_layers
+                                            or l_idx not in preactivations_eval_dict
+                                        ):
+                                            continue
+
+                                        layer_jumprelu_acts_full = acts_jumprelu_output_all_layers[l_idx]
+                                        layer_preacts_orig_full = preactivations_eval_dict[l_idx]
+                                        layer_thetas_full = current_thetas[l_idx]
+
+                                        if (
+                                            layer_jumprelu_acts_full.numel() == 0
+                                            or layer_preacts_orig_full.numel() == 0
+                                        ):
+                                            continue
+
+                                        num_features_total = layer_jumprelu_acts_full.shape[1]
+                                        if num_features_total > MAX_FEATURES_FOR_DIAG_HIST:
+                                            feats_to_sample = torch.randperm(
+                                                num_features_total, device=layer_jumprelu_acts_full.device
+                                            )[:MAX_FEATURES_FOR_DIAG_HIST]
+                                            layer_jumprelu_acts = layer_jumprelu_acts_full[:, feats_to_sample]
+                                            layer_preacts_orig = layer_preacts_orig_full[:, feats_to_sample]
+                                            layer_thetas = layer_thetas_full[feats_to_sample]
+                                        else:
+                                            layer_jumprelu_acts = layer_jumprelu_acts_full
+                                            layer_preacts_orig = layer_preacts_orig_full
+                                            layer_thetas = layer_thetas_full
+
+                                        # Per-feature activation rate (vectorized for sampled features)
+                                        fire_rate_per_sampled_feature = (
+                                            (layer_jumprelu_acts != 0).float().mean(dim=0)
+                                        )  # mean over token dim
+                                        all_fire_rates_hist_data.extend(fire_rate_per_sampled_feature.cpu().tolist())
+                                        if (
+                                            logger.isEnabledFor(logging.DEBUG)
+                                            and fire_rate_per_sampled_feature.numel() > 0
+                                        ):
+                                            logger.debug(
+                                                f"  Layer {l_idx} - JumpReLU Fire Rate (sampled features): min={fire_rate_per_sampled_feature.min().item():.4f}, mean={fire_rate_per_sampled_feature.mean().item():.4f}, max={fire_rate_per_sampled_feature.max().item():.4f}"
+                                            )
+
+                                        # Ratio: median_preact_selected_positive_output / θ (vectorized for sampled features)
+                                        # Create a mask for where preacts >= theta for each feature (batch_tokens, num_sampled_features)
+                                        activated_mask_for_median = layer_preacts_orig >= layer_thetas.unsqueeze(0)
+
+                                        ratios_this_layer = []
+                                        for f_idx_sampled in range(
+                                            layer_preacts_orig.shape[1]
+                                        ):  # Iterate over sampled features
+                                            theta_f = layer_thetas[f_idx_sampled]
+                                            preacts_feat_sampled = layer_preacts_orig[:, f_idx_sampled]
+                                            activated_mask_feat_sampled = activated_mask_for_median[:, f_idx_sampled]
+
+                                            if activated_mask_feat_sampled.sum() > 0:
+                                                median_preact_when_fired = torch.median(
+                                                    preacts_feat_sampled[activated_mask_feat_sampled].float()
+                                                ).item()
+                                                if theta_f.item() > 1e-9:
+                                                    ratio = median_preact_when_fired / theta_f.item()
+                                                    if ratio > 0:
+                                                        ratios_this_layer.append(
+                                                            torch.log10(torch.tensor(ratio)).item()
+                                                        )
+                                        all_log10_ratios_hist_data.extend(ratios_this_layer)
+
+                                    if _wandb_available:
+                                        log_payload_jumprelu = {}
+                                        if all_fire_rates_hist_data:
+                                            log_payload_jumprelu["debug/jumprelu_fire_rate_per_feature_hist"] = (
+                                                wandb.Histogram(all_fire_rates_hist_data)
+                                            )
+                                        if all_log10_ratios_hist_data:
+                                            log_payload_jumprelu[
+                                                "debug/jumprelu_log10_median_preact_div_theta_hist"
+                                            ] = wandb.Histogram(all_log10_ratios_hist_data)
+                                        if log_payload_jumprelu:
+                                            try:
+                                                self.wandb_logger.log_evaluation(step, log_payload_jumprelu)
+                                            except Exception as e_wandb:
+                                                logger.error(
+                                                    f"Rank {self.rank} Step {step}: Error logging JumpReLU diagnostics to WandB via self.wandb_logger: {e_wandb}"
+                                                )
+                    # ---- End: Logging for H1/H2/H3 diagnostics ----
+
                     # Ensure all ranks finish evaluation before proceeding
                     if self.distributed:
                         dist.barrier()
@@ -1303,25 +1562,6 @@ class CLTTrainer:
         if self.distributed:
             dist.barrier()
 
-        # --- Convert to JumpReLU if originally BatchTopK, before final save --- #
-        if self.clt_config.activation_fn == "batchtopk":  # Check original config
-            if not self.distributed or self.rank == 0:  # Log message only from rank 0
-                logger.info("Original model was BatchTopK. Converting to JumpReLU before final save...")
-            try:
-                # All ranks must participate in case of distributed reduction inside convert_to_jumprelu_inplace
-                self.model.convert_to_jumprelu_inplace(
-                    default_theta_value=self.training_config.jumprelu_default_theta_on_convert
-                )
-                if self.distributed:  # Barrier after conversion to ensure all ranks are done
-                    dist.barrier()
-                if not self.distributed or self.rank == 0:  # Log success from rank 0
-                    logger.info("Model successfully converted to JumpReLU.")
-            except Exception as e:
-                if not self.distributed or self.rank == 0:  # Log error only from rank 0
-                    logger.error(f"Error during BatchTopK to JumpReLU conversion: {e}", exc_info=True)
-                # If conversion fails, proceed to save the original BatchTopK model
-                # The config will still reflect batchtopk in this case.
-
         # --- Save final model and metrics --- (Rank 0 handles metrics/store, all ranks save model state)
         final_checkpoint_dir = os.path.join(self.log_dir, "final")
         final_store_path = os.path.join(final_checkpoint_dir, "activation_store_final.pt")  # Store inside final dir
@@ -1353,16 +1593,14 @@ class CLTTrainer:
             self._save_metrics()
 
             # --- Save CLT Config to JSON ---
+            # The config saved here will now reflect the configuration *during training* (e.g. BatchTopK)
+            # The user will need to run estimate_theta_posthoc and then save the converted JumpReLU model themselves.
             config_save_path = os.path.join(self.log_dir, "cfg.json")
-            print(f"Saving CLT configuration to {config_save_path}...")
+            print(f"Saving CLT configuration (as trained) to {config_save_path}...")
             try:
-                # Convert CLTConfig dataclass to dict
-                config_dict = asdict(self.clt_config)
+                config_dict_as_trained = asdict(self.clt_config)  # This is the original config used for training
 
-                # --- Populate fields relevant for inference from TrainingConfig --- #
-                # (Overwrites defaults in clt_config if training_config has values)
-
-                # Model Name (useful context)
+                # Populate fields relevant for inference from TrainingConfig - this is mostly for context now
                 model_name = None
                 if (
                     hasattr(self.training_config, "generation_config")
@@ -1370,23 +1608,19 @@ class CLTTrainer:
                     and "model_name" in self.training_config.generation_config
                 ):
                     model_name = self.training_config.generation_config["model_name"]
-                    config_dict["model_name"] = model_name  # Add model_name to the dict
+                    config_dict_as_trained["model_name"] = model_name
                 elif (
                     hasattr(self.training_config, "activation_config")
                     and hasattr(self.training_config.activation_config, "model_name")
                     and self.training_config.activation_config.model_name is not None
                 ):
-                    config_dict["model_name"] = self.training_config.activation_config.model_name
+                    config_dict_as_trained["model_name"] = self.training_config.activation_config.model_name
 
-                # Normalization Method (Crucial for inference data handling)
                 if hasattr(self.training_config, "normalization_method"):
-                    config_dict["normalization_method"] = self.training_config.normalization_method
-
-                # Expected Input dtype (Crucial for inference data handling)
+                    config_dict_as_trained["normalization_method"] = self.training_config.normalization_method
                 if hasattr(self.training_config, "activation_dtype"):
-                    config_dict["expected_input_dtype"] = self.training_config.activation_dtype
+                    config_dict_as_trained["expected_input_dtype"] = self.training_config.activation_dtype
 
-                # Hook Templates and context size (if activations were generated on the fly or from a known source config)
                 source_cfg_for_hooks = None
                 if (
                     hasattr(self.training_config, "generation_config")
@@ -1397,31 +1631,32 @@ class CLTTrainer:
                     hasattr(self.training_config, "activation_config")
                     and self.training_config.activation_config is not None
                 ):
-                    # If using local_manifest or remote, activation_config from TrainingConfig might hold these
-                    # Need to ensure activation_config is part of TrainingConfig or accessible
-                    # For now, let's assume it might be under a similar structure or needs to be explicitly passed/set
-                    # This part might need adjustment based on how ActivationConfig is actually stored/accessed when not using on-the-fly generation
-                    # Assuming self.training_config.activation_config exists and is an ActivationConfig object
                     act_cfg = self.training_config.activation_config
-                    # Convert ActivationConfig to a dict-like structure if it's a dataclass
-                    if hasattr(act_cfg, "__dict__"):  # A simple check if it has attributes like a dataclass or object
+                    if hasattr(act_cfg, "__dict__"):
                         source_cfg_for_hooks = act_cfg.__dict__
                     elif isinstance(act_cfg, dict):
                         source_cfg_for_hooks = act_cfg
 
                 if source_cfg_for_hooks:
                     if "mlp_input_module_path_template" in source_cfg_for_hooks:
-                        config_dict["mlp_input_template"] = source_cfg_for_hooks["mlp_input_module_path_template"]
+                        config_dict_as_trained["mlp_input_template"] = source_cfg_for_hooks[
+                            "mlp_input_module_path_template"
+                        ]
                     if "mlp_output_module_path_template" in source_cfg_for_hooks:
-                        config_dict["mlp_output_template"] = source_cfg_for_hooks["mlp_output_module_path_template"]
+                        config_dict_as_trained["mlp_output_template"] = source_cfg_for_hooks[
+                            "mlp_output_module_path_template"
+                        ]
                     if "context_size" in source_cfg_for_hooks:
-                        config_dict["context_size"] = source_cfg_for_hooks["context_size"]
-
-                # --- End Inference Field Population --- #
+                        config_dict_as_trained["context_size"] = source_cfg_for_hooks["context_size"]
 
                 with open(config_save_path, "w") as f:
-                    json.dump(config_dict, f, indent=2)
-                print(f"Successfully saved configuration to {config_save_path}")
+                    json.dump(config_dict_as_trained, f, indent=2)
+                print(f"Successfully saved training configuration to {config_save_path}")
+                if self.clt_config.activation_fn == "batchtopk":
+                    print(
+                        "NOTE: Model was trained with BatchTopK. Run estimate_theta_posthoc() on the saved model to convert to JumpReLU and finalize theta values."
+                    )
+
             except Exception as e:
                 print(f"Rank 0: Warning: Failed to save CLT configuration to JSON: {e}")
             # --- End Save CLT Config ---

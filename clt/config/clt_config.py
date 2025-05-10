@@ -144,6 +144,8 @@ class TrainingConfig:
     log_interval: int = 100  # How often to log metrics
     eval_interval: int = 1000  # How often to run evaluation
     checkpoint_interval: int = 1000  # How often to save checkpoints
+    diag_every_n_eval_steps: Optional[int] = None  # How often to run detailed diagnostics (every N eval steps)
+    max_features_for_diag_hist: Optional[int] = None  # Max features for histogram diagnostics
 
     # Optional diagnostic metrics (can be slow)
     compute_sparsity_diagnostics: bool = False  # Whether to compute detailed sparsity diagnostics during eval

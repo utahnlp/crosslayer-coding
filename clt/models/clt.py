@@ -172,31 +172,9 @@ class CrossLayerTranscoder(BaseTranscoder):
         self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
 
         # Buffers for on-the-fly theta estimation (BatchTopK → JumpReLU)
-        if self.config.activation_fn == "batchtopk":
-            # Running sum of the per-batch minima (per layer, per feature)
-            self.register_buffer(
-                "_sum_min_selected_preact",
-                torch.zeros(
-                    (config.num_layers, config.num_features),
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                persistent=False,
-            )
-            # Count of batches that contributed a finite minimum for the feature
-            self.register_buffer(
-                "_count_min_selected_preact",
-                torch.zeros(
-                    (config.num_layers, config.num_features),
-                    dtype=self.dtype,
-                    device=self.device,
-                ),
-                persistent=False,
-            )
-        else:
-            # Create the attributes for type consistency when BatchTopK is not used
-            self.register_buffer("_sum_min_selected_preact", None, persistent=False)
-            self.register_buffer("_count_min_selected_preact", None, persistent=False)
+        # Create the attributes for type consistency, will be populated by estimate_theta_posthoc if needed
+        self.register_buffer("_sum_min_selected_preact", None, persistent=False)
+        self.register_buffer("_count_min_selected_preact", None, persistent=False)
 
         # No need to call _init_parameters separately, it's handled in ParallelLinear init
         # self._init_parameters() # Remove this call
@@ -377,7 +355,12 @@ class CrossLayerTranscoder(BaseTranscoder):
                 logger.warning(f"Rank {self.rank}: running BatchTopK stats buffers not found. Skipping theta update.")
             return
 
-        assert self._sum_min_selected_preact is not None and self._count_min_selected_preact is not None
+        assert self._sum_min_selected_preact is not None and isinstance(
+            self._sum_min_selected_preact, torch.Tensor
+        ), f"Rank {self.rank}: _sum_min_selected_preact is not a Tensor or is None."
+        assert self._count_min_selected_preact is not None and isinstance(
+            self._count_min_selected_preact, torch.Tensor
+        ), f"Rank {self.rank}: _count_min_selected_preact is not a Tensor or is None."
 
         current_total_feature_offset = 0
         for i, (original_layer_idx, num_features_this_layer) in enumerate(layer_feature_sizes):
@@ -408,6 +391,32 @@ class CrossLayerTranscoder(BaseTranscoder):
                     )
 
                     per_feature_min_this_batch = masked_preact.amin(dim=0)
+
+                    if logger.isEnabledFor(logging.DEBUG):
+                        # Log characteristics of the minimums being used for theta estimation
+                        finite_mins_for_log = per_feature_min_this_batch[torch.isfinite(per_feature_min_this_batch)]
+                        if finite_mins_for_log.numel() > 0:
+                            logger.debug(
+                                f"Rank {self.rank} Layer {original_layer_idx}: per_feature_min_this_batch (finite values for log) "
+                                f"min={finite_mins_for_log.min().item():.4f}, "
+                                f"max={finite_mins_for_log.max().item():.4f}, "
+                                f"mean={finite_mins_for_log.mean().item():.4f}, "
+                                f"median={torch.median(finite_mins_for_log).item():.4f}"
+                            )
+                        else:
+                            logger.debug(
+                                f"Rank {self.rank} Layer {original_layer_idx}: No finite per_feature_min_this_batch values to log stats for."
+                            )
+
+                        # Log how many original pre-activations were negative but still contributed to a positive gated_act
+                        original_preacts_leading_to_positive_gated = preact_orig_this_layer[mask_active]
+                        if original_preacts_leading_to_positive_gated.numel() > 0:  # Check if tensor is not empty
+                            num_negative_contrib = (original_preacts_leading_to_positive_gated < 0).sum().item()
+                            if num_negative_contrib > 0:
+                                logger.debug(
+                                    f"Rank {self.rank} Layer {original_layer_idx}: {num_negative_contrib} negative original pre-activations "
+                                    f"(out of {mask_active.sum().item()} active selections) contributed to theta estimation via positive gated_acts_segment."
+                                )
 
                     # Update running sum and count for expected-value calculation
                     valid_mask = torch.isfinite(per_feature_min_this_batch)
@@ -512,13 +521,6 @@ class CrossLayerTranscoder(BaseTranscoder):
             self.config.batchtopk_straight_through,
             concatenated_preactivations_normalized,  # Pass normalized for ranking
         )
-
-        # --- On-the-fly theta update for BatchTopK ---
-        if self.config.activation_fn == "batchtopk":
-            self._update_min_selected_preactivations(
-                concatenated_preactivations_original, activated_concatenated, layer_feature_sizes
-            )
-        # --- End on-the-fly theta update ---
 
         activations_dict: Dict[int, torch.Tensor] = {}
         current_feature_offset = 0
@@ -876,7 +878,212 @@ class CrossLayerTranscoder(BaseTranscoder):
         return full_decoder_norms
 
     @torch.no_grad()
-    def convert_to_jumprelu_inplace(self, default_theta_value: float = 1e6) -> None:
+    def estimate_theta_posthoc(
+        self,
+        data_iter: torch.utils.data.IterableDataset,  # More generic iterable
+        num_batches: Optional[int] = None,
+        default_theta_value: float = 1e6,
+        scale_factor: float = 1.0,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        """Estimate theta post-hoc using a specified number of batches.
+
+        Args:
+            data_iter: An iterable yielding (inputs, targets) batches.
+            num_batches: Number of batches to process for estimation. If None, iterates through all.
+            default_theta_value: Value for features never activated.
+            scale_factor: Scaling factor for estimated thetas.
+            device: Device to run estimation on.
+
+        Returns:
+            The estimated theta tensor.
+        """
+        original_device = next(self.parameters()).device
+        target_device = device if device is not None else self.device
+        if target_device is None:
+            target_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        logger.info(f"Rank {self.rank}: Starting post-hoc theta estimation on device {target_device}.")
+
+        self.eval()  # Set model to evaluation mode
+        if target_device != original_device:
+            self.to(target_device)
+
+        # Initialize buffers for this estimation pass
+        # These will be correctly placed on target_device due to model.to()
+        # Ensure these are re-registered if they were deleted by a previous call
+        if not hasattr(self, "_sum_min_selected_preact") or self._sum_min_selected_preact is None:
+            self.register_buffer(
+                "_sum_min_selected_preact",
+                torch.zeros(
+                    (self.config.num_layers, self.config.num_features),
+                    dtype=self.dtype,  # Use model's dtype
+                    device=target_device,
+                ),
+                persistent=False,  # Ensure it's not saved with state_dict by default
+            )
+        else:  # Ensure it's on the correct device and zeroed out
+            self._sum_min_selected_preact.data = torch.zeros_like(self._sum_min_selected_preact, device=target_device)
+
+        if not hasattr(self, "_count_min_selected_preact") or self._count_min_selected_preact is None:
+            self.register_buffer(
+                "_count_min_selected_preact",
+                torch.zeros(
+                    (self.config.num_layers, self.config.num_features),
+                    dtype=self.dtype,  # Use model's dtype
+                    device=target_device,
+                ),
+                persistent=False,
+            )
+        else:  # Ensure it's on the correct device and zeroed out
+            self._count_min_selected_preact.data = torch.zeros_like(
+                self._count_min_selected_preact, device=target_device
+            )
+
+        processed_batches = 0
+
+        # Import tqdm for the progress bar
+        try:
+            from tqdm.auto import tqdm
+
+            iterable_data_iter = (
+                tqdm(data_iter, total=num_batches, desc=f"Estimating Theta (Rank {self.rank})")
+                if num_batches
+                else tqdm(data_iter, desc=f"Estimating Theta (Rank {self.rank})")
+            )
+        except ImportError:
+            logger.info("tqdm not found, proceeding without progress bar for theta estimation.")
+            iterable_data_iter = data_iter
+
+        for inputs, _ in iterable_data_iter:  # We only need inputs for preactivations
+            if num_batches is not None and processed_batches >= num_batches:
+                break
+
+            # Move inputs to the target device
+            inputs_on_device = {k: v.to(target_device) for k, v in inputs.items()}
+
+            # Mimic the parts of _apply_batch_topk needed for _update_min_selected_preactivations
+            preactivations_dict, original_shapes_info, _, _ = self._encode_all_layers(inputs_on_device)
+            if not preactivations_dict:
+                logger.warning(
+                    f"Rank {self.rank}: No preactivations from _encode_all_layers in estimate_theta_posthoc. Skipping batch {processed_batches + 1}."
+                )
+                processed_batches += 1
+                continue
+
+            first_valid_preact_posthoc = next((p for p in preactivations_dict.values() if p.numel() > 0), None)
+            if first_valid_preact_posthoc is None:
+                logger.warning(
+                    f"Rank {self.rank}: All preactivations are empty in estimate_theta_posthoc. Skipping batch {processed_batches + 1}."
+                )
+                processed_batches += 1
+                continue
+
+            ordered_preactivations_original_posthoc: List[torch.Tensor] = []
+            ordered_preactivations_normalized_posthoc: List[torch.Tensor] = []
+            layer_feature_sizes_posthoc: List[Tuple[int, int]] = []
+            batch_tokens_dim_posthoc = first_valid_preact_posthoc.shape[0]
+
+            for layer_idx_loop in range(self.config.num_layers):
+                if layer_idx_loop in preactivations_dict:
+                    preact_orig_loop = preactivations_dict[layer_idx_loop]
+                    current_num_features_loop = (
+                        preact_orig_loop.shape[1] if preact_orig_loop.numel() > 0 else self.config.num_features
+                    )
+
+                    if preact_orig_loop.shape[0] != batch_tokens_dim_posthoc and preact_orig_loop.numel() > 0:
+                        ordered_preactivations_original_posthoc.append(
+                            torch.zeros(
+                                (batch_tokens_dim_posthoc, current_num_features_loop),
+                                device=target_device,
+                                dtype=self.dtype,
+                            )
+                        )
+                        ordered_preactivations_normalized_posthoc.append(
+                            torch.zeros(
+                                (batch_tokens_dim_posthoc, current_num_features_loop),
+                                device=target_device,
+                                dtype=self.dtype,
+                            )
+                        )
+                    elif preact_orig_loop.numel() == 0 and batch_tokens_dim_posthoc > 0:
+                        ordered_preactivations_original_posthoc.append(
+                            torch.zeros(
+                                (batch_tokens_dim_posthoc, current_num_features_loop),
+                                device=target_device,
+                                dtype=self.dtype,
+                            )
+                        )
+                        ordered_preactivations_normalized_posthoc.append(
+                            torch.zeros(
+                                (batch_tokens_dim_posthoc, current_num_features_loop),
+                                device=target_device,
+                                dtype=self.dtype,
+                            )
+                        )
+                    elif preact_orig_loop.numel() > 0:
+                        ordered_preactivations_original_posthoc.append(preact_orig_loop)
+                        mean_loop = preact_orig_loop.mean(dim=0, keepdim=True)
+                        std_loop = preact_orig_loop.std(dim=0, keepdim=True)
+                        preact_norm_loop = (preact_orig_loop - mean_loop) / (std_loop + 1e-6)
+                        ordered_preactivations_normalized_posthoc.append(preact_norm_loop)
+                    layer_feature_sizes_posthoc.append((layer_idx_loop, current_num_features_loop))
+
+            if not ordered_preactivations_original_posthoc:
+                logger.warning(
+                    f"Rank {self.rank}: No preactivations collected in estimate_theta_posthoc loop. Skipping batch {processed_batches + 1}."
+                )
+                processed_batches += 1
+                continue
+
+            concatenated_preactivations_original_posthoc = torch.cat(ordered_preactivations_original_posthoc, dim=1)
+            concatenated_preactivations_normalized_posthoc = torch.cat(ordered_preactivations_normalized_posthoc, dim=1)
+
+            k_val_posthoc: float
+            if self.config.batchtopk_k is not None:
+                k_val_posthoc = float(self.config.batchtopk_k)
+            elif self.config.batchtopk_frac is not None:
+                k_val_posthoc = self.config.batchtopk_frac
+            else:
+                k_val_posthoc = float(concatenated_preactivations_original_posthoc.size(1))
+
+            activated_concatenated_posthoc = BatchTopK.apply(
+                concatenated_preactivations_original_posthoc,
+                k_val_posthoc,
+                self.config.batchtopk_straight_through,
+                concatenated_preactivations_normalized_posthoc,
+            )
+
+            self._update_min_selected_preactivations(
+                concatenated_preactivations_original_posthoc,
+                activated_concatenated_posthoc,
+                layer_feature_sizes_posthoc,
+            )
+            processed_batches += 1
+
+        logger.info(f"Rank {self.rank}: Processed {processed_batches} batches for theta estimation.")
+
+        # Call convert_to_jumprelu_inplace, which will use the populated buffers
+        self.convert_to_jumprelu_inplace(default_theta_value=default_theta_value, scale_factor=scale_factor)
+
+        # Clean up the temporarily created buffers
+        del self._sum_min_selected_preact
+        del self._count_min_selected_preact
+        # Ensure the attributes are removed if del doesn't trigger __delattr__ for buffers
+        if hasattr(self, "_sum_min_selected_preact"):
+            delattr(self, "_sum_min_selected_preact")
+        if hasattr(self, "_count_min_selected_preact"):
+            delattr(self, "_count_min_selected_preact")
+
+        # Restore original device if changed
+        if target_device != original_device:
+            self.to(original_device)
+
+        logger.info(f"Rank {self.rank}: Post-hoc theta estimation and conversion to JumpReLU complete.")
+        return torch.exp(self.log_threshold.data)  # Return the estimated theta values
+
+    @torch.no_grad()
+    def convert_to_jumprelu_inplace(self, default_theta_value: float = 1e6, *, scale_factor: float = 1.0) -> None:
         """
         Converts the model to use JumpReLU activation based on learned BatchTopK thresholds.
         This method should be called after training with BatchTopK.
@@ -885,6 +1092,7 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         Args:
             default_theta_value: Value to use for features that were never activated.
+            scale_factor: Optional scaling factor to apply to the learned thetas.
         """
         if self.config.activation_fn != "batchtopk":
             logger.warning(
@@ -897,15 +1105,29 @@ class CrossLayerTranscoder(BaseTranscoder):
                 logger.error(f"Rank {self.rank}: Model is ReLU, cannot convert to JumpReLU via learned thetas.")
             return
 
-        if self._sum_min_selected_preact is None or self._count_min_selected_preact is None:
-            logger.error(f"Rank {self.rank}: Running BatchTopK stats buffers not found. Cannot convert to JumpReLU.")
-            return
+        if (
+            not hasattr(self, "_sum_min_selected_preact")
+            or not hasattr(self, "_count_min_selected_preact")
+            or self._sum_min_selected_preact is None
+            or self._count_min_selected_preact is None
+        ):
+            raise RuntimeError(
+                f"Rank {self.rank}: BatchTopK statistics buffers (_sum_min_selected_preact, _count_min_selected_preact) "
+                "not found or not populated. Run estimate_theta_posthoc() before converting to JumpReLU."
+            )
+
+        assert self._sum_min_selected_preact is not None and isinstance(
+            self._sum_min_selected_preact, torch.Tensor
+        ), f"Rank {self.rank}: _sum_min_selected_preact is not a Tensor or is None before conversion."
+        assert self._count_min_selected_preact is not None and isinstance(
+            self._count_min_selected_preact, torch.Tensor
+        ), f"Rank {self.rank}: _count_min_selected_preact is not a Tensor or is None before conversion."
 
         logger.info(f"Rank {self.rank}: Starting conversion of BatchTopK model to JumpReLU.")
 
         # Compute expected value of per-batch minima
-        theta_sum = self._sum_min_selected_preact.clone()
-        theta_cnt = self._count_min_selected_preact.clone()
+        theta_sum = self._sum_min_selected_preact.clone()  # type: ignore[operator] # Linter might complain, but assert guards it.
+        theta_cnt = self._count_min_selected_preact.clone()  # type: ignore[operator]
 
         # If distributed, reduce sums and counts
         if self.process_group is not None and dist.is_initialized() and self.world_size > 1:
@@ -915,17 +1137,129 @@ class CrossLayerTranscoder(BaseTranscoder):
         theta = torch.where(
             theta_cnt > 0,
             theta_sum / theta_cnt.clamp_min(1.0),
-            torch.full_like(theta_sum, float("inf")),
+            torch.full_like(theta_sum, float(default_theta_value)),  # Use default_theta_value for never activated
         )
 
-        # Ensure thresholds are not too small
+        # --- Optional scaling --------------------------------------------------
+        if not isinstance(scale_factor, (int, float)):
+            logger.warning(
+                f"Rank {self.rank}: scale_factor of type {type(scale_factor)} is not supported. "
+                "Expected int or float; defaulting to 1.0."
+            )
+            scale_factor = 1.0
+        if scale_factor <= 0:
+            logger.warning(
+                f"Rank {self.rank}: scale_factor={scale_factor} <= 0 is invalid. " "Defaulting to 1.0 (no scaling)."
+            )
+            scale_factor = 1.0
+
+        if scale_factor != 1.0:
+            theta = theta * scale_factor
+            logger.info(
+                f"Rank {self.rank}: Applied scale_factor={scale_factor:.3f} to theta (post-expected-min calculation)."
+            )
+
+        # Count features at default_theta_value *before* clamping and logging them.
+        # This count reflects features that had no BatchTopK stats to begin with.
+        # Ensure comparison is done carefully with floating point numbers.
+        # It might be more robust to check where theta_cnt was zero originally.
+        # Let's use the theta_cnt == 0 condition directly for robustness.
+        num_at_default_initially = (theta_cnt == 0).sum().item()
+
+        # Ensure thresholds are not too small (or use default_theta_value if inf)
+        # theta can be inf if theta_cnt was 0 and default_theta_value was inf.
+        # If default_theta_value is a large positive number, this step handles it.
         min_positive_theta = 1e-6
+        # Replace inf with default_theta_value before clamping
+        theta_is_inf = torch.isinf(theta)
+        if theta_is_inf.any() and not torch.isinf(torch.tensor(default_theta_value)):
+            logger.info(
+                f"Rank {self.rank}: Replacing {theta_is_inf.sum().item()} inf theta values with default_theta_value={default_theta_value:.4e}"
+            )
+            theta[theta_is_inf] = float(default_theta_value)
+
         clamped_count = (theta <= min_positive_theta).sum().item()
         if clamped_count > 0:
             logger.warning(
                 f"Rank {self.rank}: Clamping {clamped_count} theta values (<= {min_positive_theta}) to {min_positive_theta} before log."
             )
         theta.clamp_min_(min_positive_theta)
+
+        # Log detailed theta statistics after scaling
+        if self.rank == 0:  # Only rank 0 for these aggregated stats
+            neg_frac = (theta < 0).float().mean().item()  # Should be 0 after clamp_min_
+            leq_1e_4_frac = (theta <= 1e-4).float().mean().item()
+            is_default_val_frac = (
+                (theta == float(default_theta_value)).float().mean().item()
+                if not torch.isinf(torch.tensor(default_theta_value))
+                else 0.0
+            )
+
+            # Calculate the number of features that ended up with the default_theta_value after all processing
+            # This might be different from num_at_default_initially if default_theta_value itself was scaled or clamped.
+            # For a more direct measure of features that *relied* on the default due to no stats:
+            # We already have num_at_default_initially. Let's add it to the log.
+
+            logger.info(
+                f"Rank {self.rank}: Theta stats (shape {theta.shape}) before log: "
+                f"min={theta.min().item():.4e}, "
+                f"p01={torch.quantile(theta.float(), 0.01).item():.4e}, "
+                f"p50={torch.median(theta.float()).item():.4e}, "
+                f"p99={torch.quantile(theta.float(), 0.99).item():.4e}, "
+                f"max={theta.max().item():.4e}, "
+                f"%%_neg_or_zero={neg_frac * 100:.2f}%, "  # Should be 0%
+                f"%%_leq_1e_4={leq_1e_4_frac * 100:.2f}%, "
+                f"%%_is_default_val (after scaling/clamping)={is_default_val_frac * 100:.2f}% (default_theta_value={default_theta_value:.4e}), "
+                f"num_features_relying_on_default_due_to_no_stats={num_at_default_initially}"
+            )
+            try:
+                import wandb  # Ensure wandb is imported
+
+                if wandb.run:
+                    # theta is already clamped to be positive.
+                    theta_for_hist = theta.cpu().float()
+                    # Handle potential inf values if default_theta_value was inf and some features were never active
+                    finite_theta_for_hist = theta_for_hist[torch.isfinite(theta_for_hist)]
+
+                    if logger.isEnabledFor(logging.DEBUG):  # Existing logger check
+                        logger.debug(
+                            f"Rank {self.rank}: convert_to_jumprelu_inplace: finite_theta_for_hist has {finite_theta_for_hist.numel()} elements for aggregate histogram."
+                        )
+
+                    if finite_theta_for_hist.numel() > 0:
+                        wandb.log(
+                            {
+                                "debug/theta_dist_layer_agg_log10": wandb.Histogram(
+                                    torch.log10(finite_theta_for_hist).cpu().tolist()
+                                )
+                            },
+                            commit=False,
+                        )
+                    else:
+                        logger.warning(
+                            f"Rank {self.rank}: No finite positive theta values to log for aggregate histogram."
+                        )
+
+                    for l_idx in range(theta.shape[0]):
+                        theta_layer = theta[l_idx].cpu().float()
+                        finite_theta_layer_for_hist = theta_layer[torch.isfinite(theta_layer)]
+                        if finite_theta_layer_for_hist.numel() > 0:
+                            wandb.log(
+                                {
+                                    f"debug/theta_dist_layer_{l_idx}_log10": wandb.Histogram(
+                                        torch.log10(finite_theta_layer_for_hist).cpu().tolist()
+                                    )
+                                },
+                                commit=False,
+                            )
+                        else:
+                            logger.debug(
+                                f"Rank {self.rank}: No finite positive theta values for layer {l_idx} histogram for log10."
+                            )
+            except ImportError:
+                logger.info("WandB not installed, skipping theta histogram logging.")
+            except Exception as e:
+                logger.error(f"Rank {self.rank}: Error logging theta histogram to WandB: {e}")
 
         log_theta = torch.log(theta)
 
@@ -951,9 +1285,10 @@ class CrossLayerTranscoder(BaseTranscoder):
             self.log_threshold.data = log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
 
         # Remove running stat buffers (no longer needed after conversion)
-        for buf_name in ["_sum_min_selected_preact", "_count_min_selected_preact"]:
-            if hasattr(self, buf_name):
-                setattr(self, buf_name, None)
+        # These are now deleted in estimate_theta_posthoc after conversion
+        # for buf_name in ["_sum_min_selected_preact", "_count_min_selected_preact"]:
+        #     if hasattr(self, buf_name):
+        #         setattr(self, buf_name, None)
 
         logger.info(f"Rank {self.rank}: Model converted to JumpReLU. activation_fn='{self.config.activation_fn}'.")
         if self.rank == 0:
