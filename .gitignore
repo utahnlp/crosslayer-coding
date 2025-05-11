@@ -197,6 +197,9 @@ tutorials/tutorial_activations_local_1M_pythia_ln/
 2412.06410v1.pdf
 tutorials/tutorial_activations_local_1M_pythia_160m/
 tutorials/tutorial_activations_local_1M_mlp_only/
+conversion_test/
+server_data/
+tutorials/old/
 
 # models
 *.pt
