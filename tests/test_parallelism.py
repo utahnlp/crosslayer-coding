@@ -1458,3 +1458,19 @@ def test_row_parallel_linear_forward(
 
 # Add more tests here for:
 # - RowParallelLinear
+
+
+# --- Synchronize ranks between individual tests --- #
+# Ensures that all ranks finish a test before any starts the next one.
+@pytest.fixture(scope="function", autouse=True)
+def sync_barrier_between_tests():
+    """Barrier after each test function to keep ranks perfectly in lock-step.
+
+    Without this, one rank can finish a test and start creating the next
+    fixture (which includes new collectives) while another rank is still in
+    the previous test.  That race leads to mismatched collective sequences
+    and NCCL watchdog timeouts.
+    """
+    yield
+    if dist.is_initialized():
+        dist.barrier()
