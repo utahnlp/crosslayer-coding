@@ -188,7 +188,9 @@ def scatter_full_parameter(full_param: torch.Tensor, model_param: torch.nn.Param
             model_param.data.copy_(param_shard.to(model_param.device, model_param.dtype))
         else:
             if RANK == 0:
-                print(f"Rank {rank} scatter ERROR: Shape mismatch {model_param.shape} != {param_shard.shape} for dim {partition_dim}")
+                print(
+                    f"Rank {rank} scatter ERROR: Shape mismatch {model_param.shape} != {param_shard.shape} for dim {partition_dim}"
+                )
     elif model_param.numel() > 0:
         if RANK == 0:
             print(
@@ -285,66 +287,78 @@ def multi_gpu_model(
 ) -> Optional[CrossLayerTranscoder]:
     """Create a distributed CLT model if WORLD_SIZE > 1, copying weights from single_gpu_model."""
     if WORLD_SIZE <= 1:
-        # pytest.skip("Skipping multi-GPU model creation (WORLD_SIZE <= 1)") # Don't skip, allow tests to run on single GPU
         return None
 
     if not dist.is_initialized():
-        # This should not happen if distributed_fixture ran
         pytest.fail("Distributed environment not initialized for multi-GPU model fixture.")
 
+    # Create the multi-GPU model (initializes its own parameters/shards)
+    # Use a different seed for multi_gpu_model creation if its init is random and needs to differ from single_gpu_model before copy
+    # However, since we copy all params, initial state of multi_gpu_model's weights doesn't strictly matter.
     model = CrossLayerTranscoder(clt_config_fn, process_group=dist.group.WORLD, device=device)
     model.eval()
 
+    # --- Copy weights from single_gpu_model to multi_gpu_model shards --- #
     single_params_dict = dict(single_gpu_model.named_parameters())
     with torch.no_grad():
         for name, multi_param in model.named_parameters():
             if name not in single_params_dict:
-                print(f"Rank {RANK}: Warning - Parameter {name} not found in single_gpu_model.")
+                if RANK == 0:
+                    print(
+                        f"Rank {RANK}: Warning - Parameter {name} from multi_gpu_model not found in single_gpu_model. Skipping copy."
+                    )
                 continue
 
             single_param = single_params_dict[name]
             single_param_data = single_param.data.to(device)
 
             if name == "log_threshold":
-                if multi_param.shape == single_param_data.shape:  # Only copy if shapes match (e.g. jumprelu)
-                    multi_param.data.copy_(single_param_data)
-                elif clt_config_fn.activation_fn == "jumprelu":  # log_threshold exists
-                    # This case might occur if a BatchTopK model (no log_thresh) is compared to a Jumprelu one.
-                    # For tests, ensure configs align or handle init of log_thresh for BatchTopK if it gets created.
-                    # For now, if it's jumprelu and shapes mismatch, it's an issue.
-                    if RANK == 0:
-                        print(
-                            f"Rank {RANK}: Warning - log_threshold shape mismatch for jumprelu: {multi_param.shape} vs {single_param_data.shape}"
-                        )
+                # Only copy if log_threshold exists on multi_param (e.g. if clt_config_fn.activation_fn is 'jumprelu')
+                # and shapes match. It might not exist if single_gpu_model was batchtopk and converted,
+                # while multi_gpu_model is being initialized fresh with a jumprelu config.
+                # This fixture logic assumes clt_config_fn is the SAME for both models being compared in a test run.
+                if (
+                    hasattr(model, "log_threshold")
+                    and model.log_threshold is not None
+                    and multi_param is model.log_threshold
+                ):
+                    if multi_param.shape == single_param_data.shape:
+                        multi_param.data.copy_(single_param_data)
+                    else:
+                        if RANK == 0:
+                            print(
+                                f"Rank {RANK}: Warning - log_threshold shape mismatch: multi {multi_param.shape} vs single {single_param_data.shape}"
+                            )
+                # If single_gpu_model has log_threshold but multi_gpu_model doesn't (e.g. different configs), this is a test setup issue.
+
             elif "encoders." in name and ".weight" in name:
                 scatter_full_parameter(single_param_data, multi_param, partition_dim=0)
             elif "decoders." in name and ".weight" in name:
                 scatter_full_parameter(single_param_data, multi_param, partition_dim=1)
             elif "encoders." in name and ".bias" in name:
-                # Check if bias actually exists on the multi_param (ColumnParallelLinear might not have it if bias=False)
-                if hasattr(multi_gpu_model.encoders[int(name.split(".")[1])], "bias_param") and multi_param is not None:
+                # Check if the corresponding encoder layer in multi_gpu_model was configured with bias=True
+                layer_idx_str = name.split(".")[1]
+                if model.encoders[int(layer_idx_str)].bias:  # Accessing the boolean flag
                     scatter_full_parameter(single_param_data, multi_param, partition_dim=0)
             elif "decoders." in name and ".bias" in name:
-                if (
-                    hasattr(
-                        multi_gpu_model.decoders[
-                            name.split(".")[1].split("->")[0] + "->" + name.split(".")[1].split("->")[1]
-                        ],
-                        "bias_param",
-                    )
-                    and multi_param is not None
-                ):
+                # Check if the corresponding decoder layer in multi_gpu_model was configured with bias=True
+                decoder_key = name.split(".")[1]  # "src->tgt"
+                if model.decoders[decoder_key].bias:  # Accessing the boolean flag
+                    # Decoder bias is replicated, not sharded
                     multi_param.data.copy_(single_param_data)
             else:
+                # Catch-all for any other parameters (e.g. future additions, or if naming changes)
                 if RANK == 0:
                     print(
-                        f"Rank {RANK}: Warning - Decoder bias shape mismatch: {multi_param.shape} vs {single_param_data.shape} for {name}"
+                        f"Rank {RANK}: Warning - Unhandled parameter type for weight copying: {name}. Attempting direct copy if shapes match."
                     )
-            else:
-                if RANK == 0:
-                    print(f"Rank {RANK}: Warning - Unhandled parameter type for weight copying: {name}")
                 if multi_param.shape == single_param_data.shape:
                     multi_param.data.copy_(single_param_data)
+                else:
+                    if RANK == 0:
+                        print(
+                            f"Rank {RANK}: Error - Shape mismatch for unhandled param {name}: multi {multi_param.shape} vs single {single_param_data.shape}. NOT copying."
+                        )
 
     if dist.is_initialized():
         dist.barrier()
@@ -1121,32 +1135,33 @@ def test_replicated_param_sync_after_conversion(
         with torch.no_grad():
             for name, multi_param in _multi_model.named_parameters():
                 if name not in single_params_dict:
-                    if RANK == 0: print(f"Warning T1: Param {name} in multi_model not in single_model, skipping copy.")
+                    if RANK == 0:
+                        print(f"Warning T1: Param {name} in multi_model not in single_model, skipping copy.")
                     continue
-                
+
                 single_param_data = single_params_dict[name].data.to(device)
 
                 if "encoders." in name:
-                    layer_idx_str = name.split('.')[1]
+                    layer_idx_str = name.split(".")[1]
                     if ".weight" in name:
                         scatter_full_parameter(single_param_data, multi_param, 0)
                     elif ".bias" in name:
                         # Encoder bias is sharded if it exists
-                        if _multi_model.encoders[int(layer_idx_str)].bias: # Check if bias was created
+                        if _multi_model.encoders[int(layer_idx_str)].bias:  # Check if bias was created
                             scatter_full_parameter(single_param_data, multi_param, 0)
                 elif "decoders." in name:
-                    decoder_key = name.split('.')[1] # This is "src->tgt"
+                    decoder_key = name.split(".")[1]  # This is "src->tgt"
                     if ".weight" in name:
                         scatter_full_parameter(single_param_data, multi_param, 1)
                     elif ".bias" in name:
                         # Decoder bias is replicated
-                        if _multi_model.decoders[decoder_key].bias: # Check if bias was created
-                             multi_param.data.copy_(single_param_data)
+                        if _multi_model.decoders[decoder_key].bias:  # Check if bias was created
+                            multi_param.data.copy_(single_param_data)
                 # log_threshold is not copied here as it's for batchtopk init
                 # Other parameters (if any) are not handled by this specific copy logic
-                            
+
         dist.barrier()
-    
+
     model_to_test = _multi_model if WORLD_SIZE > 1 and _multi_model is not None else _single_model
 
     # 2. Convert to JumpReLU
@@ -1344,13 +1359,11 @@ def test_column_parallel_linear_forward(
 
 @pytest.mark.parametrize(
     "clt_config_fn",
-    [
-        {"activation_fn": "jumprelu", "d_model":32, "num_layers":4} # Provide a default config
-    ],
-    indirect=True
+    [{"activation_fn": "jumprelu", "d_model": 32, "num_layers": 4}],  # Provide a default config
+    indirect=True,
 )
 def test_row_parallel_linear_forward(
-    clt_config_fn: CLTConfig, # Changed from base_config
+    clt_config_fn: CLTConfig,  # Changed from base_config
     device: torch.device,
 ):
     """Test RowParallelLinear forward pass against nn.Linear."""
@@ -1365,13 +1378,14 @@ def test_row_parallel_linear_forward(
         # Adjust if clt_config_fn d_model is different, or ensure it matches test setup
         # For this test, let's use a fixed out_features and ensure config matches, or make it flexible.
         # The parametrize for clt_config_fn sets d_model=32, so this is consistent.
-        pass 
+        pass
 
     batch_tokens = 128
     seed = 42 + RANK
 
     test_device = device
-    if RANK == 0: print(f"Rank {RANK}: Running RPL test on device: {test_device}")
+    if RANK == 0:
+        print(f"Rank {RANK}: Running RPL test on device: {test_device}")
 
     # 1. Create standard nn.Linear layer (broadcast weights)
     torch.manual_seed(seed)
@@ -1380,7 +1394,8 @@ def test_row_parallel_linear_forward(
         dist.broadcast(single_layer.weight.data, src=0)
         dist.broadcast(single_layer.bias.data, src=0)
         dist.barrier()
-    if RANK == 0: print(f"Rank {RANK}: Single nn.Linear layer created and weights broadcasted.")
+    if RANK == 0:
+        print(f"Rank {RANK}: Single nn.Linear layer created and weights broadcasted.")
 
     # 2. Create RowParallelLinear layer
     torch.manual_seed(seed)
@@ -1395,10 +1410,12 @@ def test_row_parallel_linear_forward(
         device=test_device,
     )
     multi_layer.eval()
-    if RANK == 0: print(f"Rank {RANK}: RowParallelLinear created.")
+    if RANK == 0:
+        print(f"Rank {RANK}: RowParallelLinear created.")
 
     # 3. Copy weights/bias from single_layer to multi_layer
-    if RANK == 0: print(f"Rank {RANK}: Scattering/copying weights/bias to RowParallelLinear...")
+    if RANK == 0:
+        print(f"Rank {RANK}: Scattering/copying weights/bias to RowParallelLinear...")
     with torch.no_grad():
         # Scatter weight (partition_dim=1 for RowParallel)
         scatter_full_parameter(single_layer.weight.data, multi_layer.weight, partition_dim=1)
