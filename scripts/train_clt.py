@@ -162,7 +162,7 @@ def parse_args():
     clt_group.add_argument(
         "--activation-fn",
         type=str,
-        choices=["jumprelu", "relu", "batchtopk"],
+        choices=["jumprelu", "relu", "batchtopk", "topk"],
         default="jumprelu",
         help="Activation function for the CLT.",
     )
@@ -188,6 +188,17 @@ def parse_args():
         "--disable-batchtopk-straight-through",
         action="store_true",  # If flag is present, disable is true. Default behavior is enabled.
         help="Disable straight-through estimator for BatchTopK. (BatchTopK default is True).",
+    )
+    clt_group.add_argument(
+        "--topk-k",
+        type=float,  # As per CLTConfig, topk_k can be a float (fraction) or int (count)
+        default=None,
+        help="Number or fraction of features to keep for TopK activation (if used). If < 1, treated as fraction; if >= 1, treated as int count.",
+    )
+    clt_group.add_argument(
+        "--disable-topk-straight-through",
+        action="store_true",
+        help="Disable straight-through estimator for TopK. (TopK default is True).",
     )
     clt_group.add_argument(
         "--clt-dtype",
@@ -438,6 +449,8 @@ def main():
         batchtopk_k=args.batchtopk_k,
         batchtopk_straight_through=(not args.disable_batchtopk_straight_through),
         clt_dtype=args.clt_dtype,
+        topk_k=args.topk_k,
+        topk_straight_through=(not args.disable_topk_straight_through),
     )
     logger.info(f"CLT Config: {clt_config}")
 
@@ -470,6 +483,10 @@ def main():
             name_parts.append("batchtopk")
             if args.batchtopk_k is not None:
                 name_parts.append(f"k{args.batchtopk_k}")
+        elif args.activation_fn == "topk":
+            name_parts.append("topk")
+            if args.topk_k is not None:
+                name_parts.append(f"k{args.topk_k}")
         else:  # jumprelu or relu
             name_parts.append(args.activation_fn)
             name_parts.append(f"{args.sparsity_lambda:.1e}-slambda")
