@@ -6,6 +6,8 @@ from torch.distributed import ProcessGroup
 import math
 from typing import Callable, Optional, cast
 
+from . import mark_replicated
+
 
 class _ParallelLinear(nn.Module):
     """Base class for parallel linear layers."""
@@ -50,14 +52,16 @@ class _ParallelLinear(nn.Module):
             self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
             if bias:
                 self.bias_param = nn.Parameter(torch.empty(self.local_out_features, device=device))
+                # DO NOT mark_replicated here, ColumnParallel bias is sharded
         elif partition_dim == 1:  # Row Parallelism (Input features sharded)
             # Calculate padded size for uniform distribution
             self.local_in_features = math.ceil(in_features / self.world_size)
             self.local_out_features = out_features
             self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
             if bias:
-                # Bias is added *after* the all-reduce, so it's not sharded
+                # Bias is added *after* the all-reduce, so it's not sharded (globally, but replicated on each rank)
                 self.bias_param = nn.Parameter(torch.empty(out_features, device=device))
+                mark_replicated(self.bias_param)  # Mark as replicated
         else:
             raise ValueError("partition_dim must be 0 or 1")
 

@@ -18,6 +18,8 @@ from clt.models.encoding import _apply_token_topk as _apply_token_topk_helper
 
 from torch.distributed import ProcessGroup
 
+from . import mark_replicated  # Added import
+
 # Configure logging (or use existing logger if available)
 logger = logging.getLogger(__name__)
 
@@ -100,6 +102,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 config.num_layers, config.num_features  # Shape: [num_layers, num_features]
             ) * torch.log(torch.tensor(config.jumprelu_threshold))
             self.log_threshold = nn.Parameter(initial_threshold_val.to(device=self.device, dtype=self.dtype))
+            mark_replicated(self.log_threshold)  # Mark as replicated
 
         self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
 
@@ -1176,8 +1179,11 @@ class CrossLayerTranscoder(BaseTranscoder):
                 self.log_threshold = nn.Parameter(
                     log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
                 )
-            # Update data in-place, ensuring it's on the correct device and dtype
-            self.log_threshold.data = log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
+            else:
+                # Update data in-place, ensuring it's on the correct device and dtype
+                self.log_threshold.data = log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
+
+        mark_replicated(self.log_threshold)  # Mark as replicated after creation or update
 
         # Remove running stat buffers (no longer needed after conversion)
         # These are now deleted in estimate_theta_posthoc after conversion

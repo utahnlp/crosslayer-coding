@@ -4,6 +4,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from clt.models.clt import CrossLayerTranscoder  # For type hinting model parameters
 
+    # from clt.models import is_replicated # No longer needed
+
 
 def average_shared_parameter_grads(model: "CrossLayerTranscoder", world_size: int):
     """Average gradients of parameters that are **replicated** across ranks.
@@ -20,8 +22,11 @@ def average_shared_parameter_grads(model: "CrossLayerTranscoder", world_size: in
     for p in model.parameters():
         if p.grad is None:
             continue
-        # Assuming replicated parameters are 1D (like JumpReLU log_threshold or biases)
-        # More sophisticated checks might be needed if other replicated parameter structures exist.
-        if p.dim() == 1:
+
+        # Check if parameter is marked as replicated OR if it's a 1D tensor (for backward compatibility)
+        # The import for is_replicated will be guarded by TYPE_CHECKING, so use getattr for runtime.
+        is_rep = getattr(p, "_is_replicated", False)
+
+        if is_rep or p.dim() == 1:
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
             p.grad /= world_size
