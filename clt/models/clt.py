@@ -845,7 +845,7 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         # Import tqdm for the progress bar
         try:
-            from tqdm.auto import tqdm
+            from tqdm.auto import tqdm  # type: ignore
 
             iterable_data_iter = (
                 tqdm(data_iter, total=num_batches, desc=f"Estimating Theta (Rank {self.rank})")

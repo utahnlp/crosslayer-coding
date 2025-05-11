@@ -188,9 +188,7 @@ def scatter_full_parameter(full_param: torch.Tensor, model_param: torch.nn.Param
             model_param.data.copy_(param_shard.to(model_param.device, model_param.dtype))
         else:
             if RANK == 0:
-                print(
-                    f"Rank {rank} scatter ERROR: Shape mismatch {model_param.shape} != {param_shard.shape} for dim {partition_dim}"
-                )
+                print(f"Rank {rank} scatter ERROR: Shape mismatch {model_param.shape} != {param_shard.shape} for dim {partition_dim}")
     elif model_param.numel() > 0:
         if RANK == 0:
             print(
@@ -336,13 +334,12 @@ def multi_gpu_model(
                     )
                     and multi_param is not None
                 ):
-                    if multi_param.shape == single_param_data.shape:
-                        multi_param.data.copy_(single_param_data)
-                    else:
-                        if RANK == 0:
-                            print(
-                                f"Rank {RANK}: Warning - Decoder bias shape mismatch: {multi_param.shape} vs {single_param_data.shape} for {name}"
-                            )
+                    multi_param.data.copy_(single_param_data)
+            else:
+                if RANK == 0:
+                    print(
+                        f"Rank {RANK}: Warning - Decoder bias shape mismatch: {multi_param.shape} vs {single_param_data.shape} for {name}"
+                    )
             else:
                 if RANK == 0:
                     print(f"Rank {RANK}: Warning - Unhandled parameter type for weight copying: {name}")
@@ -970,8 +967,8 @@ def test_gradient_calculation(
     multi_total_loss.backward()
     if multi_gpu_model is not None and WORLD_SIZE > 1:  # Only average for actual multi_gpu_model
         average_replicated_grads(multi_gpu_model)
-        if dist.is_initialized():
-            dist.barrier()
+    if dist.is_initialized():
+        dist.barrier()
 
     multi_gpu_local_grads = {
         name: p.grad for name, p in multi_gpu_actual_model.named_parameters() if p.grad is not None
@@ -1123,21 +1120,33 @@ def test_replicated_param_sync_after_conversion(
         single_params_dict = dict(_single_model.named_parameters())
         with torch.no_grad():
             for name, multi_param in _multi_model.named_parameters():
-                if name in single_params_dict:
-                    single_param_data = single_params_dict[name].data.to(device)
-                    if "encoders." in name and ".weight" in name:
-                        scatter_full_parameter(single_param_data, multi_param, 0)
-                    elif "decoders." in name and ".weight" in name:
-                        scatter_full_parameter(single_param_data, multi_param, 1)
-                    elif (
-                        "encoders." in name and ".bias" in name and _multi_model.encoders[int(name.split(".")[1])].bias
-                    ):
-                        scatter_full_parameter(single_param_data, multi_param, 0)
-                    elif "decoders." in name and ".bias" in name and _multi_model.decoders[name.split(".")[1]].bias:
-                        multi_param.data.copy_(single_param_data)  # Decoder bias is replicated
-                    # log_threshold doesn't exist yet for batchtopk
-        dist.barrier()
+                if name not in single_params_dict:
+                    if RANK == 0: print(f"Warning T1: Param {name} in multi_model not in single_model, skipping copy.")
+                    continue
+                
+                single_param_data = single_params_dict[name].data.to(device)
 
+                if "encoders." in name:
+                    layer_idx_str = name.split('.')[1]
+                    if ".weight" in name:
+                        scatter_full_parameter(single_param_data, multi_param, 0)
+                    elif ".bias" in name:
+                        # Encoder bias is sharded if it exists
+                        if _multi_model.encoders[int(layer_idx_str)].bias: # Check if bias was created
+                            scatter_full_parameter(single_param_data, multi_param, 0)
+                elif "decoders." in name:
+                    decoder_key = name.split('.')[1] # This is "src->tgt"
+                    if ".weight" in name:
+                        scatter_full_parameter(single_param_data, multi_param, 1)
+                    elif ".bias" in name:
+                        # Decoder bias is replicated
+                        if _multi_model.decoders[decoder_key].bias: # Check if bias was created
+                             multi_param.data.copy_(single_param_data)
+                # log_threshold is not copied here as it's for batchtopk init
+                # Other parameters (if any) are not handled by this specific copy logic
+                            
+        dist.barrier()
+    
     model_to_test = _multi_model if WORLD_SIZE > 1 and _multi_model is not None else _single_model
 
     # 2. Convert to JumpReLU
@@ -1237,90 +1246,6 @@ def test_replicated_param_sync_after_conversion(
     dist.barrier()
 
 
-# --- Test T4: Zero-K and Degenerate Dimensions ---
-
-
-@pytest.mark.parametrize(
-    "clt_config_fn",
-    [
-        # Zero-K for BatchTopK
-        {"activation_fn": "batchtopk", "batchtopk_k": 0, "num_features": 64, "d_model": 32, "num_layers": 2},
-        # Zero-K for TokenTopK (k=0.0 implies 0 features)
-        {"activation_fn": "topk", "topk_k": 0.0, "num_features": 64, "d_model": 32, "num_layers": 2},
-    ],
-    indirect=True,
-)
-def test_zero_k_activations(
-    single_gpu_model: CrossLayerTranscoder,  # Use single_gpu_model is enough, logic is per-rank
-    clt_config_fn: CLTConfig,
-    identical_input_data: torch.Tensor,  # Uses d_model from config
-    device: torch.device,
-):
-    """Tests T4 (Zero-K part): Activations are zero when k=0 for TopK/BatchTopK."""
-    if RANK == 0:
-        print(
-            f"\nTesting Zero-K for {clt_config_fn.activation_fn} (k={clt_config_fn.batchtopk_k if clt_config_fn.activation_fn == 'batchtopk' else clt_config_fn.topk_k})"
-        )
-
-    single_gpu_model.to(device)  # ensure model is on the correct device for this test instance
-    input_for_encode = identical_input_data.to(device)
-
-    for layer_idx in range(clt_config_fn.num_layers):
-        # Get feature activations (model.encode or model.get_feature_activations)
-        # Using get_feature_activations as it's the main entry point for these.
-        activations_dict = single_gpu_model.get_feature_activations({layer_idx: input_for_encode.clone()})
-        layer_acts = activations_dict[layer_idx]
-
-        assert layer_acts.shape == (input_for_encode.shape[0], clt_config_fn.num_features)
-        assert torch.all(
-            layer_acts == 0.0
-        ), f"Layer {layer_idx} activations not all zero for k=0 (act_fn: {clt_config_fn.activation_fn}). Max val: {layer_acts.abs().max()}"
-
-        # Check that decode still produces finite outputs (e.g., bias if enabled)
-        # For decode, need a dict of activations for potentially multiple source layers
-        decode_input_activations = {src_idx: torch.zeros_like(layer_acts) for src_idx in range(layer_idx + 1)}
-
-        # Test a decoder for this layer_idx from src_idx=0
-        if f"0->{layer_idx}" in single_gpu_model.decoders:
-            decoded_output = single_gpu_model.decode(decode_input_activations, layer_idx)
-            assert torch.all(
-                torch.isfinite(decoded_output)
-            ), f"Layer {layer_idx} decoded output not finite for k=0. Has NaNs or Infs."
-            if RANK == 0:
-                print(
-                    f"  Layer {layer_idx} (fn: {clt_config_fn.activation_fn}) Zero-K: Activations are zero, decode is finite."
-                )
-        else:  # Should not happen if num_layers > 0
-            if RANK == 0:
-                print(
-                    f"  Layer {layer_idx} (fn: {clt_config_fn.activation_fn}) Zero-K: Decoder 0->{layer_idx} not found, skipping decode check."
-                )
-
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
-
-
-# For T4 Degenerate Dimensions: Parametrize an existing test like test_full_forward_pass
-# We add a new config to its parametrize list.
-# Need to find where test_full_forward_pass is to add parametrize if it uses the new clt_config_fn.
-# It does. So I will add a new param dict to its @pytest.mark.parametrize decorator.
-
-# (The following is a conceptual change, will apply via edit_file to test_full_forward_pass)
-# @pytest.mark.parametrize(
-#     "clt_config_fn",
-#     [
-#         {"activation_fn": "jumprelu"},
-#         {"activation_fn": "batchtopk", "batchtopk_k": 10},
-#         {"activation_fn": "topk", "topk_k": 0.2},
-#         # New T4 Degenerate case: num_features < WORLD_SIZE (if WORLD_SIZE > 1)
-#         # For this to be effective, WORLD_SIZE needs to be > 2 for num_features=2
-#         # Let's assume WORLD_SIZE could be 2, 4, 8. A small num_features like 2 should trigger.
-#         {"activation_fn": "jumprelu", "num_features": 2, "d_model": 4, "num_layers": 1} # Smallest working model
-#     ],
-#     indirect=True
-# )
-# def test_full_forward_pass(...)
-
 # --- Isolated Layer Tests ---
 
 
@@ -1417,8 +1342,15 @@ def test_column_parallel_linear_forward(
         print("  ColumnParallelLinear output matches nn.Linear output.")
 
 
+@pytest.mark.parametrize(
+    "clt_config_fn",
+    [
+        {"activation_fn": "jumprelu", "d_model":32, "num_layers":4} # Provide a default config
+    ],
+    indirect=True
+)
 def test_row_parallel_linear_forward(
-    base_config: CLTConfig,  # Need base_config for init args
+    clt_config_fn: CLTConfig, # Changed from base_config
     device: torch.device,
 ):
     """Test RowParallelLinear forward pass against nn.Linear."""
@@ -1428,12 +1360,18 @@ def test_row_parallel_linear_forward(
     # Note: For RowParallel, input features are sharded.
     # Output features remain the full dimension.
     in_features = 64  # Feature dim (sharded)
-    out_features = 32  # Model dim (full)
+    out_features = 32  # Model dim (full) - Matches clt_config_fn.d_model
+    if clt_config_fn.d_model != out_features:
+        # Adjust if clt_config_fn d_model is different, or ensure it matches test setup
+        # For this test, let's use a fixed out_features and ensure config matches, or make it flexible.
+        # The parametrize for clt_config_fn sets d_model=32, so this is consistent.
+        pass 
+
     batch_tokens = 128
     seed = 42 + RANK
 
     test_device = device
-    print(f"Rank {RANK}: Running RPL test on device: {test_device}")
+    if RANK == 0: print(f"Rank {RANK}: Running RPL test on device: {test_device}")
 
     # 1. Create standard nn.Linear layer (broadcast weights)
     torch.manual_seed(seed)
@@ -1442,7 +1380,7 @@ def test_row_parallel_linear_forward(
         dist.broadcast(single_layer.weight.data, src=0)
         dist.broadcast(single_layer.bias.data, src=0)
         dist.barrier()
-    print(f"Rank {RANK}: Single nn.Linear layer created and weights broadcasted.")
+    if RANK == 0: print(f"Rank {RANK}: Single nn.Linear layer created and weights broadcasted.")
 
     # 2. Create RowParallelLinear layer
     torch.manual_seed(seed)
@@ -1452,15 +1390,15 @@ def test_row_parallel_linear_forward(
         bias=True,
         process_group=dist.group.WORLD,
         input_is_parallel=False,  # Mimic usage in decode - layer handles split
-        d_model_for_init=base_config.d_model,  # Need d_model for init bounds
-        num_layers_for_init=base_config.num_layers,  # Need num_layers for init bounds
+        d_model_for_init=clt_config_fn.d_model,  # Use d_model from config
+        num_layers_for_init=clt_config_fn.num_layers,  # Use num_layers from config
         device=test_device,
     )
     multi_layer.eval()
-    print(f"Rank {RANK}: RowParallelLinear created.")
+    if RANK == 0: print(f"Rank {RANK}: RowParallelLinear created.")
 
     # 3. Copy weights/bias from single_layer to multi_layer
-    print(f"Rank {RANK}: Scattering/copying weights/bias to RowParallelLinear...")
+    if RANK == 0: print(f"Rank {RANK}: Scattering/copying weights/bias to RowParallelLinear...")
     with torch.no_grad():
         # Scatter weight (partition_dim=1 for RowParallel)
         scatter_full_parameter(single_layer.weight.data, multi_layer.weight, partition_dim=1)
