@@ -381,12 +381,6 @@ def parse_args():
         if not args.activation_path:
             parser.error("--activation-path is required when --activation-source is 'local_manifest'")
 
-    if args.activation_fn == "batchtopk":
-        if (args.batchtopk_k is None and args.batchtopk_frac is None) or (
-            args.batchtopk_k is not None and args.batchtopk_frac is not None
-        ):
-            parser.error("For BatchTopK, exactly one of --batchtopk-k or --batchtopk-frac must be specified.")
-
     return args
 
 
@@ -442,7 +436,6 @@ def main():
         activation_fn=args.activation_fn,
         jumprelu_threshold=args.jumprelu_threshold,
         batchtopk_k=args.batchtopk_k,
-        batchtopk_frac=args.batchtopk_frac,
         batchtopk_straight_through=(not args.disable_batchtopk_straight_through),
         clt_dtype=args.clt_dtype,
     )
@@ -477,8 +470,6 @@ def main():
             name_parts.append("batchtopk")
             if args.batchtopk_k is not None:
                 name_parts.append(f"k{args.batchtopk_k}")
-            elif args.batchtopk_frac is not None:
-                name_parts.append(f"kfrac{args.batchtopk_frac:.3f}")  # Format frac to 3 decimal places
         else:  # jumprelu or relu
             name_parts.append(args.activation_fn)
             name_parts.append(f"{args.sparsity_lambda:.1e}-slambda")

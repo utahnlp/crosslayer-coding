@@ -87,7 +87,7 @@ gpt2_d_model = 768
 expansion_factor = 32
 
 # Recommended sparsity fraction for BatchTopK
-batchtopk_sparsity_fraction = 0.002  # Keep top 0.2% (590 with expansion factor 32) of features across all layers
+batchtopk_k = 200
 
 
 # For the tutorial, let's use a smaller number of features than d_model
@@ -97,8 +97,7 @@ clt_config = CLTConfig(
     num_layers=gpt2_num_layers,  # Must match the base model
     d_model=gpt2_d_model,  # Must match the base model
     activation_fn="batchtopk",  # As described in the paper
-    batchtopk_k=None,  # Specify k or frac
-    batchtopk_frac=batchtopk_sparsity_fraction,  # Keep top 2% features globally
+    batchtopk_k=200,  # Specify k or frac
     batchtopk_straight_through=True,  # Use STE for gradients
     clt_dtype="float32",
     # jumprelu_threshold=0.2

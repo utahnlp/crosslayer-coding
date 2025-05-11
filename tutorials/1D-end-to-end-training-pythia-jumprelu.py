@@ -146,6 +146,7 @@ wdb_run_name = (
     f"jumprelu-th{clt_config.jumprelu_threshold}-"  # Indicate JumpReLU and threshold
     f"{_batch_size}-batch-"
     f"{_lr:.1e}-lr"
+    f"jumprelu"
 )
 print("\nGenerated WandB run name: " + wdb_run_name)
 
@@ -164,8 +165,7 @@ training_config = TrainingConfig(
     # Normalization
     normalization_method="auto",  # Use pre-calculated stats
     # Loss function coefficients
-    sparsity_lambda=0.01,  # Example value, technical description says it ramps up.
-    # Actual value is less important than the schedule for this tutorial.
+    sparsity_lambda=0.00001,
     sparsity_lambda_schedule="linear",  # As per technical description
     sparsity_c=1.0,  # Standard sparsity penalty parameter
     preactivation_coef=3e-6,  # As per technical description for large runs

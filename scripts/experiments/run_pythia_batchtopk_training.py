@@ -47,7 +47,6 @@ clt_config = CLTConfig(
     d_model=d_model,
     activation_fn="batchtopk",
     batchtopk_k=None,
-    batchtopk_frac=batchtopk_sparsity_fraction,
     batchtopk_straight_through=True,
 )
 print("CLT Configuration (BatchTopK):")
@@ -93,11 +92,9 @@ expected_activation_path = os.path.join(
 
 _lr = 1e-4
 _batch_size = 1024
-_k_frac = clt_config.batchtopk_frac
+_k = clt_config.batchtopk_k
 
-wdb_run_name = (
-    f"{clt_config.num_features}-width-" f"batchtopk-kfrac{_k_frac:.3f}-" f"{_batch_size}-batch-" f"{_lr:.1e}-lr"
-)
+wdb_run_name = f"{clt_config.num_features}-width-" f"batchtopk-k{_k}-" f"{_batch_size}-batch-" f"{_lr:.1e}-lr"
 print("\nGenerated WandB run name: " + wdb_run_name)
 
 training_config = TrainingConfig(

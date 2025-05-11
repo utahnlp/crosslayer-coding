@@ -30,7 +30,6 @@ class ActivationExtractorCLT:
         nnsight_tracer_kwargs: Optional[Dict] = None,
         nnsight_invoker_args: Optional[Dict] = None,
         batchtopk_k: Optional[int] = None,
-        batchtopk_frac: Optional[float] = None,
     ):
         """
         Initializes the ActivationExtractorCLT.
@@ -56,7 +55,6 @@ class ActivationExtractorCLT:
             nnsight_tracer_kwargs: Additional kwargs for nnsight model.trace().
             nnsight_invoker_args: Additional invoker_args for nnsight model.trace().
             batchtopk_k: Optional k parameter for BatchTopK.
-            batchtopk_frac: Optional fraction parameter for BatchTopK.
         """
         self.model_name = model_name
         self.device = device or (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
@@ -71,7 +69,6 @@ class ActivationExtractorCLT:
         # Store BatchTopK params if provided, though not directly used by current extractor logic
         # This is for potential future use or if downstream components expect them via this config path
         self.batchtopk_k = batchtopk_k
-        self.batchtopk_frac = batchtopk_frac
 
         # Tokenizer arguments
         self.tokenizer_args = {
