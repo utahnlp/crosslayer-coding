@@ -367,7 +367,7 @@ class LossManager:
 
         # Compute auxiliary loss (only if configured and using BatchTopK)
         aux_loss = torch.tensor(0.0, device=reconstruction_loss.device)
-        if model.config.activation_fn == "batchtopk":
+        if model.config.activation_fn == "batchtopk" or model.config.activation_fn == "topk":
             aux_loss = self.compute_auxiliary_loss(model, inputs, residuals, dead_neuron_mask)
 
         # Compute total loss

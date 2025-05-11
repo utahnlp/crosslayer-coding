@@ -1,6 +1,6 @@
 import json
 from dataclasses import dataclass, field
-from typing import Literal, Optional, Dict, Any, TypeVar, Type
+from typing import Literal, Optional, Dict, Any, TypeVar, Type, List
 
 
 # Generic type for Config subclasses
@@ -18,18 +18,22 @@ class CLTConfig:
     normalization_method: Literal["auto", "estimated_mean_std", "none"] = (
         "none"  # How activations were normalized during training
     )
-    activation_fn: Literal["jumprelu", "relu", "batchtopk"] = "jumprelu"
+    activation_fn: Literal["jumprelu", "relu", "batchtopk", "topk"] = "jumprelu"
     jumprelu_threshold: float = 0.03  # Threshold for JumpReLU activation
     # BatchTopK parameters
-    batchtopk_k: Optional[int] = None  # Absolute k for BatchTopK
-    batchtopk_frac: Optional[float] = None  # Fraction of features to keep for BatchTopK
+    batchtopk_k: Optional[int] = None  # Absolute k for BatchTopK (per token)
     batchtopk_straight_through: bool = True  # Whether to use straight-through estimator for BatchTopK
+    # TopK parameters (new)
+    topk_k: Optional[float] = None  # Number or fraction of features to keep per token for TopK.
+    # If < 1, treated as fraction. If >= 1, treated as int count.
+    topk_straight_through: bool = True  # Whether to use straight-through estimator for TopK.
     clt_dtype: Optional[str] = None  # Optional dtype for the CLT model itself (e.g., "float16")
     expected_input_dtype: Optional[str] = None  # Expected dtype of input activations
     mlp_input_template: Optional[str] = None  # Module path template for MLP input activations
     mlp_output_template: Optional[str] = None  # Module path template for MLP output activations
     tl_input_template: Optional[str] = None  # TransformerLens hook point pattern before MLP
     tl_output_template: Optional[str] = None  # TransformerLens hook point pattern after MLP
+    # context_size: Optional[int] = None
 
     def __post_init__(self):
         """Validate configuration parameters."""
@@ -41,20 +45,22 @@ class CLTConfig:
         assert (
             self.normalization_method in valid_norm_methods
         ), f"Invalid normalization_method: {self.normalization_method}. Must be one of {valid_norm_methods}"
-        valid_activation_fns = ["jumprelu", "relu", "batchtopk"]
+        valid_activation_fns = ["jumprelu", "relu", "batchtopk", "topk"]
         assert (
             self.activation_fn in valid_activation_fns
         ), f"Invalid activation_fn: {self.activation_fn}. Must be one of {valid_activation_fns}"
 
         if self.activation_fn == "batchtopk":
-            if self.batchtopk_k is not None and self.batchtopk_frac is not None:
-                raise ValueError("Only one of batchtopk_k or batchtopk_frac can be specified.")
-            if self.batchtopk_k is None and self.batchtopk_frac is None:
-                raise ValueError("One of batchtopk_k or batchtopk_frac must be specified for BatchTopK.")
+            if self.batchtopk_k is None:
+                raise ValueError("batchtopk_k must be specified for BatchTopK.")
             if self.batchtopk_k is not None and self.batchtopk_k <= 0:
                 raise ValueError("batchtopk_k must be positive.")
-            if self.batchtopk_frac is not None and not (0 < self.batchtopk_frac <= 1):
-                raise ValueError("batchtopk_frac must be between 0 (exclusive) and 1 (inclusive).")
+
+        if self.activation_fn == "topk":
+            if self.topk_k is None:
+                raise ValueError("topk_k must be specified for TopK activation function.")
+            if self.topk_k is not None and self.topk_k <= 0:
+                raise ValueError("topk_k must be positive if specified.")
 
     @classmethod
     def from_json(cls: Type[C], json_path: str) -> C:
@@ -103,12 +109,9 @@ class TrainingConfig:
     normalization_estimation_batches: int = 50  # Batches for normalization estimation
 
     # --- Activation Store Source --- #
-    activation_source: Literal["generate", "local_manifest", "remote"] = "generate"
+    activation_source: Literal["local_manifest", "remote"] = "local_manifest"
     activation_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"
 
-    # Config for "generate" source (on-the-fly)
-    generation_config: Optional[Dict[str, Any]] = None  # Dict matching ActivationConfig fields needed for extractor
-    dataset_params: Optional[Dict[str, Any]] = None  # Dict matching dataset fields for stream_activations
     # Config for "local_manifest" source (pre-generated with manifest)
     activation_path: Optional[str] = None  # Path to pre-generated activation dataset directory (containing index.bin)
     # Config for "remote" source
@@ -162,6 +165,17 @@ class TrainingConfig:
     # Default theta for BatchTopK to JumpReLU conversion for never-activated features
     jumprelu_default_theta_on_convert: float = 1e6
 
+    # --- Fields ADDED from clt/config.py ---
+    # reconstruction_loss_weight: float = 1.0
+    # sparsity_loss_type: Literal["l1_norm_std", "l1_tanh_norm_std"] = "l1_tanh_norm_std"
+    # sparsity_warmup_steps: Optional[int] = None
+    # dead_feature_penalty_lambda: float = 0.0
+    # log_dir: Optional[str] = None
+    # distributed: bool = False
+    # generation_config: Optional[Dict[str, Any]] = None  # For 'generate' activation_source
+    # dataset_params: Optional[Dict[str, Any]] = None  # For 'generate' activation_source
+    # activation_config: Optional[Dict[str, Any]] = None  # For models trained on pre-generated acts
+
     def __post_init__(self):
         """Validate training parameters."""
         assert self.learning_rate > 0, "Learning rate must be positive"
@@ -172,17 +186,7 @@ class TrainingConfig:
         assert self.dead_feature_window > 0, "Dead feature window must be positive"
 
         # Validate activation source configuration
-        if self.activation_source == "generate":
-            assert (
-                self.generation_config is not None
-            ), "generation_config dict must be provided when activation_source is 'generate'"
-            assert (
-                self.dataset_params is not None
-            ), "dataset_params dict must be provided when activation_source is 'generate'"
-            # Basic check for essential keys in the dicts (can be expanded)
-            assert "model_name" in self.generation_config, "generation_config missing 'model_name'"
-            assert "dataset_path" in self.dataset_params, "dataset_params missing 'dataset_path'"
-        elif self.activation_source == "local_manifest":
+        if self.activation_source == "local_manifest":
             assert (
                 self.activation_path is not None
             ), "activation_path must be specified when activation_source is 'local_manifest'"
@@ -193,6 +197,8 @@ class TrainingConfig:
             assert (
                 "server_url" in self.remote_config and "dataset_id" in self.remote_config
             ), "remote_config must contain 'server_url' and 'dataset_id'"
+        elif self.activation_source not in ["local_manifest", "remote"]:
+            raise ValueError(f"Unsupported activation_source: {self.activation_source}")
 
         # Validate sampling strategy
         assert self.sampling_strategy in [
@@ -206,3 +212,45 @@ class TrainingConfig:
             assert (
                 0.0 <= self.sparsity_lambda_delay_frac < 1.0
             ), "sparsity_lambda_delay_frac must be between 0.0 (inclusive) and 1.0 (exclusive)"
+
+
+@dataclass
+class InferenceConfig:
+    """Configuration for CLT inference/evaluation using a trained model."""
+
+    clt_checkpoint_path: str  # Path to the .pt CLT model checkpoint or sharded checkpoint directory
+    # data_path can be a manifest.json, a directory of .pt files, or path to Streaming/Remote config for eval
+    data_path: str
+    eval_batch_size_tokens: int = 4096
+    max_eval_batches: Optional[int] = None  # Limit number of batches for evaluation
+    device: Optional[str] = None  # "cuda", "cpu", "mps"
+    output_log_dir: str = "clt_inference_results"
+    # If data_path is for Streaming/Remote, these configs are needed:
+    data_source_type: Literal["local_manifest", "generate_from_hf", "remote_server"] = "local_manifest"
+    # For generate_from_hf
+    generation_config_path: Optional[str] = (
+        None  # Path to a YAML/JSON file with generation_config for ActivationExtractorCLT
+    )
+    dataset_params_path: Optional[str] = (
+        None  # Path to a YAML/JSON file with dataset_params for extractor.stream_activations
+    )
+    # For remote_server
+    remote_server_config_path: Optional[str] = None  # Path to YAML/JSON with remote_config (server_url, dataset_id etc)
+
+    activation_dtype: Optional[str] = "float16"  # Dtype for activations from store, e.g. float16, bfloat16, float32
+    normalization_method: Literal["none", "loaded_mean_std"] = "loaded_mean_std"  # For eval, usually use loaded or none
+
+    # WandB options for logging evaluation results
+    enable_wandb: bool = False
+    wandb_project: Optional[str] = "clt_evaluation"
+    wandb_entity: Optional[str] = None
+    wandb_run_name: Optional[str] = None
+    wandb_tags: Optional[List[str]] = field(default_factory=list)
+
+    # Optional: If evaluating a specific model name for context in WandB
+    model_name_for_wandb: Optional[str] = None
+
+    # If using sharded model, world_size for reconstructing model state
+    # For non-sharded models or if CLTConfig contains TP info, this might not be needed or can be 1.
+    # Primarily for loading a sharded model checkpoint into a non-distributed InferenceRunner.
+    model_world_size_for_load: int = 1

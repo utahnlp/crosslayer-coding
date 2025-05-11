@@ -86,8 +86,9 @@ gpt2_num_layers = 12
 gpt2_d_model = 768
 expansion_factor = 32
 
-# Recommended sparsity fraction for BatchTopK (from the other tutorial)
-batchtopk_sparsity_fraction = 0.002
+# Recommended sparsity fraction for BatchTopK
+batchtopk_k = 200
+
 
 # For the tutorial, let's use a smaller number of features than d_model
 clt_num_features = gpt2_d_model * expansion_factor
@@ -95,12 +96,11 @@ clt_config = CLTConfig(
     num_features=clt_num_features,
     num_layers=gpt2_num_layers,  # Must match the base model
     d_model=gpt2_d_model,  # Must match the base model
-    activation_fn="batchtopk",  # Changed from "relu"
-    batchtopk_k=None,  # Specify k or frac
-    batchtopk_frac=batchtopk_sparsity_fraction,  # Keep top fraction features globally
+    activation_fn="batchtopk",  # As described in the paper
+    batchtopk_k=200,  # Specify k or frac
     batchtopk_straight_through=True,  # Use STE for gradients
     clt_dtype="float32",
-    # jumprelu_threshold removed as it's not used with batchtopk
+    # jumprelu_threshold=0.2
 )
 print("CLT Configuration:")
 print(clt_config)
@@ -108,13 +108,13 @@ print(clt_config)
 # --- Activation Generation Configuration ---
 # Define where activations will be stored and how they should be generated
 # Use a small number of target tokens for the tutorial
-activation_dir = "./tutorial_activations_local_1M_mlp_only"
+activation_dir = "./tutorial_activations_local_1M"
 # Fix SyntaxError: remove parenthesis around string assignment
 dataset_name = "monology/pile-uncopyrighted"  # "NeelNanda/pile-10k" is smaller if needed
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
-    mlp_input_module_path_template="transformer.h.{}.mlp.input",  # We don't include the layernorm here
+    mlp_input_module_path_template="transformer.h.{}.ln_2.input",  # We include the layernorm for linearity
     mlp_output_module_path_template="transformer.h.{}.mlp.output",  # Default for GPT2
     model_dtype=None,  # Use default precision
     # Dataset Source
@@ -160,7 +160,7 @@ expected_activation_path = os.path.join(
 # Values needed for the name (replace with actual config values if different)
 _lr = 1e-4
 _batch_size = 1024
-_sparsity_lambda = 0.0001  # Adjusted to match other tutorial for naming consistency
+_sparsity_lambda = 0.0001
 _sparsity_c = 0.1
 
 wdb_run_name = (
@@ -185,15 +185,15 @@ training_config = TrainingConfig(
     train_batch_size_tokens=_batch_size,
     sampling_strategy="sequential",
     # Normalization for training (use stored stats)
-    normalization_method="auto",  # Changed from "none"
+    normalization_method="auto",  # Use stats from norm_stats.json generated earlier
     # Loss function coefficients
-    sparsity_lambda=0,  # Changed from _sparsity_lambda
+    sparsity_lambda=0,
     sparsity_lambda_schedule="linear",
     # sparsity_lambda_delay_frac=0.10,
-    sparsity_c=0,  # Changed from _sparsity_c
-    preactivation_coef=0,  # Changed from 3e-6
-    aux_loss_factor=1 / 32,  # Added AuxK loss
-    apply_sparsity_penalty_to_batchtopk=False,  # Added to disable standard sparsity for BatchTopK
+    sparsity_c=0,
+    preactivation_coef=0,
+    aux_loss_factor=1 / 32,  # Enable AuxK loss with typical factor from paper
+    apply_sparsity_penalty_to_batchtopk=False,  # Ensure standard sparsity penalty is off for BatchTopK
     # Optimizer & Scheduler
     optimizer="adamw",
     lr_scheduler="linear_final20",
@@ -202,7 +202,7 @@ training_config = TrainingConfig(
     log_interval=10,
     eval_interval=50,
     checkpoint_interval=100,
-    dead_feature_window=500,  # Changed from 200
+    dead_feature_window=500,  # Reduced window for tutorial
     # WandB (Optional)
     enable_wandb=True,
     wandb_project="clt-tutorial-gpt2",
@@ -343,11 +343,8 @@ loaded_clt_config = CLTConfig(
     num_features=clt_config.num_features,  # Use the same params
     num_layers=clt_config.num_layers,
     d_model=clt_config.d_model,
-    activation_fn=clt_config.activation_fn,  # Should now be batchtopk
-    batchtopk_k=clt_config.batchtopk_k,  # Added
-    batchtopk_frac=clt_config.batchtopk_frac,  # Added
-    batchtopk_straight_through=clt_config.batchtopk_straight_through,  # Added
-    # jumprelu_threshold is removed from clt_config, so no need to load it
+    activation_fn=clt_config.activation_fn,
+    jumprelu_threshold=clt_config.jumprelu_threshold,
 )
 
 # 2. Load the model structure and state dict

@@ -25,7 +25,8 @@ import random  # For jitter
 import requests  # <-- Add import for requests
 
 # Import BaseActivationStore from the original data module
-from .data import BaseActivationStore
+# from .data import BaseActivationStore # Old import
+from .base_store import BaseActivationStore  # New import
 
 logger = logging.getLogger(__name__)
 
@@ -518,7 +519,9 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                             + 1e-6
                         )
                     except (ValueError, TypeError) as e:
-                        # logger.warning(f"Layer {layer_idx} input mean/std failed tensor conversion: {e}. Disabling normalization.")
+                        logger.warning(
+                            f"Layer {layer_idx} input mean/std failed tensor conversion: {e}. Disabling normalization."
+                        )
                         self.apply_normalization = False
                         break  # Exit loop
 
@@ -561,7 +564,9 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                             + 1e-6
                         )
                     except (ValueError, TypeError) as e:
-                        # logger.warning(f"Layer {layer_idx} target mean/std failed tensor conversion: {e}. Disabling normalization.")
+                        logger.warning(
+                            f"Layer {layer_idx} target mean/std failed tensor conversion: {e}. Disabling normalization."
+                        )
                         self.apply_normalization = False
                         break  # Exit loop
 

@@ -8,86 +8,18 @@ import torch.distributed as dist
 from clt.config import CLTConfig
 from clt.models.base import BaseTranscoder
 from clt.models.parallel import ColumnParallelLinear, RowParallelLinear  # Import parallel layers
-from clt.models.activations import BatchTopK  # Import BatchTopK
+from clt.models.activations import BatchTopK, JumpReLU, TokenTopK  # Import BatchTopK, JumpReLU and TokenTopK
+
+# Import the new encoding helper functions
+from clt.models.encoding import get_preactivations as _get_preactivations_helper
+from clt.models.encoding import _encode_all_layers as _encode_all_layers_helper
+from clt.models.encoding import _apply_batch_topk as _apply_batch_topk_helper
+from clt.models.encoding import _apply_token_topk as _apply_token_topk_helper
 
 from torch.distributed import ProcessGroup
 
 # Configure logging (or use existing logger if available)
 logger = logging.getLogger(__name__)
-
-
-class JumpReLU(torch.autograd.Function):
-    """Custom JumpReLU activation function with straight-through gradient estimator."""
-
-    @staticmethod
-    def forward(ctx, input: torch.Tensor, threshold: torch.Tensor, bandwidth: float) -> torch.Tensor:
-        """Forward pass of JumpReLU activation.
-
-        Args:
-            input: Input tensor
-            threshold: Activation threshold tensor (can be scalar or per-feature)
-            bandwidth: Bandwidth parameter for straight-through estimator
-
-        Returns:
-            Output tensor with JumpReLU applied
-        """
-        ctx.save_for_backward(input, threshold)
-        ctx.bandwidth = bandwidth
-
-        # JumpReLU: 0 if x < threshold, x if x >= threshold
-        return (input >= threshold).float() * input
-
-    @staticmethod
-    def backward(ctx, *grad_outputs: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], None]:
-        """Backward pass with straight-through gradient estimator.
-
-        Performs calculations in the original tensor dtypes.
-
-        Args:
-            grad_outputs: Gradient(s) from subsequent layer(s)
-
-        Returns:
-            Gradients for input, threshold, and None for bandwidth.
-        """
-        grad_output = grad_outputs[0]  # Unpack the primary gradient
-        input, threshold = ctx.saved_tensors
-        bandwidth = ctx.bandwidth
-        # Check which inputs need gradients
-        needs_input_grad, needs_threshold_grad, _ = ctx.needs_input_grad
-
-        grad_input = None
-        grad_threshold = None
-
-        # 1. Gradient for input (Straight-through estimator)
-        #    We want gradients to flow for **all** active units (input >= threshold),
-        #    not only those in a narrow band.  This follows the usual STE treatment
-        #    and avoids vanishing gradients for strongly active features.
-        if needs_input_grad:
-            ste_mask = (input >= threshold).type_as(grad_output)
-            grad_input = grad_output * ste_mask
-
-        # 2. Gradient for threshold
-        if needs_threshold_grad:
-            # Keep a narrow window around the threshold for a smooth surrogate
-            is_near_threshold = torch.abs(input - threshold) <= (bandwidth / 2.0)
-            local_grad_theta = (-input / bandwidth) * is_near_threshold.type_as(input)
-            grad_threshold_per_element = grad_output * local_grad_theta
-
-            # Sum gradients across non-feature dimensions if threshold is per-feature
-            # This assumes threshold might be broadcasted to match input shape
-            if grad_threshold_per_element.dim() > threshold.dim():
-                dims_to_sum = tuple(range(grad_threshold_per_element.dim() - threshold.dim()))
-                grad_threshold = grad_threshold_per_element.sum(dim=dims_to_sum)
-                # Ensure shape matches original threshold shape if it wasn't originally scalar
-                if threshold.shape != torch.Size([]):
-                    grad_threshold = grad_threshold.reshape(threshold.shape)
-            else:
-                # If threshold was scalar, sum everything
-                grad_threshold = grad_threshold_per_element.sum()
-
-        # Return gradients corresponding to the inputs of forward
-        # (input, threshold, bandwidth)
-        return grad_input, grad_threshold, None
 
 
 class CrossLayerTranscoder(BaseTranscoder):
@@ -186,6 +118,33 @@ class CrossLayerTranscoder(BaseTranscoder):
                 f"CLT TP model initialized on rank {self.rank} with dtype {self.dtype} " f"(device not specified yet)"
             )
 
+    def _get_current_op_device_dtype(self, x_sample: Optional[torch.Tensor] = None) -> Tuple[torch.device, torch.dtype]:
+        """Resolves the device and dtype for an operation.
+        Prioitizes self.device and self.dtype if set, otherwise infers from x_sample or defaults.
+        """
+        current_op_device = self.device
+        current_op_dtype = self.dtype  # Should be set by _resolve_dtype in __init__
+
+        if current_op_device is None:
+            if x_sample is not None and x_sample.numel() > 0:
+                current_op_device = x_sample.device
+            else:
+                # Fallback if model device is None and no sample tensor provided
+                current_op_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                # Log this fallback if it happens outside of initial self.device setting
+                # However, self.device should ideally be set by get_feature_activations if initially None.
+
+        # self.dtype should always be valid after __init__ due to _resolve_dtype.
+        # If it were somehow None, a fallback would be needed:
+        if current_op_dtype is None:  # Defensive coding, should ideally not be reached.
+            if x_sample is not None and x_sample.numel() > 0 and isinstance(x_sample.dtype, torch.dtype):
+                current_op_dtype = x_sample.dtype
+            else:
+                current_op_dtype = torch.float32
+            logger.warning(f"Rank {self.rank}: CLT self.dtype was unexpectedly None. Defaulting to {current_op_dtype}.")
+
+        return current_op_device, current_op_dtype
+
     def _resolve_dtype(self, dtype_input: Optional[Union[str, torch.dtype]]) -> torch.dtype:
         """Converts string dtype names to torch.dtype objects, defaulting to float32."""
         if isinstance(dtype_input, torch.dtype):
@@ -223,116 +182,68 @@ class CrossLayerTranscoder(BaseTranscoder):
 
     def get_preactivations(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Get pre-activation values (full tensor) for features at the specified layer."""
-        result: Optional[torch.Tensor] = None
-        fallback_shape: Optional[Tuple[int, int]] = None
+        # Resolve device and dtype for this operation, similar to encode()
+        # current_op_device = self.device
+        # current_op_dtype = self.dtype
 
-        try:
-            # 1. Check input shape and reshape if necessary
-            if x.dim() == 2:
-                input_for_linear = x
-            elif x.dim() == 3:
-                batch, seq_len, d_model = x.shape
-                if d_model != self.config.d_model:
-                    # Handle d_model mismatch early
-                    logger.warning(
-                        f"Rank {self.rank}: Input d_model {d_model} != config {self.config.d_model} layer {layer_idx}"
-                    )
-                    fallback_shape = (batch * seq_len, self.config.num_features)
-                else:
-                    input_for_linear = x.reshape(-1, d_model)
-            else:
-                logger.warning(
-                    f"Rank {self.rank}: Cannot handle input shape {x.shape} for preactivations layer {layer_idx}"
-                )
-                fallback_shape = (0, self.config.num_features)
+        # if current_op_device is None:
+        #     current_op_device = x.device if x.numel() > 0 else torch.device("cpu")
+        # if current_op_dtype is None:
+        #     current_op_dtype = x.dtype if x.numel() > 0 and isinstance(x.dtype, torch.dtype) else torch.float32
+        current_op_device, current_op_dtype = self._get_current_op_device_dtype(x)
 
-            # 2. Check d_model match if not already done
-            if fallback_shape is None and input_for_linear.shape[1] != self.config.d_model:
-                logger.warning(
-                    f"Rank {self.rank}: Input d_model {input_for_linear.shape[1]} != config {self.config.d_model} layer {layer_idx}"
-                )
-                fallback_shape = (input_for_linear.shape[0], self.config.num_features)
+        # Ensure input is on the correct device and dtype before passing to helper
+        x_processed = x.to(device=current_op_device, dtype=current_op_dtype)
 
-            # 3. Proceed if no errors so far
-            if fallback_shape is None:
-                # Explicitly cast the output of the parallel linear layer
-                result = cast(torch.Tensor, self.encoders[layer_idx](input_for_linear))
-
-        except IndexError:
-            logger.error(f"Rank {self.rank}: Invalid layer index {layer_idx} requested for encoder.")
-            fallback_batch_dim = x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1] if x.dim() == 3 else 0
-            fallback_shape = (fallback_batch_dim, self.config.num_features)
-        except Exception as e:
-            logger.error(f"Rank {self.rank}: Error during get_preactivations layer {layer_idx}: {e}", exc_info=True)
-            fallback_batch_dim = x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1] if x.dim() == 3 else 0
-            fallback_shape = (fallback_batch_dim, self.config.num_features)
-
-        # 4. Return result or fallback tensor
-        if result is not None:
-            return result
-        else:
-            # Ensure fallback_shape is defined if result is None
-            if fallback_shape is None:
-                # This case should ideally not happen if logic above is correct
-                logger.error(
-                    f"Rank {self.rank}: Fallback shape not determined for layer {layer_idx}, returning empty tensor."
-                )
-                fallback_shape = (0, self.config.num_features)
-            return torch.zeros(fallback_shape, device=self.device, dtype=self.dtype)
+        return _get_preactivations_helper(
+            x_processed,
+            layer_idx,
+            self.config,
+            self.encoders,
+            current_op_device,
+            current_op_dtype,
+            self.rank,
+        )
 
     def _encode_all_layers(
         self, inputs: Dict[int, torch.Tensor]
     ) -> Tuple[Dict[int, torch.Tensor], List[Tuple[int, int, int]], torch.device, torch.dtype]:
         """Encodes inputs for all layers and returns pre-activations and original shape info."""
-        preactivations_dict = {}
-        original_shapes_info: List[Tuple[int, int, int]] = []  # layer_idx, batch_size, seq_len
-        device = self.device
-        dtype = self.dtype
+        # Determine effective device and dtype for this batch, inferring if necessary
+        effective_device = self.device
+        effective_dtype = self.dtype
 
-        # Attempt to infer device and dtype from the first available input tensor if model defaults are None
-        # This is a fallback if the model was initialized without an explicit device/dtype.
-        if device is None or dtype is None:
+        if effective_device is None or effective_dtype is None:
             first_input_tensor = next((t for t in inputs.values() if t.numel() > 0), None)
             if first_input_tensor is not None:
-                if device is None:
-                    device = first_input_tensor.device
-                if dtype is None:
-                    # Try to match a torch.dtype or use float32
-                    # This part could be more robust if inputs might have various dtypes
-                    dtype = (
+                if effective_device is None:
+                    effective_device = first_input_tensor.device
+                if effective_dtype is None:
+                    effective_dtype = (
                         first_input_tensor.dtype if isinstance(first_input_tensor.dtype, torch.dtype) else torch.float32
                     )
             else:  # No valid inputs to infer from, and model device/dtype are None
-                # This case implies an issue with model init or empty inputs
-                # Defaulting to CPU/float32 here might hide problems, but avoids immediate crash
-                if device is None:
-                    device = torch.device("cpu")
-                if dtype is None:
-                    dtype = torch.float32
+                if effective_device is None:
+                    effective_device = torch.device("cpu")
+                if effective_dtype is None:
+                    effective_dtype = torch.float32
                 logger.warning(
-                    f"Rank {self.rank}: Could not infer device/dtype from inputs for _encode_all_layers, and model defaults are None. Using {device}/{dtype}."
+                    f"Rank {self.rank}: Could not infer device/dtype from inputs for _encode_all_layers, "
+                    f"and model defaults are None. Using {effective_device}/{effective_dtype}."
                 )
 
+        # Ensure all input tensors are on the determined effective device and dtype
+        processed_inputs: Dict[int, torch.Tensor] = {}
         for layer_idx, x_orig in inputs.items():
-            # Ensure x is on the determined/inferred device and dtype for processing
-            x = x_orig.to(device=device, dtype=dtype)
+            processed_inputs[layer_idx] = x_orig.to(device=effective_device, dtype=effective_dtype)
 
-            # Store original shape info if 3D
-            if x.dim() == 3:
-                batch_size, seq_len, _ = x.shape
-                original_shapes_info.append((layer_idx, batch_size, seq_len))
-            elif x.dim() == 2:
-                # For 2D, seq_len is implicitly 1 for reshaping purposes
-                batch_size, _ = x.shape
-                original_shapes_info.append((layer_idx, batch_size, 1))
-            # else: # Should we handle other dims or assume they are errors caught by get_preactivations?
-            # For now, assume get_preactivations will handle or warn about unexpected dims.
-
-            preact = self.get_preactivations(x, layer_idx)
-            preactivations_dict[layer_idx] = preact
-            # Device and dtype should now be consistently from `device` and `dtype` determined above
-
-        return preactivations_dict, original_shapes_info, device, dtype
+        # Call the helper function with processed inputs and determined device/dtype
+        # The helper returns the device and dtype it operated on, which should match effective_device and effective_dtype
+        preactivations_dict, original_shapes_info, returned_device, returned_dtype = _encode_all_layers_helper(
+            processed_inputs, self.config, self.encoders, effective_device, effective_dtype, self.rank
+        )
+        # The returned_device and returned_dtype from the helper reflect what was used.
+        return preactivations_dict, original_shapes_info, returned_device, returned_dtype
 
     @torch.no_grad()
     def _update_min_selected_preactivations(
@@ -438,101 +349,20 @@ class CrossLayerTranscoder(BaseTranscoder):
     def _apply_batch_topk(
         self,
         preactivations_dict: Dict[int, torch.Tensor],
-        original_shapes_info: List[Tuple[int, int, int]],
         device: torch.device,
         dtype: torch.dtype,
     ) -> Dict[int, torch.Tensor]:
-        """Applies BatchTopK to concatenated pre-activations from all layers."""
-        if not preactivations_dict:
-            return {}
+        """Applies BatchTopK to concatenated pre-activations from all layers by calling the helper."""
+        return _apply_batch_topk_helper(preactivations_dict, self.config, device, dtype, self.rank)
 
-        first_valid_preact = next((p for p in preactivations_dict.values() if p.numel() > 0), None)
-        if first_valid_preact is None:
-            logger.warning(
-                f"Rank {self.rank}: All preactivations are empty in _apply_batch_topk. Returning empty dict."
-            )
-            return {
-                layer_idx: torch.zeros((0, self.config.num_features), device=device, dtype=dtype)
-                for layer_idx in preactivations_dict.keys()
-            }
-
-        batch_tokens_dim = first_valid_preact.shape[0]
-
-        ordered_preactivations_original: List[torch.Tensor] = []
-        ordered_preactivations_normalized: List[torch.Tensor] = []
-        layer_feature_sizes: List[Tuple[int, int]] = []
-
-        for layer_idx in range(self.config.num_layers):
-            if layer_idx in preactivations_dict:
-                preact_orig = preactivations_dict[layer_idx]  # Already on correct device/dtype
-
-                current_num_features = self.config.num_features  # Default
-                if preact_orig.numel() > 0:
-                    current_num_features = preact_orig.shape[1]
-
-                if preact_orig.shape[0] != batch_tokens_dim and preact_orig.numel() > 0:
-                    logger.warning(
-                        f"Rank {self.rank}: Inconsistent batch_tokens dim for layer {layer_idx}. "
-                        f"Expected {batch_tokens_dim}, got {preact_orig.shape[0]}. Using zero tensor."
-                    )
-                    zero_tensor_orig = torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
-                    ordered_preactivations_original.append(zero_tensor_orig)
-                    ordered_preactivations_normalized.append(
-                        torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
-                    )  # Norm of zeros is zeros (or NaN, but zeros is fine for ranking)
-                    layer_feature_sizes.append((layer_idx, current_num_features))
-                elif preact_orig.numel() == 0 and batch_tokens_dim > 0:
-                    zero_tensor_orig = torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
-                    ordered_preactivations_original.append(zero_tensor_orig)
-                    ordered_preactivations_normalized.append(
-                        torch.zeros((batch_tokens_dim, current_num_features), device=device, dtype=dtype)
-                    )
-                    layer_feature_sizes.append((layer_idx, current_num_features))
-                elif preact_orig.numel() > 0:
-                    ordered_preactivations_original.append(preact_orig)
-                    # Normalize preact_orig for ranking (mean and std over token dimension for each feature)
-                    mean = preact_orig.mean(dim=0, keepdim=True)
-                    std = preact_orig.std(dim=0, keepdim=True)
-                    preact_norm = (preact_orig - mean) / (std + 1e-6)  # Add epsilon to std
-                    ordered_preactivations_normalized.append(preact_norm)
-                    layer_feature_sizes.append((layer_idx, preact_orig.shape[1]))
-
-        if not ordered_preactivations_original:
-            logger.warning(
-                f"Rank {self.rank}: No preactivations found for layers 0 to {self.config.num_layers - 1} after filtering. Returning empty dict."
-            )
-            return {}
-
-        concatenated_preactivations_original = torch.cat(ordered_preactivations_original, dim=1)
-        concatenated_preactivations_normalized = torch.cat(ordered_preactivations_normalized, dim=1)
-
-        k_val: float
-        if self.config.batchtopk_k is not None:
-            k_val = float(self.config.batchtopk_k)
-        elif self.config.batchtopk_frac is not None:
-            k_val = self.config.batchtopk_frac
-        else:
-            logger.error(f"Rank {self.rank}: BatchTopK k or frac not specified. Defaulting to keeping all features.")
-            k_val = float(concatenated_preactivations_original.size(1))
-
-        activated_concatenated = BatchTopK.apply(
-            concatenated_preactivations_original,  # Pass original for values and STE path
-            k_val,
-            self.config.batchtopk_straight_through,
-            concatenated_preactivations_normalized,  # Pass normalized for ranking
-        )
-
-        activations_dict: Dict[int, torch.Tensor] = {}
-        current_feature_offset = 0
-
-        for original_layer_idx, num_features_this_layer in layer_feature_sizes:
-            layer_activated_flat = activated_concatenated[
-                :, current_feature_offset : current_feature_offset + num_features_this_layer
-            ]
-            activations_dict[original_layer_idx] = layer_activated_flat
-            current_feature_offset += num_features_this_layer
-
-        return activations_dict
+    def _apply_token_topk(
+        self,
+        preactivations_dict: Dict[int, torch.Tensor],
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Dict[int, torch.Tensor]:
+        """Applies TokenTopK to concatenated pre-activations from all layers by calling the helper."""
+        return _apply_token_topk_helper(preactivations_dict, self.config, device, dtype, self.rank)
 
     def encode(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Encode the input activations at the specified layer.
@@ -548,8 +378,18 @@ class CrossLayerTranscoder(BaseTranscoder):
         Returns:
             Encoded activations after nonlinearity [..., num_features]
         """
+        # Resolve device and dtype for this operation
+        # current_op_device = self.device
+        # current_op_dtype = self.dtype
+
+        # if current_op_device is None:
+        #     current_op_device = x.device if x.numel() > 0 else torch.device("cpu")
+        # if current_op_dtype is None:
+        #     current_op_dtype = x.dtype if x.numel() > 0 and isinstance(x.dtype, torch.dtype) else torch.float32
+        current_op_device, current_op_dtype = self._get_current_op_device_dtype(x)
+
         # Ensure input is on the correct device and dtype
-        x = x.to(device=self.device, dtype=self.dtype)
+        x = x.to(device=current_op_device, dtype=current_op_dtype)
 
         fallback_tensor: Optional[torch.Tensor] = None
         activated: Optional[torch.Tensor] = None
@@ -563,13 +403,13 @@ class CrossLayerTranscoder(BaseTranscoder):
                 logger.warning(f"Rank {self.rank}: Received empty preactivations for encode layer {layer_idx}.")
                 batch_dim = x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1] if x.dim() == 3 else 0
                 fallback_shape = (batch_dim, self.config.num_features)
-                fallback_tensor = torch.zeros(fallback_shape, device=self.device, dtype=self.dtype)
+                fallback_tensor = torch.zeros(fallback_shape, device=current_op_device, dtype=current_op_dtype)
             elif preact.shape[-1] != self.config.num_features:
                 logger.warning(
                     f"Rank {self.rank}: Received invalid preactivations shape {preact.shape} for encode layer {layer_idx}."
                 )
                 fallback_shape = (preact.shape[0], self.config.num_features)  # Try to keep batch dim
-                fallback_tensor = torch.zeros(fallback_shape, device=self.device, dtype=self.dtype)
+                fallback_tensor = torch.zeros(fallback_shape, device=current_op_device, dtype=current_op_dtype)
             else:
                 # Apply activation function to the full preactivation tensor
                 if self.config.activation_fn == "jumprelu":
@@ -584,24 +424,37 @@ class CrossLayerTranscoder(BaseTranscoder):
                     logger.warning(
                         f"Rank {self.rank}: 'encode' called for BatchTopK on layer {layer_idx}. This applies TopK per-layer, not globally. Use 'get_feature_activations' for global BatchTopK."
                     )
-                    k_val_local: float
+                    k_val_local_int: int
                     if self.config.batchtopk_k is not None:
-                        k_val_local = (
-                            float(self.config.batchtopk_k) / self.config.num_layers
-                        )  # Crude approximation for per-layer k
-                        k_val_local = max(1.0, k_val_local)  # Ensure at least 1
-                    elif self.config.batchtopk_frac is not None:
-                        k_val_local = self.config.batchtopk_frac  # Apply frac directly per layer
-                    else:  # Should not happen
-                        k_val_local = float(preact.size(1))
+                        k_val_local_int = int(self.config.batchtopk_k)
+                    else:
+                        k_val_local_int = preact.size(1)
 
-                    activated = BatchTopK.apply(preact, k_val_local, self.config.batchtopk_straight_through)
+                    activated = BatchTopK.apply(preact, float(k_val_local_int), self.config.batchtopk_straight_through)
+
+                elif self.config.activation_fn == "topk":  # Added handling for 'topk'
+                    logger.warning(
+                        f"Rank {self.rank}: 'encode' called for TopK on layer {layer_idx}. This applies TopK per-layer, not globally. Use 'get_feature_activations' for global TopK."
+                    )
+                    k_val_local_float: float
+                    if hasattr(self.config, "topk_k") and self.config.topk_k is not None:
+                        k_val_local_float = float(self.config.topk_k)
+                    else:  # Default to keeping all features for this layer if topk_k not set
+                        k_val_local_float = float(preact.size(1))
+
+                    # Get topk_straight_through from config, default to True
+                    straight_through_local = getattr(self.config, "topk_straight_through", True)
+                    # TokenTopK.apply takes the original preactivation, k, straight_through, and optional ranking tensor
+                    # For per-layer application, we don't have a separate normalized ranking tensor readily available here,
+                    # so we pass preact itself for ranking. Normalization would ideally happen inside TokenTopK if needed
+                    # or be handled if this path were to be seriously supported (it's a fallback/warning path).
+                    activated = TokenTopK.apply(preact, k_val_local_float, straight_through_local, preact)
 
         except Exception as e:
             logger.error(f"Rank {self.rank}: Error during encode layer {layer_idx}: {e}", exc_info=True)
             batch_dim = x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1] if x.dim() == 3 else 0
             fallback_shape = (batch_dim, self.config.num_features)
-            fallback_tensor = torch.zeros(fallback_shape, device=self.device, dtype=self.dtype)
+            fallback_tensor = torch.zeros(fallback_shape, device=current_op_device, dtype=current_op_dtype)
 
         # Return activated tensor or fallback
         if activated is not None:
@@ -611,7 +464,7 @@ class CrossLayerTranscoder(BaseTranscoder):
         else:
             # Should not happen, but return empty tensor as last resort
             logger.error(f"Rank {self.rank}: Failed to encode or create fallback for layer {layer_idx}.")
-            return torch.zeros((0, self.config.num_features), device=self.device, dtype=self.dtype)
+            return torch.zeros((0, self.config.num_features), device=current_op_device, dtype=current_op_dtype)
 
     def decode(self, a: Dict[int, torch.Tensor], layer_idx: int) -> torch.Tensor:
         """Decode the feature activations to reconstruct outputs at the specified layer.
@@ -731,33 +584,76 @@ class CrossLayerTranscoder(BaseTranscoder):
         Returns:
             Dictionary mapping layer indices to *full* feature activations [..., num_features]
         """
-        if self.config.activation_fn == "batchtopk":
-            # 1. Get all pre-activations and original shape info
-            preactivations_dict, original_shapes_info, device, dtype = self._encode_all_layers(inputs)
-            if not preactivations_dict:  # No valid inputs or all inputs led to empty preacts
-                # Construct fallback based on original input layer structure, if possible
+        # Resolve model device and dtype if they haven't been set yet.
+        if self.device is None or self.dtype is None:  # self.dtype should be set from _resolve_dtype
+            first_input_tensor = next((t for t in inputs.values() if t.numel() > 0), None)
+            if self.device is None:  # Infer self.device if not set
+                if first_input_tensor is not None:
+                    self.device = first_input_tensor.device
+                    logger.info(
+                        f"Rank {self.rank}: Inferred and set model device: {self.device} from first input tensor."
+                    )
+                else:
+                    self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    logger.warning(
+                        f"Rank {self.rank}: Defaulting and setting model device to {self.device} due to empty inputs and no device set."
+                    )
+            # self.dtype is expected to be set by __init__ via _resolve_dtype.
+            # If it were None here, it would indicate an issue with __init__ or subsequent modification.
+            if self.dtype is None:  # Defensive, should not happen.
+                if first_input_tensor is not None and isinstance(first_input_tensor.dtype, torch.dtype):
+                    self.dtype = first_input_tensor.dtype
+                else:
+                    self.dtype = torch.float32  # Absolute fallback
+                logger.error(
+                    f"Rank {self.rank}: Inferred and set model dtype: {self.dtype} in get_feature_activations. This is unexpected."
+                )
+
+        # Now self.device and self.dtype should be valid.
+        # For operations within this function, we can use them directly or use the new helper for local context if needed.
+        # current_op_device, current_op_dtype = self._get_current_op_device_dtype(first_input_tensor if 'first_input_tensor' in locals() else None)
+
+        # Ensure all input tensors are on the model's (now resolved) device and dtype
+        processed_inputs: Dict[int, torch.Tensor] = {}
+        for layer_idx, x_orig in inputs.items():
+            processed_inputs[layer_idx] = x_orig.to(device=self.device, dtype=self.dtype)
+
+        if self.config.activation_fn == "batchtopk" or self.config.activation_fn == "topk":
+            # _encode_all_layers_helper expects device and dtype to be passed, use self.device/self.dtype
+            preactivations_dict, _, processed_device, processed_dtype = _encode_all_layers_helper(
+                processed_inputs, self.config, self.encoders, self.device, self.dtype, self.rank
+            )
+
+            if not preactivations_dict:
                 activations = {}
+                dev_fallback = processed_device
+                dt_fallback = processed_dtype
                 for layer_idx_orig_input in inputs.keys():
-                    # Use device/dtype from model if preacts were all empty
-                    dev = device if device is not None else self.device
-                    dt = dtype if dtype is not None else self.dtype
-                    # Try to get original batch dim for fallback
                     x_orig_input = inputs[layer_idx_orig_input]
-                    batch_dim_fallback = x_orig_input.shape[0] if x_orig_input.dim() >= 1 else 0
+                    batch_dim_fallback = 0
+                    if x_orig_input.dim() == 3:  # B, S, D
+                        batch_dim_fallback = x_orig_input.shape[0] * x_orig_input.shape[1]
+                    elif x_orig_input.dim() == 2:  # B, D or B*S, D
+                        batch_dim_fallback = x_orig_input.shape[0]
+                    # else: batch_dim_fallback remains 0 if shape is unusual or empty
+
                     activations[layer_idx_orig_input] = torch.zeros(
-                        (batch_dim_fallback, self.config.num_features), device=dev, dtype=dt
+                        (batch_dim_fallback, self.config.num_features), device=dev_fallback, dtype=dt_fallback
                     )
                 return activations
 
-            # 2. Apply BatchTopK globally
-            activations = self._apply_batch_topk(preactivations_dict, original_shapes_info, device, dtype)
+            if self.config.activation_fn == "batchtopk":
+                activations = self._apply_batch_topk(preactivations_dict, processed_device, processed_dtype)
+            elif self.config.activation_fn == "topk":
+                activations = self._apply_token_topk(preactivations_dict, processed_device, processed_dtype)
             return activations
         else:  # ReLU or JumpReLU (per-layer activation)
             activations = {}
-            for layer_idx, x in inputs.items():
+            for layer_idx, x_input in processed_inputs.items():  # Use processed_inputs here
                 try:
                     # encode() returns the full activation tensor after per-layer ReLU/JumpReLU
-                    act = self.encode(x, layer_idx)
+                    # encode() itself handles moving x_input to the correct device/dtype internally
+                    act = self.encode(x_input, layer_idx)
                     activations[layer_idx] = act
                 except Exception as e:
                     # Log the error but continue trying other layers
@@ -767,17 +663,17 @@ class CrossLayerTranscoder(BaseTranscoder):
                     )
                     # Fallback: return zero tensor of expected shape for this layer
                     # Determine batch size from input if possible
-                    if x.dim() >= 1:
+                    if x_input.dim() >= 1:
                         pass  # This variable is not used for the fallback tensor construction below
-                        if x.dim() == 3:  # if [B,S,D] -> get B*S from preact if possible, or B here
+                        if x_input.dim() == 3:  # if [B,S,D] -> get B*S from preact if possible, or B here
                             pass  # get_preactivations handles this, encode will use its output shape
 
                     # Try to infer batch_dim for fallback
                     actual_batch_dim = 0  # Initialize actual_batch_dim
-                    if hasattr(x, "shape") and len(x.shape) > 0:
-                        actual_batch_dim = x.shape[0]
-                        if len(x.shape) == 3:  # B, S, D_model
-                            actual_batch_dim = x.shape[0] * x.shape[1]
+                    if hasattr(x_input, "shape") and len(x_input.shape) > 0:
+                        actual_batch_dim = x_input.shape[0]
+                        if len(x_input.shape) == 3:  # B, S, D_model
+                            actual_batch_dim = x_input.shape[0] * x_input.shape[1]
                     # else: # fallback if x is weird, actual_batch_dim remains 0
 
                     activations[layer_idx] = torch.zeros(
@@ -923,7 +819,9 @@ class CrossLayerTranscoder(BaseTranscoder):
                 persistent=False,  # Ensure it's not saved with state_dict by default
             )
         else:  # Ensure it's on the correct device and zeroed out
-            self._sum_min_selected_preact.data = torch.zeros_like(self._sum_min_selected_preact, device=target_device)
+            self._sum_min_selected_preact.data = torch.zeros_like(
+                cast(torch.Tensor, self._sum_min_selected_preact), device=target_device
+            )
 
         if not hasattr(self, "_count_min_selected_preact") or self._count_min_selected_preact is None:
             self.register_buffer(
@@ -937,7 +835,7 @@ class CrossLayerTranscoder(BaseTranscoder):
             )
         else:  # Ensure it's on the correct device and zeroed out
             self._count_min_selected_preact.data = torch.zeros_like(
-                self._count_min_selected_preact, device=target_device
+                cast(torch.Tensor, self._count_min_selected_preact), device=target_device
             )
 
         processed_batches = 0
@@ -1039,17 +937,15 @@ class CrossLayerTranscoder(BaseTranscoder):
             concatenated_preactivations_original_posthoc = torch.cat(ordered_preactivations_original_posthoc, dim=1)
             concatenated_preactivations_normalized_posthoc = torch.cat(ordered_preactivations_normalized_posthoc, dim=1)
 
-            k_val_posthoc: float
+            k_val_int: int
             if self.config.batchtopk_k is not None:
-                k_val_posthoc = float(self.config.batchtopk_k)
-            elif self.config.batchtopk_frac is not None:
-                k_val_posthoc = self.config.batchtopk_frac
+                k_val_int = int(self.config.batchtopk_k)
             else:
-                k_val_posthoc = float(concatenated_preactivations_original_posthoc.size(1))
+                k_val_int = concatenated_preactivations_original_posthoc.size(1)
 
             activated_concatenated_posthoc = BatchTopK.apply(
                 concatenated_preactivations_original_posthoc,
-                k_val_posthoc,
+                float(k_val_int),
                 self.config.batchtopk_straight_through,
                 concatenated_preactivations_normalized_posthoc,
             )
@@ -1270,7 +1166,6 @@ class CrossLayerTranscoder(BaseTranscoder):
         # We mark the original config field to signify it's superseded.
         self.config.jumprelu_threshold = 0.0  # Mark as effectively superseded
         self.config.batchtopk_k = None
-        self.config.batchtopk_frac = None
 
         # Create or update self.log_threshold as an nn.Parameter
         if not hasattr(self, "log_threshold") or self.log_threshold is None:
