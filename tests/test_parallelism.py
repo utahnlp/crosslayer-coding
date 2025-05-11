@@ -298,7 +298,10 @@ def multi_gpu_model(
     model = CrossLayerTranscoder(clt_config_fn, process_group=dist.group.WORLD, device=device)
     model.eval()
 
-    # --- Copy weights from single_gpu_model to multi_gpu_model shards --- #
+    # Ensure single_gpu_model creation and its broadcasts are complete on all ranks
+    if dist.is_initialized():
+        dist.barrier()
+
     single_params_dict = dict(single_gpu_model.named_parameters())
     with torch.no_grad():
         for name, multi_param in model.named_parameters():
