@@ -1,13 +1,13 @@
 # %% [markdown]
-# # Tutorial 2: End-to-End CLT Training with TopK Activation
+# # Tutorial 1D: End-to-End CLT Training with JumpReLU Activation
 #
 # This tutorial demonstrates training a Cross-Layer Transcoder (CLT)
-# using the **TopK** activation function. We will:
-# 1. Configure the CLT model for TopK, activation generation, and training parameters.
+# using the **JumpReLU** activation function. We will:
+# 1. Configure the CLT model for JumpReLU, activation generation, and training parameters.
 # 2. Generate activations locally (with manifest) using the ActivationGenerator.
 # 3. Configure the trainer to use the locally stored activations via the manifest.
-# 4. Train the CLT model using TopK activation.
-# 5. Save and load the final trained model (which will be a TopK model).
+# 4. Train the CLT model using JumpReLU activation.
+# 5. Save and load the final trained model (which will be a JumpReLU model).
 
 # %% [markdown]
 # ## 1. Imports and Setup
@@ -64,7 +64,8 @@ std_normal = Normal(0, 1)
 # ## 2. Configuration
 #
 # We configure the CLT, Activation Generation, and Training.
-# Key change: `CLTConfig.activation_fn` is set to `"topk"`.
+# Key change: `CLTConfig.activation_fn` is set to `"jumprelu"`.
+# We also set `jumprelu_threshold` as per the technical description.
 
 # %%
 # --- CLT Architecture Configuration ---
@@ -73,18 +74,18 @@ d_model = 512
 expansion_factor = 32
 clt_num_features = d_model * expansion_factor
 
-topk_k_val = 100  # Can be a float for fraction or int for count
+jumprelu_threshold_val = 0.03  # From technical description
 
 clt_config = CLTConfig(
     num_features=clt_num_features,
     num_layers=num_layers,
     d_model=d_model,
-    activation_fn="topk",  # Use TopK activation
-    topk_k=topk_k_val,  # Specify k for TopK
-    topk_straight_through=True,  # Use STE for gradients
-    # jumprelu_threshold is not used for topk
+    activation_fn="jumprelu",  # Use JumpReLU activation
+    jumprelu_threshold=jumprelu_threshold_val,  # Specify threshold for JumpReLU
+    # topk_k is not used for jumprelu
+    # topk_straight_through is not used for jumprelu
 )
-print("CLT Configuration (TopK):")
+print("CLT Configuration (JumpReLU):")
 print(clt_config)
 
 # --- Activation Generation Configuration ---
@@ -138,11 +139,11 @@ expected_activation_path = os.path.join(
 # --- Determine WandB Run Name (using config values) ---
 _lr = 1e-4
 _batch_size = 1024
-_k_val_for_name = clt_config.topk_k  # Use topk_k for name
+# _k_val_for_name = clt_config.topk_k  # Use topk_k for name # Not needed for JumpReLU
 
 wdb_run_name = (
     f"{clt_config.num_features}-width-"
-    f"topk-k{_k_val_for_name}-"  # Indicate TopK and k
+    f"jumprelu-th{clt_config.jumprelu_threshold}-"  # Indicate JumpReLU and threshold
     f"{_batch_size}-batch-"
     f"{_lr:.1e}-lr"
 )
@@ -163,11 +164,12 @@ training_config = TrainingConfig(
     # Normalization
     normalization_method="auto",  # Use pre-calculated stats
     # Loss function coefficients
-    sparsity_lambda=0.0,  # Standard sparsity penalty (adjust as needed for TopK)
-    sparsity_lambda_schedule="linear",
-    sparsity_c=0.0,  # Standard sparsity penalty (adjust as needed for TopK)
-    preactivation_coef=0,
-    aux_loss_factor=1 / 32,  # Enable AuxK loss with typical factor from paper
+    sparsity_lambda=0.01,  # Example value, technical description says it ramps up.
+    # Actual value is less important than the schedule for this tutorial.
+    sparsity_lambda_schedule="linear",  # As per technical description
+    sparsity_c=1.0,  # Standard sparsity penalty parameter
+    preactivation_coef=3e-6,  # As per technical description for large runs
+    aux_loss_factor=0.0,  # AuxK loss is for TopK/BatchTopK, not JumpReLU
     # Optimizer & Scheduler
     optimizer="adamw",
     lr_scheduler="linear_final20",
@@ -184,7 +186,7 @@ training_config = TrainingConfig(
     wandb_project="clt-hp-sweeps-pythia-70m",
     wandb_run_name=wdb_run_name,
 )
-print("\nTraining Configuration (TopK):")
+print("\nTraining Configuration (JumpReLU):")
 print(training_config)
 
 
@@ -220,23 +222,23 @@ else:
         raise
 
 # %% [markdown]
-# ## 4. Training the CLT with TopK Activation
+# ## 4. Training the CLT with JumpReLU Activation
 #
 # Instantiate the `CLTTrainer` using the configurations defined above.
 # The trainer will use the `LocalActivationStore` (driven by the manifest) and the CLT model
-# will use the TopK activation function internally based on `clt_config`.
+# will use the JumpReLU activation function internally based on `clt_config`.
 
 # %%
-print("Initializing CLTTrainer for training with TopK...")
+print("Initializing CLTTrainer for training with JumpReLU...")
 
-log_dir = f"clt_training_logs/clt_pythia_topk_train_{int(time.time())}"
+log_dir = f"clt_training_logs/clt_pythia_jumprelu_train_{int(time.time())}"
 os.makedirs(log_dir, exist_ok=True)
 print(f"Logs and checkpoints will be saved to: {log_dir}")
 
 try:
     print("Creating CLTTrainer instance...")
     print(f"- Using device: {device}")
-    print(f"- CLT config (TopK): {vars(clt_config)}")
+    print(f"- CLT config (JumpReLU): {vars(clt_config)}")
     print(f"- Activation Source: {training_config.activation_source}")
     print(f"- Reading activations from: {training_config.activation_path}")
 
@@ -254,7 +256,7 @@ except Exception as e:
     raise
 
 # Start training
-print("Beginning training using TopK activation...")
+print("Beginning training using JumpReLU activation...")
 print(f"Training for {training_config.training_steps} steps.")
 print(f"Normalization method set to: {training_config.normalization_method}")
 
@@ -272,15 +274,14 @@ except Exception as train_err:
 # ## 5. Saving and Loading the Final Trained Model
 #
 # The `CLTTrainer` automatically saves the final model and its configuration (cfg.json)
-# in the `log_dir/final/` directory. Unlike BatchTopK, TopK models are typically
-# not converted to JumpReLU by the trainer at the end of training.
+# in the `log_dir/final/` directory.
 # Here, we'll also demonstrate a manual save of the model state and its config as Python dict,
 # and then load it back. This manually saved model will be the one returned by trainer.train(),
-# so it will be a TopK model.
+# so it will be a JumpReLU model.
 
 # %%
 # The trained_clt_model is what trainer.train() returned.
-# For TopK, this model remains a TopK model.
+# For JumpReLU, this model is already a JumpReLU model.
 final_model_state_path = os.path.join(log_dir, "clt_final_manual_state.pt")
 final_model_config_path = os.path.join(log_dir, "clt_final_manual_config.json")
 
@@ -289,7 +290,7 @@ print(f"Manually saving final model config to: {final_model_config_path}")
 
 torch.save(trained_clt_model.state_dict(), final_model_state_path)
 with open(final_model_config_path, "w") as f:
-    # The config on trained_clt_model will reflect 'topk'
+    # The config on trained_clt_model will reflect 'jumprelu'
     json.dump(trained_clt_model.config.__dict__, f, indent=4)
 
 print(f"\nContents of log directory ({log_dir}):")
@@ -322,16 +323,16 @@ print(f"Loaded model is on device: {next(loaded_clt_model_manual.parameters()).d
 # %% [markdown]
 # ## 6. Next Steps
 #
-# This tutorial showed how to train a CLT using the token-wise TopK activation
-# and save/load the trained TopK model.
+# This tutorial showed how to train a CLT using the JumpReLU activation
+# and save/load the trained JumpReLU model.
 
 # %%
-print("\nTopK Tutorial Complete!")
+print("\nJumpReLU Tutorial Complete!")
 print(f"Logs and checkpoints will be saved to: {log_dir}")
 
 # %%
 # The following cells for loading a specific BatchTopK checkpoint are removed
-# as they are not relevant to this TopK tutorial and the section was cut.
+# as they are not relevant to this JumpReLU tutorial.
 # weights = torch.load(batchtopk_checkpoint_path)
 
 # %%

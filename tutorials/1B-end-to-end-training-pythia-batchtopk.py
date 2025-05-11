@@ -86,7 +86,7 @@ d_model = 512
 expansion_factor = 32
 clt_num_features = d_model * expansion_factor
 
-batchtopk_k = 500
+batchtopk_k = 200
 
 clt_config = CLTConfig(
     num_features=clt_num_features,
