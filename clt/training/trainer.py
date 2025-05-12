@@ -373,6 +373,14 @@ class CLTTrainer:
                     batch_get_duration = time.monotonic() - batch_get_start_time
                     logger.debug(f"Rank {self.rank} Step {step}: Getting batch took {batch_get_duration:.4f}s")
 
+                    # logging to diagnose batch size mismatch
+                    tok_cnt = next(iter(inputs.values())).shape[0]  # number of rows (=tokens) in this batch
+                    tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
+                    gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
+                    dist.all_gather(gathered, tok_cnt_t)
+                    if self.rank == 0:
+                        print("Batch token-count per rank:", [int(x.item()) for x in gathered])
+
                 except StopIteration:
                     # Rank 0 prints message
                     if not self.distributed or self.rank == 0:
