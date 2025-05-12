@@ -27,6 +27,8 @@ def average_shared_parameter_grads(model: "CrossLayerTranscoder", world_size: in
         # The import for is_replicated will be guarded by TYPE_CHECKING, so use getattr for runtime.
         is_rep = getattr(p, "_is_replicated", False)
 
-        if is_rep or p.dim() == 1:
+        # Only average if explicitly marked as replicated.
+        # The p.dim() == 1 heuristic was too broad and could incorrectly average sharded 1D parameters (e.g., encoder biases).
+        if is_rep:
             dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
             p.grad /= world_size

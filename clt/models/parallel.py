@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import math
-from typing import Callable, Optional, cast
+from typing import Callable, Optional, cast, Tuple
 
 from . import mark_replicated
 
@@ -188,15 +188,18 @@ class _Reduce(torch.autograd.Function):
         return input_contig
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor):
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], None]:
         # Non-distributed: gradient flows straight through.
         if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
-            return grad_output, None
+            # Match the number of forward inputs in return for consistency
+            return grad_output.contiguous() if grad_output is not None else None, None
 
         # The gradient dL/dX_local for each rank's local input X_local is simply dL/dY_sum,
         # where Y_sum is the all-reduced sum, because dY_sum/dX_local = 1.
         # grad_output is dL/dY_sum and is identical on all ranks.
-        return grad_output.contiguous(), None  # Grad for input_, None for process_group
+        # Ensure contiguous and handle if grad_output might be None (though unlikely for scalar loss)
+        grad_for_input = grad_output.contiguous() if grad_output is not None else None
+        return grad_for_input, None  # Grad for input_, None for process_group
 
 
 def _reduce(input_, process_group):
