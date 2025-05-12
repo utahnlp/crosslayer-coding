@@ -161,8 +161,47 @@ class _Gather(torch.autograd.Function):
         return grad_input, None, None, None
 
 
+class _Reduce(torch.autograd.Function):
+    """Autograd-aware all-reduce + sum.
+
+    In the forward pass, the input tensor is summed across all ranks in the
+    process group, and the result is made available on all ranks.
+    In the backward pass, the gradient output (which is identical on all ranks)
+    is passed through as the gradient for the input tensor on each rank.
+    """
+
+    @staticmethod
+    def forward(ctx, input_: torch.Tensor, process_group: Optional[ProcessGroup]):
+        if process_group is None or not dist.is_initialized() or dist.get_world_size(process_group) == 1:
+            ctx.process_group = None  # Mark non-distributed case
+            return input_
+
+        ctx.process_group = process_group
+        input_contig = input_.contiguous()  # Ensure contiguous before collective
+
+        # Perform the all-reduce with SUM operation.
+        # The operation is in-place on input_contig if it's the same object for all_reduce's output internally,
+        # or if all_reduce returns a new tensor, that's what we return.
+        # For clarity, let's assume all_reduce modifies input_contig or we assign its result.
+        dist.all_reduce(input_contig, op=dist.ReduceOp.SUM, group=process_group)
+        # The tensor input_contig now holds the sum.
+        return input_contig
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        # Non-distributed: gradient flows straight through.
+        if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
+            return grad_output, None
+
+        # The gradient dL/dX_local for each rank's local input X_local is simply dL/dY_sum,
+        # where Y_sum is the all-reduced sum, because dY_sum/dX_local = 1.
+        # grad_output is dL/dY_sum and is identical on all ranks.
+        return grad_output.contiguous(), None  # Grad for input_, None for process_group
+
+
 def _reduce(input_, process_group):
     """All-reduce the input tensor across the process group (SUM, no additional scaling).
+    Now uses the autograd-aware _Reduce.apply for proper gradient tracking.
 
     For row-parallel layers each rank holds a slice of the input-feature dimension and the
     local matmul produces the *partial* output.  These partial outputs must be **summed**
@@ -182,10 +221,8 @@ def _reduce(input_, process_group):
     input_ = input_.contiguous()
 
     # Perform the all-reduce with **SUM** operation (the correct aggregation for TP)
-    dist.all_reduce(input_, op=dist.ReduceOp.SUM, group=process_group)
-
-    # No extra scaling — return the summed tensor
-    return input_
+    # return input_ # Old implementation
+    return _Reduce.apply(input_, process_group)  # Use autograd function
 
 
 def _split(input_, process_group, dim=-1):
