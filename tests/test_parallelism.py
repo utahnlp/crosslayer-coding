@@ -545,19 +545,20 @@ def test_encoder_preactivations(
                 multi_out = multi_gpu_output
 
                 print(f"  Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-                if clt_config_fn.activation_fn == "jumprelu" and layer_idx == 3:  # Specific debug for failing case
+                # Specific debug for jumprelu, now targeting layer 2 or 3 based on typical failure points
+                if clt_config_fn.activation_fn == "jumprelu" and layer_idx in [2, 3]:
                     mismatch_indices = torch.where(torch.abs(single_out - multi_out) > 1e-6)
                     num_mismatches = mismatch_indices[0].numel()
-                    print(f"    DEBUG jumprelu L3: Num mismatches by allclose logic: {num_mismatches}")
+                    print(f"    DEBUG jumprelu L{layer_idx}: Num mismatches by allclose logic: {num_mismatches}")
                     if num_mismatches > 0 and num_mismatches < 20:  # Print details if few mismatches
                         print(
-                            f"    DEBUG jumprelu L3: Mismatch indices (first one): {tuple(idx[0].item() for idx in mismatch_indices)}"
+                            f"    DEBUG jumprelu L{layer_idx}: Mismatch indices (first one): {tuple(idx[0].item() for idx in mismatch_indices)}"
                         )
                         print(
-                            f"    DEBUG jumprelu L3: Single out at mismatch: {single_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
+                            f"    DEBUG jumprelu L{layer_idx}: Single out at mismatch: {single_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
                         )
                         print(
-                            f"    DEBUG jumprelu L3: Multi  out at mismatch: {multi_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
+                            f"    DEBUG jumprelu L{layer_idx}: Multi  out at mismatch: {multi_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
                         )
                         # Check if one is zero and other is not (typical JumpReLU diff)
                         single_is_zero = torch.isclose(
@@ -571,7 +572,7 @@ def test_encoder_preactivations(
                             atol=1e-7,
                         )
                         print(
-                            f"    DEBUG jumprelu L3: Single is zero: {single_is_zero}, Multi is zero: {multi_is_zero}"
+                            f"    DEBUG jumprelu L{layer_idx}: Single is zero: {single_is_zero}, Multi is zero: {multi_is_zero}"
                         )
 
                 assert torch.allclose(single_out, multi_out, atol=1e-6), (
@@ -638,19 +639,20 @@ def test_feature_activations(
                 multi_out = multi_out.to(single_out.device)
 
                 print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-                if clt_config_fn.activation_fn == "jumprelu" and layer_idx == 3:  # Specific debug for failing case
+                # Specific debug for jumprelu, now targeting layer 2 or 3 based on typical failure points
+                if clt_config_fn.activation_fn == "jumprelu" and layer_idx in [2, 3]:
                     mismatch_indices = torch.where(torch.abs(single_out - multi_out) > 1e-6)
                     num_mismatches = mismatch_indices[0].numel()
-                    print(f"    DEBUG jumprelu L3: Num mismatches by allclose logic: {num_mismatches}")
+                    print(f"    DEBUG jumprelu L{layer_idx}: Num mismatches by allclose logic: {num_mismatches}")
                     if num_mismatches > 0 and num_mismatches < 20:  # Print details if few mismatches
                         print(
-                            f"    DEBUG jumprelu L3: Mismatch indices (first one): {tuple(idx[0].item() for idx in mismatch_indices)}"
+                            f"    DEBUG jumprelu L{layer_idx}: Mismatch indices (first one): {tuple(idx[0].item() for idx in mismatch_indices)}"
                         )
                         print(
-                            f"    DEBUG jumprelu L3: Single out at mismatch: {single_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
+                            f"    DEBUG jumprelu L{layer_idx}: Single out at mismatch: {single_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
                         )
                         print(
-                            f"    DEBUG jumprelu L3: Multi  out at mismatch: {multi_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
+                            f"    DEBUG jumprelu L{layer_idx}: Multi  out at mismatch: {multi_out[mismatch_indices[0][0], mismatch_indices[1][0]]}"
                         )
                         # Check if one is zero and other is not (typical JumpReLU diff)
                         single_is_zero = torch.isclose(
@@ -664,7 +666,7 @@ def test_feature_activations(
                             atol=1e-7,
                         )
                         print(
-                            f"    DEBUG jumprelu L3: Single is zero: {single_is_zero}, Multi is zero: {multi_is_zero}"
+                            f"    DEBUG jumprelu L{layer_idx}: Single is zero: {single_is_zero}, Multi is zero: {multi_is_zero}"
                         )
 
                 assert torch.allclose(single_out, multi_out, atol=1e-6), (
