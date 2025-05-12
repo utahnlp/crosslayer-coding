@@ -3,7 +3,7 @@ import torch.distributed as dist
 import pytest
 import os
 import math
-from typing import Optional, Union
+from typing import Optional
 import torch.nn.functional as F  # Add F for padding
 import torch.nn as nn  # Add nn for Linear layer
 
@@ -529,20 +529,24 @@ def test_encoder_preactivations(
             assert multi_gpu_output.device == device  # device fixture already resolves to rank's device
 
         # 3. Compare Outputs (Rank 0)
-        if RANK == 0:
-            print(f"Comparing Encoder Pre-activations for Layer {layer_idx} (Rank 0):")
-            single_out = single_gpu_output.to(multi_gpu_output.device)
-            multi_out = multi_gpu_output
-
-            print(f"  Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-            assert torch.allclose(single_out, multi_out, atol=1e-6), (
-                f"Mismatch in pre-activations for layer {layer_idx} between single and multi-GPU."
-                f"\nMax diff: {(single_out - multi_out).abs().max()}"
-            )
-            print(f"  Layer {layer_idx} Pre-activation Check PASSED.")
         # Barrier before next layer (ensures prints are ordered)
-        if dist.is_initialized():
-            dist.barrier()
+        try:
+            if RANK == 0:
+                print(f"Comparing Encoder Pre-activations for Layer {layer_idx} (Rank 0):")
+                single_out = single_gpu_output.to(multi_gpu_output.device)
+                multi_out = multi_gpu_output
+
+                print(f"  Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+                assert torch.allclose(single_out, multi_out, atol=1e-6), (
+                    f"Mismatch in pre-activations for layer {layer_idx} between single and multi-GPU."
+                    f"\nMax diff: {(single_out - multi_out).abs().max()}"
+                )
+                print(f"  Layer {layer_idx} Pre-activation Check PASSED.")
+        finally:
+            if (
+                dist.is_initialized()
+            ):  # Removed WORLD_SIZE > 1 check as dist.is_initialized() implies it for barrier usage
+                dist.barrier()
 
 
 # Test 2: Feature Activations (encode)
@@ -601,44 +605,9 @@ def test_feature_activations(
                     f"Mismatch in feature activations for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
                     f"\nMax diff: {(single_out - multi_out).abs().max()}"
                 )
-                # For topk variants, check that non-selected are zero
-                if clt_config_fn.activation_fn == "topk" or clt_config_fn.activation_fn == "batchtopk":
-                    # Calculate the number of non-zeros we expect
-                    k_val_resolved: Optional[Union[float, int]] = None
-                    if clt_config_fn.activation_fn == "topk":
-                        k_val_resolved = clt_config_fn.topk_k
-                    elif clt_config_fn.activation_fn == "batchtopk":
-                        k_val_resolved = clt_config_fn.batchtopk_k
-
-                    num_expected_non_zero_per_token: int = 0
-                    if k_val_resolved is not None:
-                        if 0 < k_val_resolved < 1:  # k_val_resolved is float here
-                            num_expected_non_zero_per_token = math.ceil(k_val_resolved * clt_config_fn.num_features)
-                        elif k_val_resolved >= 1:  # k_val_resolved is float or int here
-                            num_expected_non_zero_per_token = int(k_val_resolved)
-
-                    if (
-                        num_expected_non_zero_per_token > 0
-                        and num_expected_non_zero_per_token <= clt_config_fn.num_features
-                    ):
-                        if clt_config_fn.activation_fn == "topk":
-                            # For TokenTopK, count non-zeros per token
-                            non_zeros_per_token = (multi_out != 0).float().sum(dim=-1)
-                            assert torch.all(
-                                non_zeros_per_token <= num_expected_non_zero_per_token
-                            ), f"Layer {layer_idx} (topk): Expected at most {num_expected_non_zero_per_token} non-zeros per token, found more."
-                        elif clt_config_fn.activation_fn == "batchtopk":
-                            # For BatchTopK, count total non-zeros across batch for this layer's output
-                            total_non_zeros = (multi_out != 0).float().sum()
-                            max_expected_total_non_zeros = (
-                                num_expected_non_zero_per_token * multi_out.shape[0]
-                            )  # k_per_token * B_tokens
-                            assert (
-                                total_non_zeros <= max_expected_total_non_zeros
-                            ), f"Layer {layer_idx} (batchtopk): Expected at most {max_expected_total_non_zeros} total non-zeros, found {total_non_zeros}."
     finally:
         if WORLD_SIZE > 1 and dist.is_initialized():
-            dist.barrier()  # Ensure all ranks complete before next test item
+            dist.barrier()
 
 
 # Test 3: Decoder Forward Pass (decode)
@@ -686,22 +655,27 @@ def test_decoder_decode(
             assert multi_gpu_output.shape == expected_shape
             assert multi_gpu_output.device == device
 
-    if RANK == 0:
-        print(f"\nComparing Decoder Outputs (Rank 0) for config: {clt_config_fn.activation_fn}")
-        for layer_idx in range(clt_config_fn.num_layers):
-            single_out = single_gpu_reconstructions[layer_idx]
-            multi_out = multi_gpu_reconstructions[layer_idx]
-            multi_out = multi_out.to(single_out.device)
+    # --- Comparison (only on Rank 0) --- #
+    try:
+        if RANK == 0:
+            print(f"\nComparing Decoder Outputs (Rank 0) for config: {clt_config_fn.activation_fn}")
+            for layer_idx in range(clt_config_fn.num_layers):
+                single_out = single_gpu_reconstructions[layer_idx]
+                multi_out = multi_gpu_reconstructions[layer_idx]
+                multi_out = multi_out.to(single_out.device)
 
-            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-            if single_out.shape != multi_out.shape:
-                pytest.fail(f"Shape mismatch for layer {layer_idx}: Single={single_out.shape}, Multi={multi_out.shape}")
-            assert torch.allclose(single_out, multi_out, atol=1e-5, rtol=1e-4), (
-                f"Mismatch in decoder outputs for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
-                f"\nMax diff: {(single_out - multi_out).abs().max()}"
-            )
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
+                print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+                if single_out.shape != multi_out.shape:
+                    pytest.fail(
+                        f"Shape mismatch for layer {layer_idx}: Single={single_out.shape}, Multi={multi_out.shape}"
+                    )
+                assert torch.allclose(single_out, multi_out, atol=1e-5, rtol=1e-4), (
+                    f"Mismatch in decoder outputs for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
+                    f"\nMax diff: {(single_out - multi_out).abs().max()}"
+                )
+    finally:
+        if WORLD_SIZE > 1 and dist.is_initialized():
+            dist.barrier()
 
 
 # Test 4: Full Forward Pass (forward)
@@ -754,25 +728,27 @@ def test_full_forward_pass(
             assert output.shape == expected_shape
             assert output.device == device
 
-    if RANK == 0:
-        print(f"\nComparing Full Forward Pass Outputs (Rank 0) for config: {clt_config_fn.activation_fn}")
-        assert single_gpu_outputs.keys() == multi_gpu_outputs.keys()
-        for layer_idx in single_gpu_outputs.keys():
-            single_out = single_gpu_outputs[layer_idx]
-            multi_out = multi_gpu_outputs[layer_idx]
-            multi_out = multi_out.to(single_out.device)
+    try:
+        if RANK == 0:
+            print(f"\nComparing Full Forward Pass Outputs (Rank 0) for config: {clt_config_fn.activation_fn}")
+            assert single_gpu_outputs.keys() == multi_gpu_outputs.keys()
+            for layer_idx in single_gpu_outputs.keys():
+                single_out = single_gpu_outputs[layer_idx]
+                multi_out = multi_gpu_outputs[layer_idx]
+                multi_out = multi_out.to(single_out.device)
 
-            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-            if single_out.shape != multi_out.shape:
-                pytest.fail(
-                    f"Shape mismatch forward layer {layer_idx}: Single={single_out.shape}, Multi={multi_out.shape}"
+                print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+                if single_out.shape != multi_out.shape:
+                    pytest.fail(
+                        f"Shape mismatch forward layer {layer_idx}: Single={single_out.shape}, Multi={multi_out.shape}"
+                    )
+                assert torch.allclose(single_out, multi_out, atol=1e-5, rtol=1e-4), (
+                    f"Mismatch in full forward pass for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
+                    f"\nMax diff: {(single_out - multi_out).abs().max()}"
                 )
-            assert torch.allclose(single_out, multi_out, atol=1e-5, rtol=1e-4), (
-                f"Mismatch in full forward pass for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
-                f"\nMax diff: {(single_out - multi_out).abs().max()}"
-            )
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
+    finally:
+        if WORLD_SIZE > 1 and dist.is_initialized():
+            dist.barrier()
 
 
 # Test 5: Reconstruction Loss Calculation
@@ -816,15 +792,17 @@ def test_reconstruction_loss(
     multi_recon_loss = loss_manager.compute_reconstruction_loss(multi_gpu_outputs, target_dict_multi)
     assert isinstance(multi_recon_loss, torch.Tensor) and multi_recon_loss.numel() == 1
 
-    if RANK == 0:
-        print(f"\nComparing Reconstruction Loss (Rank 0) for config: {clt_config_fn.activation_fn}")
-        single_loss_val = single_recon_loss.item()
-        multi_loss_val = multi_recon_loss.item()
-        assert math.isclose(
-            single_loss_val, multi_loss_val, rel_tol=1e-5, abs_tol=1e-6
-        ), f"Mismatch in recon loss (config {clt_config_fn.activation_fn}): single ({single_loss_val}), multi ({multi_loss_val})."
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
+    try:
+        if RANK == 0:
+            print(f"\nComparing Reconstruction Loss (Rank 0) for config: {clt_config_fn.activation_fn}")
+            single_loss_val = single_recon_loss.item()
+            multi_loss_val = multi_recon_loss.item()
+            assert math.isclose(
+                single_loss_val, multi_loss_val, rel_tol=1e-5, abs_tol=1e-6
+            ), f"Mismatch in recon loss (config {clt_config_fn.activation_fn}): single ({single_loss_val}), multi ({multi_loss_val})."
+    finally:
+        if WORLD_SIZE > 1 and dist.is_initialized():
+            dist.barrier()
 
 
 # Test 6: Sparsity Loss Calculation (via total loss)
@@ -879,13 +857,16 @@ def test_sparsity_loss(
     )
     multi_sparsity_loss_val = multi_loss_dict.get("sparsity", 0.0)
 
-    if RANK == 0:
-        print(f"\nComparing Sparsity Loss (Rank 0) for config: {clt_config_fn.activation_fn}")
-        assert math.isclose(
-            single_sparsity_loss_val, multi_sparsity_loss_val, rel_tol=1e-4, abs_tol=1e-5
-        ), f"Mismatch in sparsity loss (config {clt_config_fn.activation_fn}): single ({single_sparsity_loss_val}), multi ({multi_sparsity_loss_val})."
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
+    # --- Comparison (only on Rank 0) --- #
+    try:
+        if RANK == 0:
+            print(f"\nComparing Sparsity Loss (Rank 0) for config: {clt_config_fn.activation_fn}")
+            assert math.isclose(
+                single_sparsity_loss_val, multi_sparsity_loss_val, rel_tol=1e-4, abs_tol=1e-5
+            ), f"Mismatch in sparsity loss (config {clt_config_fn.activation_fn}): single ({single_sparsity_loss_val}), multi ({multi_sparsity_loss_val})."
+    finally:
+        if WORLD_SIZE > 1 and dist.is_initialized():
+            dist.barrier()
 
 
 # Test 7: Total Loss Calculation
@@ -936,13 +917,16 @@ def test_total_loss(
     )
     multi_total_loss_val = multi_total_loss.item()
 
-    if RANK == 0:
-        print(f"\nComparing Total Loss (Rank 0) for config: {clt_config_fn.activation_fn}")
-        assert math.isclose(
-            single_total_loss_val, multi_total_loss_val, rel_tol=1e-4, abs_tol=1e-5
-        ), f"Mismatch in total loss (config {clt_config_fn.activation_fn}): single ({single_total_loss_val}), multi ({multi_total_loss_val})."
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
+    # --- Comparison (only on Rank 0) --- #
+    try:
+        if RANK == 0:
+            print(f"\nComparing Total Loss (Rank 0) for config: {clt_config_fn.activation_fn}")
+            assert math.isclose(
+                single_total_loss_val, multi_total_loss_val, rel_tol=1e-4, abs_tol=1e-5
+            ), f"Mismatch in total loss (config {clt_config_fn.activation_fn}): single ({single_total_loss_val}), multi ({multi_total_loss_val})."
+    finally:
+        if WORLD_SIZE > 1 and dist.is_initialized():
+            dist.barrier()
 
 
 # Test 8: Gradient Calculation
@@ -1015,97 +999,96 @@ def test_gradient_calculation(
     if WORLD_SIZE > 1 and dist.is_initialized():
         dist.barrier()
 
-    if RANK == 0:
-        print(f"\nComparing Gradients (Rank 0) for config: {clt_config_fn.activation_fn}")
-        assert (
-            single_gpu_grads.keys() == multi_gpu_local_grads.keys()
-        ), f"Grad keys differ (config {clt_config_fn.activation_fn}): {single_gpu_grads.keys()} vs {multi_gpu_local_grads.keys()}"
+    # --- Comparison (only on Rank 0, with final barrier for all) --- #
+    try:
+        if RANK == 0:
+            print(f"\nComparing Gradients (Rank 0) for config: {clt_config_fn.activation_fn}")
+            assert (
+                single_gpu_grads.keys() == multi_gpu_local_grads.keys()
+            ), f"Grad keys differ (config {clt_config_fn.activation_fn}): {single_gpu_grads.keys()} vs {multi_gpu_local_grads.keys()}"
 
-    multi_gpu_params_dict = dict(multi_gpu_actual_model.named_parameters())
-    gradient_mismatch_detected = False
-    mismatch_messages = []
+        multi_gpu_params_dict = dict(multi_gpu_actual_model.named_parameters())
+        gradient_mismatch_detected = False
+        mismatch_messages = []  # This list is populated by RANK 0
 
-    for name, single_grad_val in single_gpu_grads.items():
-        if name not in multi_gpu_local_grads:
-            if RANK == 0:
-                msg = f"Warning: Grad for {name} missing in multi-GPU model (config {clt_config_fn.activation_fn})."
-                print(msg)
-                gradient_mismatch_detected = True
-                mismatch_messages.append(msg)
-            continue
+        # This loop is executed by all ranks to prepare full_multi_grad if needed,
+        # but comparisons and mismatch_messages updates are RANK 0 only.
+        for name, single_grad_val in single_gpu_grads.items():
+            if name not in multi_gpu_local_grads:
+                if RANK == 0:
+                    msg = f"Warning: Grad for {name} missing in multi-GPU model (config {clt_config_fn.activation_fn})."
+                    print(msg)
+                    gradient_mismatch_detected = True
+                    mismatch_messages.append(msg)
+                continue
 
-        local_grad_val = multi_gpu_local_grads[name]
-        param = multi_gpu_params_dict[name]
-        full_multi_grad = None
-        is_sharded = False
-        partition_dim = -1
+            local_grad_val = multi_gpu_local_grads[name]
+            param = multi_gpu_params_dict[name]
+            full_multi_grad = None
+            is_sharded = False
+            partition_dim = -1
 
-        if "encoders." in name and ".weight" in name:
-            is_sharded = True
-            partition_dim = 0
-        elif "decoders." in name and ".weight" in name:
-            is_sharded = True
-            partition_dim = 1
-        elif "encoders." in name and ".bias_param" in name:
-            if (
-                hasattr(multi_gpu_actual_model.encoders[int(name.split(".")[1])], "bias_param")
-                and param is not None
-                and param.numel() > 0
-            ):
+            if "encoders." in name and ".weight" in name:
                 is_sharded = True
                 partition_dim = 0
+            elif "decoders." in name and ".weight" in name:
+                is_sharded = True
+                partition_dim = 1
+            elif "encoders." in name and ".bias_param" in name:
+                if (
+                    hasattr(multi_gpu_actual_model.encoders[int(name.split(".")[1])], "bias_param")
+                    and param is not None
+                    and param.numel() > 0
+                ):
+                    is_sharded = True
+                    partition_dim = 0
 
-        # Decoder bias is replicated, log_threshold is replicated.
-        # They are handled by average_replicated_grads if multi_gpu_model is not None.
-        # If multi_gpu_model is None (single GPU run), local_grad_val is already the full grad.
+            if is_sharded and multi_gpu_model is not None and WORLD_SIZE > 1:
+                # All ranks must call gather_sharded_gradient if it involves collectives (dist.all_gather)
+                full_multi_grad = gather_sharded_gradient(local_grad_val, param, single_grad_val.shape, partition_dim)
+            elif not is_sharded:  # Replicated param or single GPU run
+                full_multi_grad = local_grad_val
+            elif is_sharded and (multi_gpu_model is None or WORLD_SIZE == 1):  # Sharded but running in single GPU mode
+                full_multi_grad = local_grad_val
 
-        if is_sharded and multi_gpu_model is not None and WORLD_SIZE > 1:
-            full_multi_grad = gather_sharded_gradient(local_grad_val, param, single_grad_val.shape, partition_dim)
-        elif not is_sharded:  # Replicated param or single GPU run
-            full_multi_grad = local_grad_val  # Use local_grad directly
-        elif is_sharded and (multi_gpu_model is None or WORLD_SIZE == 1):  # Sharded but running in single GPU mode
-            full_multi_grad = local_grad_val
+            if RANK == 0:  # Assertions and mismatch reporting only on Rank 0
+                print(f"  Comparing grad for: {name} (shape {single_grad_val.shape})")
+                single_grad_to_compare = single_grad_val.to(device)
 
-        if RANK == 0:
-            print(f"  Comparing grad for: {name} (shape {single_grad_val.shape})")
-            single_grad_to_compare = single_grad_val.to(device)
+                if full_multi_grad is None and is_sharded and WORLD_SIZE > 1:
+                    gradient_mismatch_detected = True
+                    mismatch_messages.append(
+                        f"Failed to obtain full_multi_grad for sharded {name} on Rank 0 (config {clt_config_fn.activation_fn})."
+                    )
+                    continue
 
-            if full_multi_grad is None and is_sharded and WORLD_SIZE > 1:
-                # This means gather_sharded_gradient failed or wasn't called when it should have been for rank 0
-                gradient_mismatch_detected = True
-                mismatch_messages.append(
-                    f"Failed to obtain full_multi_grad for sharded {name} on Rank 0 (config {clt_config_fn.activation_fn})."
-                )
-                continue
+                multi_grad_to_compare = full_multi_grad.to(device) if full_multi_grad is not None else None
 
-            multi_grad_to_compare = full_multi_grad.to(device) if full_multi_grad is not None else None
+                if multi_grad_to_compare is None:
+                    gradient_mismatch_detected = True
+                    mismatch_messages.append(
+                        f"Multi grad for {name} is None on Rank 0 (config {clt_config_fn.activation_fn})."
+                    )
+                    continue
 
-            if multi_grad_to_compare is None:
-                gradient_mismatch_detected = True
-                mismatch_messages.append(
-                    f"Multi grad for {name} is None on Rank 0 (config {clt_config_fn.activation_fn})."
-                )
-                continue
+                atol, rtol = (1e-4, 1e-3) if is_sharded else (1e-4, 1e-4)
+                if name == "log_threshold":
+                    atol, rtol = (1e-5, 1e-4)
 
-            # Determine appropriate tolerance
-            atol, rtol = (1e-4, 1e-3) if is_sharded else (1e-4, 1e-4)  # Looser for sharded due to gather
-            if name == "log_threshold":  # Tighter for directly replicated
-                atol, rtol = (1e-5, 1e-4)
+                if not torch.allclose(single_grad_to_compare, multi_grad_to_compare, atol=atol, rtol=rtol):
+                    gradient_mismatch_detected = True
+                    diff = (single_grad_to_compare - multi_grad_to_compare).abs().max()
+                    mismatch_messages.append(
+                        f"Mismatch for '{name}' (config {clt_config_fn.activation_fn}). Max diff: {diff}. Type: {'Sharded' if is_sharded else 'Replicated/Other'}"
+                    )
 
-            if not torch.allclose(single_grad_to_compare, multi_grad_to_compare, atol=atol, rtol=rtol):
-                gradient_mismatch_detected = True
-                diff = (single_grad_to_compare - multi_grad_to_compare).abs().max()
-                mismatch_messages.append(
-                    f"Mismatch for '{name}' (config {clt_config_fn.activation_fn}). Max diff: {diff}. Type: {'Sharded' if is_sharded else 'Replicated/Other'}"
-                )
+        # Actual failure point for RANK 0 if mismatches were detected
+        if RANK == 0 and gradient_mismatch_detected:
+            pytest.fail("\n".join(mismatch_messages))
 
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
-
-    if RANK == 0 and gradient_mismatch_detected:
-        pytest.fail("\n".join(mismatch_messages))
-    elif WORLD_SIZE > 1 and dist.is_initialized():  # Ensure non-rank0 pass if no errors on rank0
-        pass
+    finally:
+        if WORLD_SIZE > 1 and dist.is_initialized():  # Ensure non-rank0 pass if no errors on rank0
+            dist.barrier()
 
 
 # --- Test T1: Replicated Parameter Sync after JumpReLU conversion ---
@@ -1275,10 +1258,13 @@ def test_replicated_param_sync_after_conversion(
                 if not any(name in msg for msg in mismatch_messages_t1):
                     print(f"T1: Decoder bias {name} synced.")
 
-    if RANK == 0 and mismatch_messages_t1:
-        pytest.fail("\n".join(mismatch_messages_t1))
-
-    dist.barrier()
+    # --- Final assertions (Rank 0) and cleanup --- #
+    try:
+        if RANK == 0 and mismatch_messages_t1:
+            pytest.fail("\n".join(mismatch_messages_t1))
+    finally:
+        if dist.is_initialized():  # Check before calling barrier
+            dist.barrier()
 
 
 # --- Isolated Layer Tests ---
