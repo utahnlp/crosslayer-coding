@@ -689,53 +689,36 @@ class CLTTrainer:
             print(f"Saving CLT configuration (as trained) to {config_save_path}...")
             try:
                 config_dict_as_trained = asdict(self.clt_config)
-                model_name = None
-                if (
-                    hasattr(self.training_config, "generation_config")
-                    and self.training_config.generation_config is not None
-                    and "model_name" in self.training_config.generation_config
-                ):
-                    model_name = self.training_config.generation_config["model_name"]
-                    config_dict_as_trained["model_name"] = model_name
-                elif (
-                    hasattr(self.training_config, "activation_config")
-                    and hasattr(self.training_config.activation_config, "model_name")
-                    and self.training_config.activation_config.model_name is not None
-                ):
-                    config_dict_as_trained["model_name"] = self.training_config.activation_config.model_name
+                # Remove accesses to attributes no longer in TrainingConfig
+                # model_name = None
+                # if (
+                #     hasattr(self.training_config, "generation_config")
+                #     and self.training_config.generation_config is not None
+                #     and "model_name" in self.training_config.generation_config
+                # ):
+                #     model_name = self.training_config.generation_config["model_name"]
+                #     config_dict_as_trained["model_name"] = model_name
+                # elif (
+                #     hasattr(self.training_config, "activation_config")
+                #     and hasattr(self.training_config.activation_config, "model_name")
+                #     and self.training_config.activation_config.model_name is not None
+                # ):
+                #     config_dict_as_trained["model_name"] = self.training_config.activation_config.model_name
+
+                # Attempt to add model_name if available in clt_config itself
+                if hasattr(self.clt_config, "model_name") and self.clt_config.model_name:
+                    config_dict_as_trained["model_name"] = self.clt_config.model_name
 
                 if hasattr(self.training_config, "normalization_method"):
                     config_dict_as_trained["normalization_method"] = self.training_config.normalization_method
                 if hasattr(self.training_config, "activation_dtype"):
                     config_dict_as_trained["expected_input_dtype"] = self.training_config.activation_dtype
 
-                source_cfg_for_hooks = None
-                if (
-                    hasattr(self.training_config, "generation_config")
-                    and self.training_config.generation_config is not None
-                ):
-                    source_cfg_for_hooks = self.training_config.generation_config
-                elif (
-                    hasattr(self.training_config, "activation_config")
-                    and self.training_config.activation_config is not None
-                ):
-                    act_cfg = self.training_config.activation_config
-                    if hasattr(act_cfg, "__dict__"):
-                        source_cfg_for_hooks = act_cfg.__dict__
-                    elif isinstance(act_cfg, dict):
-                        source_cfg_for_hooks = act_cfg
-
-                if source_cfg_for_hooks:
-                    if "mlp_input_module_path_template" in source_cfg_for_hooks:
-                        config_dict_as_trained["mlp_input_template"] = source_cfg_for_hooks[
-                            "mlp_input_module_path_template"
-                        ]
-                    if "mlp_output_module_path_template" in source_cfg_for_hooks:
-                        config_dict_as_trained["mlp_output_template"] = source_cfg_for_hooks[
-                            "mlp_output_module_path_template"
-                        ]
-                    if "context_size" in source_cfg_for_hooks:
-                        config_dict_as_trained["context_size"] = source_cfg_for_hooks["context_size"]
+                # Add hook templates if available directly in clt_config
+                if hasattr(self.clt_config, "mlp_input_template") and self.clt_config.mlp_input_template:
+                    config_dict_as_trained["mlp_input_template"] = self.clt_config.mlp_input_template
+                if hasattr(self.clt_config, "mlp_output_template") and self.clt_config.mlp_output_template:
+                    config_dict_as_trained["mlp_output_template"] = self.clt_config.mlp_output_template
 
                 with open(config_save_path, "w") as f:
                     json.dump(config_dict_as_trained, f, indent=2)
