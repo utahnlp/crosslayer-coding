@@ -273,10 +273,17 @@ def single_gpu_model(clt_config_fn: CLTConfig, device: torch.device) -> CrossLay
     model = CrossLayerTranscoder(clt_config_fn, process_group=None, device=device)
     model.eval()
 
+    # Removed per-parameter dist.broadcast to avoid potential collective-order
+    # divergence between ranks.  The model parameters are deterministically
+    # initialised with a fixed random seed on every rank, so they are already
+    # identical.  Broadcasting each parameter one-by-one is unnecessary and
+    # created a long sequence of `dist.broadcast` calls; if the parameter
+    # iteration order differed even slightly (e.g. due to Python insertion-
+    # order subtleties), the two ranks would desynchronise and the NCCL
+    # watchdog would trigger.  With the broadcast removed we rely on the fixed
+    # seed for reproducibility and simply insert a barrier to keep the ranks
+    # in lock-step.
     if WORLD_SIZE > 1 and dist.is_initialized():
-        with torch.no_grad():
-            for param in model.parameters():
-                dist.broadcast(param.data, src=0)
         dist.barrier()
     return model
 
@@ -1124,9 +1131,6 @@ def test_replicated_param_sync_after_conversion(
     _single_model = CrossLayerTranscoder(clt_config_fn, process_group=None, device=device)
     _single_model.eval()
     if WORLD_SIZE > 1 and dist.is_initialized():
-        with torch.no_grad():
-            for param in _single_model.parameters():
-                dist.broadcast(param.data, src=0)
         dist.barrier()
 
     _multi_model: Optional[CrossLayerTranscoder] = None
