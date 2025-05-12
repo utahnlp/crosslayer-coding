@@ -274,17 +274,29 @@ def single_gpu_model(clt_config_fn: CLTConfig, device: torch.device) -> CrossLay
     model.eval()
 
     # Removed per-parameter dist.broadcast to avoid potential collective-order
-    # divergence between ranks.  The model parameters are deterministically
-    # initialised with a fixed random seed on every rank, so they are already
-    # identical.  Broadcasting each parameter one-by-one is unnecessary and
-    # created a long sequence of `dist.broadcast` calls; if the parameter
-    # iteration order differed even slightly (e.g. due to Python insertion-
-    # order subtleties), the two ranks would desynchronise and the NCCL
-    # watchdog would trigger.  With the broadcast removed we rely on the fixed
-    # seed for reproducibility and simply insert a barrier to keep the ranks
-    # in lock-step.
+    # divergence between ranks. The main model parameters are deterministically
+    # initialised with a fixed random seed on every rank, so they are generally
+    # identical.
+    # However, log_threshold (if used for JumpReLU) needs to be explicitly broadcast
+    # as different GPU initializations, even with the same seed, can lead to
+    # minor discrepancies that affect JumpReLU gating if not perfectly synced.
     if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()
+        if clt_config_fn.activation_fn == "jumprelu":
+            # Ensure log_threshold exists and is a parameter before broadcasting
+            if (
+                hasattr(model, "log_threshold")
+                and model.log_threshold is not None
+                and isinstance(model.log_threshold, nn.Parameter)
+            ):
+                dist.broadcast(model.log_threshold.data, src=0)
+            else:
+                # This case should ideally not be hit if activation_fn is jumprelu
+                # and the model is correctly initialized. Log if it occurs.
+                if RANK == 0:  # RANK is a global constant in the file
+                    print(
+                        f"Rank {RANK}: Warning - single_gpu_model configured for jumprelu but log_threshold not found or not a Parameter. Skipping broadcast of log_threshold."
+                    )
+        dist.barrier()  # Barrier to ensure all ranks are synced after potential broadcast.
     return model
 
 
