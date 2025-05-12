@@ -205,18 +205,16 @@ class CLTTrainer:
         # different subset of tokens and lead to inconsistent batch sizes which breaks
         # collective ops such as all_gather in ColumnParallelLinear.
 
-        # Determine the rank and world size to pass to the activation store.
-        # For TP, each rank needs the *full* batch, so we pass world_size=1 to the store
-        # to prevent it from sharding the data based on the TP world size.
-        activation_store_rank = self.rank  # Rank still needed for logging/potential future use within store
-        activation_store_world = 1 if self.distributed else self.world_size  # <-- Force world=1 for TP
+        # Pass the actual rank and world size from the distributed setup
+        activation_store_rank = self.rank
+        activation_store_world = self.world_size
 
         self.activation_store = create_activation_store(
             training_config=self.training_config,
             clt_config=self.clt_config,
             device=self.device,
-            rank=activation_store_rank,  # Pass the determined rank
-            world_size=activation_store_world,  # Pass the determined world size (1 for TP)
+            rank=activation_store_rank,  # Pass the actual rank
+            world_size=activation_store_world,  # Pass the actual world size
             start_time=self.start_time,
         )
 
