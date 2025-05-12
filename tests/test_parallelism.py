@@ -669,8 +669,14 @@ def test_feature_activations(
                             f"    DEBUG jumprelu L{layer_idx}: Single is zero: {single_is_zero}, Multi is zero: {multi_is_zero}"
                         )
 
-                assert torch.allclose(single_out, multi_out, atol=1e-6), (
-                    f"Mismatch in feature activations for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
+                current_atol = 1e-6
+                if clt_config_fn.activation_fn == "jumprelu":
+                    # For JumpReLU, differences are expected if a value is near the threshold (0.01 by default)
+                    # such that one model zeros it and the other doesn't. Max diff would be ~0.01.
+                    current_atol = 0.01 + 1e-5  # Default threshold + small epsilon
+
+                assert torch.allclose(single_out, multi_out, atol=current_atol), (
+                    f"Mismatch in feature activations for layer {layer_idx} (config: {clt_config_fn.activation_fn}, atol={current_atol})."
                     f"\nMax diff: {(single_out - multi_out).abs().max()}"
                 )
     finally:
@@ -810,8 +816,17 @@ def test_full_forward_pass(
                     pytest.fail(
                         f"Shape mismatch forward layer {layer_idx}: Single={single_out.shape}, Multi={multi_out.shape}"
                     )
-                assert torch.allclose(single_out, multi_out, atol=1e-5, rtol=1e-4), (
-                    f"Mismatch in full forward pass for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
+
+                current_atol = 1e-5  # Default atol for forward pass is 1e-5
+                current_rtol = 1e-4  # Default rtol for forward pass is 1e-4
+                if clt_config_fn.activation_fn == "jumprelu":
+                    # For JumpReLU, differences are expected if a value is near the threshold (0.01 by default)
+                    # such that one model zeros it and the other doesn't. Max diff would be ~0.01.
+                    # The rtol can remain the same, but atol needs to cover the absolute diff of ~0.01.
+                    current_atol = 0.01 + 1e-5  # Default threshold + small epsilon
+
+                assert torch.allclose(single_out, multi_out, atol=current_atol, rtol=current_rtol), (
+                    f"Mismatch in full forward pass for layer {layer_idx} (config: {clt_config_fn.activation_fn}, atol={current_atol}, rtol={current_rtol})."
                     f"\nMax diff: {(single_out - multi_out).abs().max()}"
                 )
     finally:
