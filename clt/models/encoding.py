@@ -89,7 +89,10 @@ def _encode_all_layers(
     # Device and dtype are now asserted by the type hints and caller responsibility
     # No inference or .to() calls needed here for the inputs dict items themselves.
 
-    for layer_idx, x in inputs.items():  # x is x_orig, assumed to be on correct device/dtype
+    # Iterate in a deterministic layer order so that all TP ranks execute
+    # collective operations (all_gather) in the exact same sequence.
+    for layer_idx in sorted(inputs.keys()):
+        x = inputs[layer_idx]  # x is x_orig, assumed to be on correct device/dtype
         # Optional: Add assertions here if strict checking is desired at this stage
         # assert x.device == model_device, f"Input for layer {layer_idx} not on expected device"
         # assert x.dtype == model_dtype, f"Input for layer {layer_idx} not on expected dtype"

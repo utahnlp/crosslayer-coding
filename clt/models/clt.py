@@ -652,7 +652,10 @@ class CrossLayerTranscoder(BaseTranscoder):
             return activations
         else:  # ReLU or JumpReLU (per-layer activation)
             activations = {}
-            for layer_idx, x_input in processed_inputs.items():  # Use processed_inputs here
+            # Iterate layers in deterministic ascending order so all ranks
+            # invoke the same collective operations in the same sequence.
+            for layer_idx in sorted(processed_inputs.keys()):
+                x_input = processed_inputs[layer_idx]
                 try:
                     # encode() returns the full activation tensor after per-layer ReLU/JumpReLU
                     # encode() itself handles moving x_input to the correct device/dtype internally
