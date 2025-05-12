@@ -103,6 +103,14 @@ class CLTTrainer:
 
         # Initialize model, passing device and process group for direct initialization
         # self.process_group is correctly set to None if not distributed
+
+        # --- Set Rank-Specific Seed --- #
+        if self.training_config.seed is not None:
+            torch.manual_seed(self.training_config.seed + self.rank)
+            logger.info(f"Rank {self.rank}: Set manual seed to {self.training_config.seed + self.rank}")
+        else:
+            logger.warning(f"Rank {self.rank}: No seed provided in TrainingConfig. Using default torch seeding.")
+
         self.model = CrossLayerTranscoder(clt_config, process_group=self.process_group, device=self.device)
 
         # Initialize optimizer - works on local parameters
@@ -511,6 +519,15 @@ class CLTTrainer:
                     # --- Invalidate Caches --- #
                     if hasattr(self.model, "_cached_decoder_norms"):
                         self.model._cached_decoder_norms = None
+
+                # --- Sync Dead Neuron Counters --- #
+                if (
+                    self.distributed
+                    and self.world_size > 1
+                    and hasattr(self, "n_forward_passes_since_fired")
+                    and self.n_forward_passes_since_fired is not None
+                ):
+                    dist.all_reduce(self.n_forward_passes_since_fired, op=dist.ReduceOp.MIN, group=self.process_group)
 
                 # --- Scheduler step --- (All ranks)
                 if self.scheduler:
