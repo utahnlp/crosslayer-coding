@@ -587,57 +587,58 @@ def test_feature_activations(
             assert multi_gpu_output.device == device
 
     # --- Comparison (only on Rank 0) --- #
-    if RANK == 0:
-        print(f"\nComparing Feature Activations (Rank 0) for config: {clt_config_fn.activation_fn}")
-        for layer_idx in range(clt_config_fn.num_layers):
-            single_out = single_gpu_outputs[layer_idx]
-            multi_out = multi_gpu_outputs[layer_idx]
-            # Ensure multi_out is on the same device as single_out for comparison if it was from single_gpu_model fallback
-            multi_out = multi_out.to(single_out.device)
+    try:
+        if RANK == 0:
+            print(f"\nComparing Feature Activations (Rank 0) for config: {clt_config_fn.activation_fn}")
+            for layer_idx in range(clt_config_fn.num_layers):
+                single_out = single_gpu_outputs[layer_idx]
+                multi_out = multi_gpu_outputs[layer_idx]
+                # Ensure multi_out is on the same device as single_out for comparison if it was from single_gpu_model fallback
+                multi_out = multi_out.to(single_out.device)
 
-            print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
-            assert torch.allclose(single_out, multi_out, atol=1e-6), (
-                f"Mismatch in feature activations for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
-                f"\nMax diff: {(single_out - multi_out).abs().max()}"
-            )
-            # For topk variants, check that non-selected are zero
-            if clt_config_fn.activation_fn == "topk" or clt_config_fn.activation_fn == "batchtopk":
-                # Calculate the number of non-zeros we expect
-                k_val_resolved: Optional[Union[float, int]] = None
-                if clt_config_fn.activation_fn == "topk":
-                    k_val_resolved = clt_config_fn.topk_k
-                elif clt_config_fn.activation_fn == "batchtopk":
-                    k_val_resolved = clt_config_fn.batchtopk_k
-
-                num_expected_non_zero_per_token: int = 0
-                if k_val_resolved is not None:
-                    if 0 < k_val_resolved < 1:  # k_val_resolved is float here
-                        num_expected_non_zero_per_token = math.ceil(k_val_resolved * clt_config_fn.num_features)
-                    elif k_val_resolved >= 1:  # k_val_resolved is float or int here
-                        num_expected_non_zero_per_token = int(k_val_resolved)
-
-                if (
-                    num_expected_non_zero_per_token > 0
-                    and num_expected_non_zero_per_token <= clt_config_fn.num_features
-                ):
+                print(f"  Layer {layer_idx}: Single GPU shape={single_out.shape}, Multi GPU shape={multi_out.shape}")
+                assert torch.allclose(single_out, multi_out, atol=1e-6), (
+                    f"Mismatch in feature activations for layer {layer_idx} (config: {clt_config_fn.activation_fn})."
+                    f"\nMax diff: {(single_out - multi_out).abs().max()}"
+                )
+                # For topk variants, check that non-selected are zero
+                if clt_config_fn.activation_fn == "topk" or clt_config_fn.activation_fn == "batchtopk":
+                    # Calculate the number of non-zeros we expect
+                    k_val_resolved: Optional[Union[float, int]] = None
                     if clt_config_fn.activation_fn == "topk":
-                        # For TokenTopK, count non-zeros per token
-                        non_zeros_per_token = (multi_out != 0).float().sum(dim=-1)
-                        assert torch.all(
-                            non_zeros_per_token <= num_expected_non_zero_per_token
-                        ), f"Layer {layer_idx} (topk): Expected at most {num_expected_non_zero_per_token} non-zeros per token, found more."
+                        k_val_resolved = clt_config_fn.topk_k
                     elif clt_config_fn.activation_fn == "batchtopk":
-                        # For BatchTopK, count total non-zeros across batch for this layer's output
-                        total_non_zeros = (multi_out != 0).float().sum()
-                        max_expected_total_non_zeros = (
-                            num_expected_non_zero_per_token * multi_out.shape[0]
-                        )  # k_per_token * B_tokens
-                        assert (
-                            total_non_zeros <= max_expected_total_non_zeros
-                        ), f"Layer {layer_idx} (batchtopk): Expected at most {max_expected_total_non_zeros} total non-zeros, found {total_non_zeros}."
+                        k_val_resolved = clt_config_fn.batchtopk_k
 
-    if WORLD_SIZE > 1 and dist.is_initialized():
-        dist.barrier()  # Ensure all ranks complete before next test item
+                    num_expected_non_zero_per_token: int = 0
+                    if k_val_resolved is not None:
+                        if 0 < k_val_resolved < 1:  # k_val_resolved is float here
+                            num_expected_non_zero_per_token = math.ceil(k_val_resolved * clt_config_fn.num_features)
+                        elif k_val_resolved >= 1:  # k_val_resolved is float or int here
+                            num_expected_non_zero_per_token = int(k_val_resolved)
+
+                    if (
+                        num_expected_non_zero_per_token > 0
+                        and num_expected_non_zero_per_token <= clt_config_fn.num_features
+                    ):
+                        if clt_config_fn.activation_fn == "topk":
+                            # For TokenTopK, count non-zeros per token
+                            non_zeros_per_token = (multi_out != 0).float().sum(dim=-1)
+                            assert torch.all(
+                                non_zeros_per_token <= num_expected_non_zero_per_token
+                            ), f"Layer {layer_idx} (topk): Expected at most {num_expected_non_zero_per_token} non-zeros per token, found more."
+                        elif clt_config_fn.activation_fn == "batchtopk":
+                            # For BatchTopK, count total non-zeros across batch for this layer's output
+                            total_non_zeros = (multi_out != 0).float().sum()
+                            max_expected_total_non_zeros = (
+                                num_expected_non_zero_per_token * multi_out.shape[0]
+                            )  # k_per_token * B_tokens
+                            assert (
+                                total_non_zeros <= max_expected_total_non_zeros
+                            ), f"Layer {layer_idx} (batchtopk): Expected at most {max_expected_total_non_zeros} total non-zeros, found {total_non_zeros}."
+    finally:
+        if WORLD_SIZE > 1 and dist.is_initialized():
+            dist.barrier()  # Ensure all ranks complete before next test item
 
 
 # Test 3: Decoder Forward Pass (decode)
