@@ -595,19 +595,23 @@ class CLTTrainer:
                         # --- Log evaluation metrics (now done by MetricLogger) ---
                         self.metric_logger.log_evaluation_metrics(step, eval_metrics)
 
-                    # Optionally compute and log sparsity diagnostics (can be slow)
+                    # Optionally compute and log sparsity diagnostics (can be slow).
+                    # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
+                    # internally calls `get_decoder_norms`, which performs distributed all-reduces.
+                    # We therefore compute the diagnostics on **all** ranks to keep the NCCL
+                    # collectives aligned, but we still only merge the returned values into
+                    # `eval_metrics` and log them on rank 0.
                     if self.training_config.compute_sparsity_diagnostics:
-                        # Calculate diagnostics using the same batch data and cached activations/norms
-                        sparsity_diag_metrics = compute_sparsity_diagnostics(  # New call
+                        sparsity_diag_metrics = compute_sparsity_diagnostics(
                             model=self.model,
                             training_config=self.training_config,
                             feature_activations=feature_activations_batch,
                         )
-                        # Merge diagnostics into the main eval metrics dict
-                        if sparsity_diag_metrics:
-                            eval_metrics.update(sparsity_diag_metrics)
-                            # Log updated metrics to WandB (only rank 0)
-                            if not self.distributed or self.rank == 0:
+
+                        # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
+                        if (not self.distributed) or (self.rank == 0):
+                            if sparsity_diag_metrics:
+                                eval_metrics.update(sparsity_diag_metrics)
                                 self.wandb_logger.log_evaluation(step, eval_metrics)
 
                     # Ensure all ranks finish evaluation before proceeding
