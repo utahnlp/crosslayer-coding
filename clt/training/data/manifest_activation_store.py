@@ -48,8 +48,8 @@ class ChunkRowSampler(Sampler):
        have unused rows for the current rank in the current epoch. Rows within
        a chunk are yielded in a pre-shuffled order for that epoch.
 
-    Strides by GPU rank so there is no overlap. Yields (batch, 2) numpy arrays
-    containing [chunk_id, row_id].
+    Strides by GPU rank so there is no overlap (if shard_data=True).
+    Yields (batch, 2) numpy arrays containing [chunk_id, row_id].
     """
 
     def __init__(
@@ -62,6 +62,7 @@ class ChunkRowSampler(Sampler):
         rank: int,
         world: int,
         sampling_strategy: str = "sequential",  # Added sampling strategy
+        shard_data: bool = True,  # ---> ADDED PARAMETER <---
     ):
         # Handle chunk_sizes as either a dict mapping chunk_id → size or an array of sizes
         if isinstance(chunk_sizes, dict):
@@ -76,6 +77,7 @@ class ChunkRowSampler(Sampler):
         self.num_chunks = num_chunks
         self.seed = seed
         self.epoch = epoch
+        self.shard_data = shard_data  # ---> STORE PARAMETER <---
 
         # Added: Validate and store sampling strategy
         if sampling_strategy not in ["sequential", "random_chunk"]:
@@ -110,11 +112,19 @@ class ChunkRowSampler(Sampler):
 
             # Get rows assigned to this rank
             chunk_rows = np.arange(chunk_size, dtype=np.uint32)
-            rows_for_rank = chunk_rows[self.rank :: self.world]
+            # ---> MODIFIED LOGIC <---
+            if self.shard_data:
+                rows_for_rank = chunk_rows[self.rank :: self.world]
+            else:
+                # If not sharding, every rank gets all rows for the chunk.
+                # This is for Tensor Parallelism where each rank needs the full batch.
+                # The rank/world information is still useful for logging or other non-sharding logic.
+                rows_for_rank = chunk_rows[:]  # Get all rows
+            # ---> END MODIFICATION <---
             # DEBUG: Log row counts before and after sharding for a specific chunk (e.g., chunk 0)
             if chunk_id == 0:
                 logger.debug(
-                    f"Rank {self.rank}: Chunk 0 total rows: {chunk_size}. Rows after sharding [{self.rank}::{self.world}]: {len(rows_for_rank)}"
+                    f"Rank {self.rank}: Chunk 0 total rows: {chunk_size}. Shard_data: {self.shard_data}. Rows after sharding (or not): {len(rows_for_rank)}"
                 )
 
             # Shuffle rows *within* the chunk for this rank for the epoch
@@ -283,6 +293,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         sampling_strategy: str = "sequential",  # Added sampling strategy
         normalization_method: str = "none",  # Added normalization method
         prefetch_batches: int = 1,  # Number of batches to prefetch (1 means no prefetching)
+        shard_data: bool = True,  # ---> ADDED PARAMETER <---
     ):
         self.train_batch_size_tokens = train_batch_size_tokens  # From Base
         self.rank = rank
@@ -292,6 +303,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         # Added: Store sampling strategy
         self.prefetch_batches = max(1, prefetch_batches)  # Ensure at least 1
         self.sampling_strategy = sampling_strategy
+        self.shard_data = shard_data  # ---> STORE PARAMETER <---
 
         # Device setup
         _device_input = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -442,6 +454,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             rank=self.rank,
             world=self.world,
             sampling_strategy=self.sampling_strategy,  # Pass the strategy
+            shard_data=self.shard_data,  # ---> PASS PARAMETER <---
         )
         self.sampler_iter = iter(self.sampler)
 
@@ -901,6 +914,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             "epoch": self.epoch,
             "seed": self.seed,
             "sampling_strategy": self.sampling_strategy,
+            "shard_data": self.shard_data,  # ---> ADD TO STATE DICT <---
             # Sampler state (chunk order, position) is implicitly restored
             # by re-initializing ChunkRowSampler with the saved epoch and seed.
         }
@@ -914,8 +928,9 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
         loaded_epoch = int(state_dict.get("epoch", 0))
         loaded_seed = int(state_dict.get("seed", self.seed))
-        # --> Added: Load sampling strategy, default to sequential if missing <--
-        loaded_strategy = state_dict.get("sampling_strategy", "sequential")
+        # Default to sequential if not found for backward compatibility
+        loaded_sampling_strategy = state_dict.get("sampling_strategy", "sequential")
+        loaded_shard_data = state_dict.get("shard_data", True)  # Default to True if missing
 
         if loaded_seed != self.seed:
             logger.warning(
@@ -924,17 +939,12 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             self.seed = loaded_seed  # Update own seed to match loaded state
 
         self.epoch = loaded_epoch
-        # --> Added: Update own strategy to match loaded state <--
-        # Check if the loaded strategy is different and log a warning maybe?
-        if loaded_strategy != self.sampling_strategy:
-            logger.warning(
-                f"Loading state with different sampling strategy ('{loaded_strategy}') than current ('{self.sampling_strategy}'). Using loaded strategy."
-            )
-            self.sampling_strategy = loaded_strategy
+        self.sampling_strategy = loaded_sampling_strategy  # Update strategy
+        self.shard_data = loaded_shard_data  # Update shard_data
 
-        # Re‑create sampler iterator starting from the loaded epoch, seed, and strategy
+        # Re‑create sampler iterator starting from the loaded epoch/state
         logger.info(
-            f"Resetting sampler to epoch {self.epoch} with seed {self.seed} and strategy '{self.sampling_strategy}'."
+            f"Resetting sampler to epoch {self.epoch} with seed {self.seed}, strategy '{self.sampling_strategy}', shard_data={self.shard_data}."
         )
         self.sampler = ChunkRowSampler(
             chunk_sizes=self.chunk_sizes,
@@ -945,6 +955,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             rank=self.rank,
             world=self.world,
             sampling_strategy=self.sampling_strategy,  # Use loaded/updated strategy
+            shard_data=self.shard_data,  # ---> PASS LOADED PARAMETER <---
         )
         self.sampler_iter = iter(self.sampler)
 

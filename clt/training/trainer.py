@@ -216,6 +216,7 @@ class CLTTrainer:
             rank=activation_store_rank,  # Pass the actual rank
             world_size=activation_store_world,  # Pass the actual world size
             start_time=self.start_time,
+            shard_data=not self.distributed,  # ---> ADDED: False if distributed (TP), True otherwise <----
         )
 
         # Pass normalisation statistics (if available) so the loss can be computed in
