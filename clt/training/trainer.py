@@ -205,8 +205,8 @@ class CLTTrainer:
         # different subset of tokens and lead to inconsistent batch sizes which breaks
         # collective ops such as all_gather in ColumnParallelLinear.
 
-        activation_store_rank = 0 if self.distributed else self.rank
-        activation_store_world = 1 if self.distributed else self.world_size
+        activation_store_rank = self.rank
+        activation_store_world = self.world_size
 
         self.activation_store = create_activation_store(
             training_config=self.training_config,
