@@ -346,6 +346,14 @@ def multi_gpu_model(
                 ):
                     if multi_param.shape == single_param_data.shape:
                         multi_param.data.copy_(single_param_data)
+                        if RANK == 0 and name == "log_threshold":
+                            # Verify the copy for log_threshold on RANK 0
+                            # Using a small slice to avoid excessive printing
+                            s_slice = single_param_data.flatten()[: min(5, single_param_data.numel())]
+                            m_slice = multi_param.data.flatten()[: min(5, multi_param.data.numel())]
+                            print(
+                                f"Rank {RANK} DEBUG: log_threshold copied. Single_model (src): {s_slice}. Multi_model (dst after copy): {m_slice}. Equal: {torch.equal(single_param_data, multi_param.data)}"
+                            )
                     else:
                         if RANK == 0:
                             print(
