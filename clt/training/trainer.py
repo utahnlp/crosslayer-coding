@@ -198,13 +198,22 @@ class CLTTrainer:
 
         # Add elif blocks here for other potential schedulers
 
-        # Initialize activation store based on config - uses self.rank/world_size now
-        self.activation_store = create_activation_store(  # New call
+        # Initialize activation store.
+        # For tensor parallelism we need every rank to process the *same* batch because
+        # activations are sharded **across the feature dimension**, not across tokens.
+        # Passing the per-rank/world sharded parameters here would make each rank see a
+        # different subset of tokens and lead to inconsistent batch sizes which breaks
+        # collective ops such as all_gather in ColumnParallelLinear.
+
+        activation_store_rank = 0 if self.distributed else self.rank
+        activation_store_world = 1 if self.distributed else self.world_size
+
+        self.activation_store = create_activation_store(
             training_config=self.training_config,
-            clt_config=self.clt_config,  # Pass clt_config
+            clt_config=self.clt_config,
             device=self.device,
-            rank=self.rank,
-            world_size=self.world_size,
+            rank=activation_store_rank,
+            world_size=activation_store_world,
             start_time=self.start_time,
         )
 
