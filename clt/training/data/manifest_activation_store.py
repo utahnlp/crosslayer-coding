@@ -96,6 +96,9 @@ class ChunkRowSampler(Sampler):
 
     def _reset_generator(self):
         """Resets the numpy random generator and internal state for a new epoch."""
+        logger.debug(
+            f"Rank {self.rank}: ChunkRowSampler._reset_generator called for epoch {self.epoch} with seed {self.seed}, world_size {self.world}"
+        )  # DEBUG
         self.rng = np.random.default_rng(self.seed + self.epoch)  # Use instance RNG
 
         # --- State common to both strategies ---
@@ -108,6 +111,12 @@ class ChunkRowSampler(Sampler):
             # Get rows assigned to this rank
             chunk_rows = np.arange(chunk_size, dtype=np.uint32)
             rows_for_rank = chunk_rows[self.rank :: self.world]
+            # DEBUG: Log row counts before and after sharding for a specific chunk (e.g., chunk 0)
+            if chunk_id == 0:
+                logger.debug(
+                    f"Rank {self.rank}: Chunk 0 total rows: {chunk_size}. Rows after sharding [{self.rank}::{self.world}]: {len(rows_for_rank)}"
+                )
+
             # Shuffle rows *within* the chunk for this rank for the epoch
             self.rng.shuffle(rows_for_rank)
             self.rows_by_chunk_for_epoch[chunk_id] = rows_for_rank
