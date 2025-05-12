@@ -205,15 +205,18 @@ class CLTTrainer:
         # different subset of tokens and lead to inconsistent batch sizes which breaks
         # collective ops such as all_gather in ColumnParallelLinear.
 
-        activation_store_rank = self.rank
-        activation_store_world = self.world_size
+        # Determine the rank and world size to pass to the activation store.
+        # For TP, each rank needs the *full* batch, so we pass world_size=1 to the store
+        # to prevent it from sharding the data based on the TP world size.
+        activation_store_rank = self.rank  # Rank still needed for logging/potential future use within store
+        activation_store_world = 1 if self.distributed else self.world_size  # <-- Force world=1 for TP
 
         self.activation_store = create_activation_store(
             training_config=self.training_config,
             clt_config=self.clt_config,
             device=self.device,
-            rank=activation_store_rank,
-            world_size=activation_store_world,
+            rank=activation_store_rank,  # Pass the determined rank
+            world_size=activation_store_world,  # Pass the determined world size (1 for TP)
             start_time=self.start_time,
         )
 
@@ -375,11 +378,13 @@ class CLTTrainer:
 
                     # logging to diagnose batch size mismatch
                     tok_cnt = next(iter(inputs.values())).shape[0]  # number of rows (=tokens) in this batch
-                    tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
-                    gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
-                    dist.all_gather(gathered, tok_cnt_t)
-                    if self.rank == 0:
-                        print("Batch token-count per rank:", [int(x.item()) for x in gathered])
+                    # Only run the all_gather diagnostic when running in distributed mode
+                    if self.distributed and self.world_size > 1 and dist.is_initialized():
+                        tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
+                        gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
+                        dist.all_gather(gathered, tok_cnt_t)
+                        if self.rank == 0:
+                            print("Batch token-count per rank:", [int(x.item()) for x in gathered])
 
                 except StopIteration:
                     # Rank 0 prints message
