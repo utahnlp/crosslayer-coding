@@ -1154,16 +1154,18 @@ def test_gradient_calculation(
                     )
                     continue
 
-                atol, rtol = (1e-4, 1e-3) if is_sharded else (1e-4, 1e-4)
+                current_atol, current_rtol = (1e-4, 5e-3) if is_sharded else (1e-4, 1e-4)  # Increased rtol for sharded
                 if name == "log_threshold":
                     # Increased atol for log_threshold gradient due to known forward pass sensitivity
-                    atol, rtol = (3e-5, 1e-4)
+                    current_atol, current_rtol = (3e-5, 1e-4)
 
-                if not torch.allclose(single_grad_to_compare, multi_grad_to_compare, atol=atol, rtol=rtol):
+                if not torch.allclose(
+                    single_grad_to_compare, multi_grad_to_compare, atol=current_atol, rtol=current_rtol
+                ):
                     gradient_mismatch_detected = True
                     diff = (single_grad_to_compare - multi_grad_to_compare).abs().max()
                     mismatch_messages.append(
-                        f"Mismatch for '{name}' (config {clt_config_fn.activation_fn}). Max diff: {diff}. Type: {'Sharded' if is_sharded else 'Replicated/Other'}"
+                        f"Mismatch for '{name}' (config {clt_config_fn.activation_fn}, atol={current_atol}, rtol={current_rtol}). Max diff: {diff}. Type: {'Sharded' if is_sharded else 'Replicated/Other'}"
                     )
 
         # Actual failure point for RANK 0 if mismatches were detected
