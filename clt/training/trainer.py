@@ -93,6 +93,22 @@ class CLTTrainer:
             # Process group is None when not distributed
             self.process_group = None
 
+        # --- Mixed Precision Setup ---
+        self.mixed_precision = self.training_config.precision.lower()
+        self.use_cuda_amp = torch.cuda.is_available() and self.mixed_precision in {"fp16", "bf16"}
+        self.autocast_dtype = (
+            torch.float16
+            if self.mixed_precision == "fp16"
+            else torch.bfloat16 if self.mixed_precision == "bf16" else torch.float32
+        )
+        # Initialize GradScaler (enabled only for fp16 on CUDA)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.mixed_precision == "fp16" and self.use_cuda_amp))
+
+        logger.info(
+            f"Rank {self.rank}: Mixed precision mode: {self.mixed_precision}, use_cuda_amp: {self.use_cuda_amp}, autocast_dtype: {self.autocast_dtype}"
+        )
+        logger.info(f"Rank {self.rank}: GradScaler enabled: {self.scaler.is_enabled()}")
+
         # Set up log directory - only rank 0 creates it
         self.log_dir = log_dir or f"clt_train_{int(time.time())}"
         if not self.distributed or self.rank == 0:
@@ -356,6 +372,12 @@ class CLTTrainer:
             dummy_out = dummy * 2
             dummy_out.backward()
             print("!!! END DIAGNOSTIC !!!\n")
+
+        # --- Enable Anomaly Detection (if configured) ---
+        if self.training_config.debug_anomaly:
+            torch.autograd.set_detect_anomaly(True)
+            if not self.distributed or self.rank == 0:
+                logger.info("PyTorch Anomaly Detection ENABLED.")
 
         # Create progress bar only on rank 0
         pbar: Union[tqdm, range]
