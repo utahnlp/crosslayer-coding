@@ -200,6 +200,7 @@ tutorials/tutorial_activations_local_1M_mlp_only/
 conversion_test/
 server_data/
 tutorials/old/
+clt_remote_runs/
 
 # models
 *.pt

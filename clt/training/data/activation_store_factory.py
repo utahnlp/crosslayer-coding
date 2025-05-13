@@ -16,6 +16,7 @@ def create_activation_store(
     rank: int,
     world_size: int,
     start_time: float,
+    shard_data: bool = True,
 ) -> BaseActivationStore:
     """Create the appropriate activation store based on training config.
 
@@ -30,6 +31,7 @@ def create_activation_store(
         rank: The distributed rank.
         world_size: The distributed world size.
         start_time: The training start time for elapsed time logging (unused if generate is gone).
+        shard_data: Whether to include shard data in the store.
 
     Returns:
         Configured instance of a BaseActivationStore subclass.
@@ -55,6 +57,7 @@ def create_activation_store(
             seed=training_config.seed,
             sampling_strategy=sampling_strategy,
             normalization_method=training_config.normalization_method,
+            shard_data=shard_data,
         )
         if isinstance(store, LocalActivationStore):
             logger.info(f"Rank {rank}: Initialized LocalActivationStore from path: {store.dataset_path}")
@@ -84,6 +87,7 @@ def create_activation_store(
             timeout=remote_cfg.get("timeout", 60),
             sampling_strategy=sampling_strategy,
             normalization_method=training_config.normalization_method,
+            shard_data=shard_data,
         )
         if isinstance(store, RemoteActivationStore):
             logger.info(f"Rank {rank}: Initialized RemoteActivationStore for dataset: {store.did_raw}")

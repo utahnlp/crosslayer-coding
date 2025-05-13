@@ -53,6 +53,7 @@ class RemoteActivationStore(ManifestActivationStore):
         timeout: int = 60,
         sampling_strategy: str = "sequential",
         normalization_method: str = "none",
+        shard_data: bool = True,
     ):
         self.server = server_url.rstrip("/") + "/"
         self.did_enc = quote(dataset_id, safe="")
@@ -68,6 +69,7 @@ class RemoteActivationStore(ManifestActivationStore):
             seed=seed,
             sampling_strategy=sampling_strategy,
             normalization_method=normalization_method,
+            shard_data=shard_data,
         )
 
         logger.info(

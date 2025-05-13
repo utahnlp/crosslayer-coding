@@ -35,6 +35,7 @@ class LocalActivationStore(ManifestActivationStore):
         seed: int = 42,
         sampling_strategy: str = "sequential",
         normalization_method: str = "none",
+        shard_data: bool = True,
     ):
         self.dataset_path = Path(dataset_path).resolve()
         if not self.dataset_path.is_dir():
@@ -49,6 +50,7 @@ class LocalActivationStore(ManifestActivationStore):
             seed=seed,
             sampling_strategy=sampling_strategy,
             normalization_method=normalization_method,
+            shard_data=shard_data,
         )
 
         logger.info(

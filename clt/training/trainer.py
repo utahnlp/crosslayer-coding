@@ -103,6 +103,14 @@ class CLTTrainer:
 
         # Initialize model, passing device and process group for direct initialization
         # self.process_group is correctly set to None if not distributed
+
+        # --- Set Rank-Specific Seed --- #
+        if self.training_config.seed is not None:
+            torch.manual_seed(self.training_config.seed + self.rank)
+            logger.info(f"Rank {self.rank}: Set manual seed to {self.training_config.seed + self.rank}")
+        else:
+            logger.warning(f"Rank {self.rank}: No seed provided in TrainingConfig. Using default torch seeding.")
+
         self.model = CrossLayerTranscoder(clt_config, process_group=self.process_group, device=self.device)
 
         # Initialize optimizer - works on local parameters
@@ -198,14 +206,25 @@ class CLTTrainer:
 
         # Add elif blocks here for other potential schedulers
 
-        # Initialize activation store based on config - uses self.rank/world_size now
-        self.activation_store = create_activation_store(  # New call
+        # Initialize activation store.
+        # For tensor parallelism we need every rank to process the *same* batch because
+        # activations are sharded **across the feature dimension**, not across tokens.
+        # Passing the per-rank/world sharded parameters here would make each rank see a
+        # different subset of tokens and lead to inconsistent batch sizes which breaks
+        # collective ops such as all_gather in ColumnParallelLinear.
+
+        # Pass the actual rank and world size from the distributed setup
+        activation_store_rank = self.rank
+        activation_store_world = self.world_size
+
+        self.activation_store = create_activation_store(
             training_config=self.training_config,
-            clt_config=self.clt_config,  # Pass clt_config
+            clt_config=self.clt_config,
             device=self.device,
-            rank=self.rank,
-            world_size=self.world_size,
+            rank=activation_store_rank,  # Pass the actual rank
+            world_size=activation_store_world,  # Pass the actual world size
             start_time=self.start_time,
+            shard_data=not self.distributed,  # ---> ADDED: False if distributed (TP), True otherwise <----
         )
 
         # Pass normalisation statistics (if available) so the loss can be computed in
@@ -364,6 +383,16 @@ class CLTTrainer:
                     batch_get_duration = time.monotonic() - batch_get_start_time
                     logger.debug(f"Rank {self.rank} Step {step}: Getting batch took {batch_get_duration:.4f}s")
 
+                    # logging to diagnose batch size mismatch
+                    tok_cnt = next(iter(inputs.values())).shape[0]  # number of rows (=tokens) in this batch
+                    # Only run the all_gather diagnostic when running in distributed mode
+                    if self.distributed and self.world_size > 1 and dist.is_initialized():
+                        tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
+                        gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
+                        dist.all_gather(gathered, tok_cnt_t)
+                        if self.rank == 0:
+                            print("Batch token-count per rank:", [int(x.item()) for x in gathered])
+
                 except StopIteration:
                     # Rank 0 prints message
                     if not self.distributed or self.rank == 0:
@@ -491,6 +520,15 @@ class CLTTrainer:
                     if hasattr(self.model, "_cached_decoder_norms"):
                         self.model._cached_decoder_norms = None
 
+                # --- Sync Dead Neuron Counters --- #
+                if (
+                    self.distributed
+                    and self.world_size > 1
+                    and hasattr(self, "n_forward_passes_since_fired")
+                    and self.n_forward_passes_since_fired is not None
+                ):
+                    dist.all_reduce(self.n_forward_passes_since_fired, op=dist.ReduceOp.MIN, group=self.process_group)
+
                 # --- Scheduler step --- (All ranks)
                 if self.scheduler:
                     self.scheduler.step()
@@ -586,19 +624,23 @@ class CLTTrainer:
                         # --- Log evaluation metrics (now done by MetricLogger) ---
                         self.metric_logger.log_evaluation_metrics(step, eval_metrics)
 
-                    # Optionally compute and log sparsity diagnostics (can be slow)
+                    # Optionally compute and log sparsity diagnostics (can be slow).
+                    # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
+                    # internally calls `get_decoder_norms`, which performs distributed all-reduces.
+                    # We therefore compute the diagnostics on **all** ranks to keep the NCCL
+                    # collectives aligned, but we still only merge the returned values into
+                    # `eval_metrics` and log them on rank 0.
                     if self.training_config.compute_sparsity_diagnostics:
-                        # Calculate diagnostics using the same batch data and cached activations/norms
-                        sparsity_diag_metrics = compute_sparsity_diagnostics(  # New call
+                        sparsity_diag_metrics = compute_sparsity_diagnostics(
                             model=self.model,
                             training_config=self.training_config,
                             feature_activations=feature_activations_batch,
                         )
-                        # Merge diagnostics into the main eval metrics dict
-                        if sparsity_diag_metrics:
-                            eval_metrics.update(sparsity_diag_metrics)
-                            # Log updated metrics to WandB (only rank 0)
-                            if not self.distributed or self.rank == 0:
+
+                        # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
+                        if (not self.distributed) or (self.rank == 0):
+                            if sparsity_diag_metrics:
+                                eval_metrics.update(sparsity_diag_metrics)
                                 self.wandb_logger.log_evaluation(step, eval_metrics)
 
                     # Ensure all ranks finish evaluation before proceeding
@@ -668,53 +710,36 @@ class CLTTrainer:
             print(f"Saving CLT configuration (as trained) to {config_save_path}...")
             try:
                 config_dict_as_trained = asdict(self.clt_config)
-                model_name = None
-                if (
-                    hasattr(self.training_config, "generation_config")
-                    and self.training_config.generation_config is not None
-                    and "model_name" in self.training_config.generation_config
-                ):
-                    model_name = self.training_config.generation_config["model_name"]
-                    config_dict_as_trained["model_name"] = model_name
-                elif (
-                    hasattr(self.training_config, "activation_config")
-                    and hasattr(self.training_config.activation_config, "model_name")
-                    and self.training_config.activation_config.model_name is not None
-                ):
-                    config_dict_as_trained["model_name"] = self.training_config.activation_config.model_name
+                # Remove accesses to attributes no longer in TrainingConfig
+                # model_name = None
+                # if (
+                #     hasattr(self.training_config, "generation_config")
+                #     and self.training_config.generation_config is not None
+                #     and "model_name" in self.training_config.generation_config
+                # ):
+                #     model_name = self.training_config.generation_config["model_name"]
+                #     config_dict_as_trained["model_name"] = model_name
+                # elif (
+                #     hasattr(self.training_config, "activation_config")
+                #     and hasattr(self.training_config.activation_config, "model_name")
+                #     and self.training_config.activation_config.model_name is not None
+                # ):
+                #     config_dict_as_trained["model_name"] = self.training_config.activation_config.model_name
+
+                # Attempt to add model_name if available in clt_config itself
+                if hasattr(self.clt_config, "model_name") and self.clt_config.model_name:
+                    config_dict_as_trained["model_name"] = self.clt_config.model_name
 
                 if hasattr(self.training_config, "normalization_method"):
                     config_dict_as_trained["normalization_method"] = self.training_config.normalization_method
                 if hasattr(self.training_config, "activation_dtype"):
                     config_dict_as_trained["expected_input_dtype"] = self.training_config.activation_dtype
 
-                source_cfg_for_hooks = None
-                if (
-                    hasattr(self.training_config, "generation_config")
-                    and self.training_config.generation_config is not None
-                ):
-                    source_cfg_for_hooks = self.training_config.generation_config
-                elif (
-                    hasattr(self.training_config, "activation_config")
-                    and self.training_config.activation_config is not None
-                ):
-                    act_cfg = self.training_config.activation_config
-                    if hasattr(act_cfg, "__dict__"):
-                        source_cfg_for_hooks = act_cfg.__dict__
-                    elif isinstance(act_cfg, dict):
-                        source_cfg_for_hooks = act_cfg
-
-                if source_cfg_for_hooks:
-                    if "mlp_input_module_path_template" in source_cfg_for_hooks:
-                        config_dict_as_trained["mlp_input_template"] = source_cfg_for_hooks[
-                            "mlp_input_module_path_template"
-                        ]
-                    if "mlp_output_module_path_template" in source_cfg_for_hooks:
-                        config_dict_as_trained["mlp_output_template"] = source_cfg_for_hooks[
-                            "mlp_output_module_path_template"
-                        ]
-                    if "context_size" in source_cfg_for_hooks:
-                        config_dict_as_trained["context_size"] = source_cfg_for_hooks["context_size"]
+                # Add hook templates if available directly in clt_config
+                if hasattr(self.clt_config, "mlp_input_template") and self.clt_config.mlp_input_template:
+                    config_dict_as_trained["mlp_input_template"] = self.clt_config.mlp_input_template
+                if hasattr(self.clt_config, "mlp_output_template") and self.clt_config.mlp_output_template:
+                    config_dict_as_trained["mlp_output_template"] = self.clt_config.mlp_output_template
 
                 with open(config_save_path, "w") as f:
                     json.dump(config_dict_as_trained, f, indent=2)

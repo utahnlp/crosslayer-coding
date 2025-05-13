@@ -4,6 +4,33 @@ from typing import Optional, Tuple
 
 class BatchTopK(torch.autograd.Function):
     @staticmethod
+    def _compute_mask(x: torch.Tensor, k_per_token: int, x_for_ranking: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Helper static method to compute the BatchTopK mask."""
+        B = x.size(0)
+        if k_per_token <= 0:
+            return torch.zeros_like(x, dtype=torch.bool)
+
+        F_total_batch = x.numel()
+        if F_total_batch == 0:
+            return torch.zeros_like(x, dtype=torch.bool)
+
+        k_total_batch = min(k_per_token * B, F_total_batch)
+
+        ranking_tensor_to_use = x_for_ranking if x_for_ranking is not None else x
+        x_flat = x.reshape(-1)
+        ranking_flat = ranking_tensor_to_use.reshape(-1)
+
+        if k_total_batch > 0:
+            _, flat_indices = torch.topk(ranking_flat, k_total_batch, sorted=False)
+            mask_flat = torch.zeros_like(x_flat, dtype=torch.bool)
+            mask_flat[flat_indices] = True
+            mask = mask_flat.view_as(x)
+        else:
+            mask = torch.zeros_like(x, dtype=torch.bool)
+
+        return mask
+
+    @staticmethod
     def forward(
         ctx, x: torch.Tensor, k: float, straight_through: bool, x_for_ranking: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -18,40 +45,8 @@ class BatchTopK(torch.autograd.Function):
         Returns:
             Output tensor with BatchTopK applied.
         """
-        B = x.size(0)
-        # k is now an integer representing desired features *per token*
         k_per_token = int(k)
-        if k_per_token <= 0:
-            # If k_per_token is 0 or negative, return a zero tensor
-            if straight_through:
-                ctx.save_for_backward(torch.zeros_like(x, dtype=torch.bool))
-            return torch.zeros_like(x)
-
-        # Total features to keep across the batch
-        # Clamp to F_total (x.numel()) to avoid errors if k_per_token * B > F_total
-        # Also handle the case where x is empty (x.numel() == 0)
-        F_total_batch = x.numel()
-        if F_total_batch == 0:  # If input is empty, return empty tensor
-            if straight_through:
-                ctx.save_for_backward(torch.zeros_like(x, dtype=torch.bool))
-            return torch.zeros_like(x)
-
-        k_total_batch = min(k_per_token * B, F_total_batch)
-
-        ranking_tensor_to_use = x_for_ranking if x_for_ranking is not None else x
-
-        # Flatten input and ranking tensor for global top-k
-        x_flat = x.reshape(-1)  # [B*F_total]
-        ranking_flat = ranking_tensor_to_use.reshape(-1)
-
-        if k_total_batch > 0:
-            # Global top-k on the flattened ranking tensor
-            _, flat_indices = torch.topk(ranking_flat, k_total_batch, sorted=False)
-            mask_flat = torch.zeros_like(x_flat, dtype=torch.bool)
-            mask_flat[flat_indices] = True
-            mask = mask_flat.view_as(x)  # Reshape mask to original x shape
-        else:  # k_total_batch is 0 (either k_per_token was 0 or input was empty)
-            mask = torch.zeros_like(x, dtype=torch.bool)
+        mask = BatchTopK._compute_mask(x, k_per_token, x_for_ranking)
 
         if straight_through:
             ctx.save_for_backward(mask)
@@ -98,6 +93,35 @@ class BatchTopK(torch.autograd.Function):
 
 class TokenTopK(torch.autograd.Function):
     @staticmethod
+    def _compute_mask(x: torch.Tensor, k_float: float, x_for_ranking: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Helper static method to compute the TokenTopK mask."""
+        B_tokens, F_total = x.shape
+
+        if F_total == 0:
+            return torch.zeros_like(x, dtype=torch.bool)
+
+        k_per_token: int
+        if 0 < k_float < 1:
+            k_per_token = int(torch.ceil(torch.tensor(k_float * F_total)).item())
+        elif k_float >= 1:
+            k_per_token = int(k_float)
+        else:  # k <= 0
+            return torch.zeros_like(x, dtype=torch.bool)
+
+        k_per_token = min(k_per_token, F_total)
+
+        ranking_tensor_to_use = x_for_ranking if x_for_ranking is not None else x
+
+        if k_per_token > 0:
+            _, topk_indices_per_row = torch.topk(ranking_tensor_to_use, k_per_token, dim=-1, sorted=False)
+            mask = torch.zeros_like(x, dtype=torch.bool)
+            mask.scatter_(-1, topk_indices_per_row, True)
+        else:
+            mask = torch.zeros_like(x, dtype=torch.bool)
+
+        return mask
+
+    @staticmethod
     def forward(
         ctx, x: torch.Tensor, k: float, straight_through: bool, x_for_ranking: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -114,39 +138,7 @@ class TokenTopK(torch.autograd.Function):
         Returns:
             Output tensor with TokenTopK applied.
         """
-        B_tokens, F_total = x.shape
-
-        if F_total == 0:  # Handle empty feature dimension
-            if straight_through:
-                ctx.save_for_backward(torch.zeros_like(x, dtype=torch.bool))
-            return torch.zeros_like(x)
-
-        k_per_token: int
-        if 0 < k < 1:
-            k_per_token = int(torch.ceil(torch.tensor(k * F_total)).item())
-        elif k >= 1:
-            k_per_token = int(k)
-        else:  # k <= 0
-            if straight_through:
-                ctx.save_for_backward(torch.zeros_like(x, dtype=torch.bool))
-            return torch.zeros_like(x)
-
-        # Clamp k_per_token to be at most F_total
-        k_per_token = min(k_per_token, F_total)
-
-        ranking_tensor_to_use = x_for_ranking if x_for_ranking is not None else x
-
-        if k_per_token > 0:
-            # Apply topk for each row (token)
-            # topk returns values and indices. We only need indices to create the mask.
-            _, topk_indices_per_row = torch.topk(ranking_tensor_to_use, k_per_token, dim=-1, sorted=False)
-
-            # Create mask
-            mask = torch.zeros_like(x, dtype=torch.bool)
-            # Use scatter_ to set True at the topk_indices for each row
-            mask.scatter_(-1, topk_indices_per_row, True)
-        else:  # k_per_token is 0
-            mask = torch.zeros_like(x, dtype=torch.bool)
+        mask = TokenTopK._compute_mask(x, k, x_for_ranking)
 
         if straight_through:
             ctx.save_for_backward(mask)

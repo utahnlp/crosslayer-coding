@@ -13,10 +13,12 @@ from clt.models.activations import BatchTopK, JumpReLU, TokenTopK  # Import Batc
 # Import the new encoding helper functions
 from clt.models.encoding import get_preactivations as _get_preactivations_helper
 from clt.models.encoding import _encode_all_layers as _encode_all_layers_helper
-from clt.models.encoding import _apply_batch_topk as _apply_batch_topk_helper
-from clt.models.encoding import _apply_token_topk as _apply_token_topk_helper
+from clt.models.encoding import _apply_batch_topk_helper
+from clt.models.encoding import _apply_token_topk_helper
 
 from torch.distributed import ProcessGroup
+
+from . import mark_replicated  # Added import
 
 # Configure logging (or use existing logger if available)
 logger = logging.getLogger(__name__)
@@ -100,6 +102,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 config.num_layers, config.num_features  # Shape: [num_layers, num_features]
             ) * torch.log(torch.tensor(config.jumprelu_threshold))
             self.log_threshold = nn.Parameter(initial_threshold_val.to(device=self.device, dtype=self.dtype))
+            mark_replicated(self.log_threshold)  # Mark as replicated
 
         self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
 
@@ -353,7 +356,7 @@ class CrossLayerTranscoder(BaseTranscoder):
         dtype: torch.dtype,
     ) -> Dict[int, torch.Tensor]:
         """Applies BatchTopK to concatenated pre-activations from all layers by calling the helper."""
-        return _apply_batch_topk_helper(preactivations_dict, self.config, device, dtype, self.rank)
+        return _apply_batch_topk_helper(preactivations_dict, self.config, device, dtype, self.rank, self.process_group)
 
     def _apply_token_topk(
         self,
@@ -362,7 +365,7 @@ class CrossLayerTranscoder(BaseTranscoder):
         dtype: torch.dtype,
     ) -> Dict[int, torch.Tensor]:
         """Applies TokenTopK to concatenated pre-activations from all layers by calling the helper."""
-        return _apply_token_topk_helper(preactivations_dict, self.config, device, dtype, self.rank)
+        return _apply_token_topk_helper(preactivations_dict, self.config, device, dtype, self.rank, self.process_group)
 
     def encode(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Encode the input activations at the specified layer.
@@ -643,13 +646,22 @@ class CrossLayerTranscoder(BaseTranscoder):
                 return activations
 
             if self.config.activation_fn == "batchtopk":
-                activations = self._apply_batch_topk(preactivations_dict, processed_device, processed_dtype)
+                # Pass rank and process_group to the helper
+                activations = _apply_batch_topk_helper(
+                    preactivations_dict, self.config, processed_device, processed_dtype, self.rank, self.process_group
+                )
             elif self.config.activation_fn == "topk":
-                activations = self._apply_token_topk(preactivations_dict, processed_device, processed_dtype)
+                # Pass rank and process_group to the helper
+                activations = _apply_token_topk_helper(
+                    preactivations_dict, self.config, processed_device, processed_dtype, self.rank, self.process_group
+                )
             return activations
         else:  # ReLU or JumpReLU (per-layer activation)
             activations = {}
-            for layer_idx, x_input in processed_inputs.items():  # Use processed_inputs here
+            # Iterate layers in deterministic ascending order so all ranks
+            # invoke the same collective operations in the same sequence.
+            for layer_idx in sorted(processed_inputs.keys()):
+                x_input = processed_inputs[layer_idx]
                 try:
                     # encode() returns the full activation tensor after per-layer ReLU/JumpReLU
                     # encode() itself handles moving x_input to the correct device/dtype internally
@@ -842,7 +854,7 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         # Import tqdm for the progress bar
         try:
-            from tqdm.auto import tqdm
+            from tqdm.auto import tqdm  # type: ignore
 
             iterable_data_iter = (
                 tqdm(data_iter, total=num_batches, desc=f"Estimating Theta (Rank {self.rank})")
@@ -1176,8 +1188,11 @@ class CrossLayerTranscoder(BaseTranscoder):
                 self.log_threshold = nn.Parameter(
                     log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
                 )
-            # Update data in-place, ensuring it's on the correct device and dtype
-            self.log_threshold.data = log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
+            else:
+                # Update data in-place, ensuring it's on the correct device and dtype
+                self.log_threshold.data = log_theta.to(device=self.log_threshold.device, dtype=self.log_threshold.dtype)
+
+        mark_replicated(self.log_threshold)  # Mark as replicated after creation or update
 
         # Remove running stat buffers (no longer needed after conversion)
         # These are now deleted in estimate_theta_posthoc after conversion
