@@ -398,44 +398,89 @@ class CLTTrainer:
                 if isinstance(pbar, tqdm):
                     pbar.refresh()
 
+                step_inputs: Optional[Dict[int, torch.Tensor]] = None
+                step_targets: Optional[Dict[int, torch.Tensor]] = None
+                # 1 for success, 0 for StopIteration, -2 for other Exception (to distinguish from -1 used by ReduceOp.MIN)
+                load_success_code = 1
+
                 try:
-                    # Get batch directly from the iterator (handles distributed sampling internally)
                     batch_get_start_time = time.monotonic()
-                    inputs, targets = next(self.activation_store)
+                    step_inputs, step_targets = next(self.activation_store)
                     batch_get_duration = time.monotonic() - batch_get_start_time
+                    # Use debug level for per-step batch get duration to reduce verbosity
                     logger.debug(f"Rank {self.rank} Step {step}: Getting batch took {batch_get_duration:.4f}s")
 
-                    # logging to diagnose batch size mismatch
+                except StopIteration:
+                    load_success_code = 0
+                except Exception as e:
+                    load_success_code = -2  # Negative value for error
+                    # Log the error only on rank 0 for clarity, but all ranks will know an error occurred.
+                    if not self.distributed or self.rank == 0:
+                        logger.error(f"Rank {self.rank}: Error getting batch at step {step}: {e}", exc_info=True)
+
+                load_status_tensor = torch.tensor([load_success_code], device=self.device, dtype=torch.int)
+                if self.distributed and dist.is_initialized() and self.world_size > 1:
+                    # Use MIN to propagate the 'worst' status (error < stop < success)
+                    dist.all_reduce(load_status_tensor, op=dist.ReduceOp.MIN)
+
+                final_load_status = load_status_tensor.item()
+
+                if final_load_status == 1:  # All ranks successfully loaded data
+                    assert (
+                        step_inputs is not None and step_targets is not None
+                    ), "Inputs/targets should be populated on success"
+                    inputs, targets = step_inputs, step_targets
+
+                    # Original tok_cnt logic and all_gather diagnostic
                     tok_cnt = next(iter(inputs.values())).shape[0]  # number of rows (=tokens) in this batch
-                    # Only run the all_gather diagnostic when running in distributed mode
                     if self.distributed and self.world_size > 1 and dist.is_initialized():
                         tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
                         gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
                         dist.all_gather(gathered, tok_cnt_t)
                         if self.rank == 0:
-                            print("Batch token-count per rank:", [int(x.item()) for x in gathered])
+                            # Clarify print source and step
+                            print(
+                                f"Rank 0: Batch token-count per rank (step {step}): {[int(x.item()) for x in gathered]}"
+                            )
+                            sys.stdout.flush()  # Ensure print appears
 
-                except StopIteration:
-                    # Rank 0 prints message
+                    # --- Check for empty batch --- (Moved here, after successful load confirmed by all)
+                    if not inputs or not targets or not any(v.numel() > 0 for v in inputs.values()):
+                        if not self.distributed or self.rank == 0:
+                            print(
+                                f"\nRank {self.rank}: Warning: Received empty batch at step {step} (after sync). Skipping step."
+                            )
+                        # Ensure all ranks skip together if one has an empty batch post-sync
+                        if self.distributed and dist.is_initialized() and self.world_size > 1:
+                            dist.barrier()
+                        continue
+
+                elif final_load_status == 0:  # StopIteration on at least one rank
                     if not self.distributed or self.rank == 0:
-                        print("Activation store exhausted. Training finished early.")
-                    if self.distributed:
-                        dist.barrier()  # Ensure all ranks see this
-                    break  # Exit training loop if data runs out
-                except Exception as e:
-                    # Rank 0 prints message
+                        print(
+                            f"Rank {self.rank}: Activation store exhausted at step {step} (detected by at least one rank). Training finished early."
+                        )
+                        sys.stdout.flush()
+                    # All ranks will break, no barrier strictly needed before break if all take this path.
+                    if (
+                        self.distributed and dist.is_initialized() and self.world_size > 1
+                    ):  # Optional barrier for clean exit
+                        dist.barrier()
+                    break
+                else:  # final_load_status == -2 (or other negative), error on at least one rank
                     if not self.distributed or self.rank == 0:
-                        print(f"\nRank {self.rank}: Error getting batch at step {step}: {e}. Skipping step.")
-                    # Maybe barrier here too? If one rank fails, others might hang?
-                    # Let's continue for now, assuming store handles internal errors.
+                        print(
+                            f"Rank {self.rank}: Error loading batch at step {step} (detected by at least one rank). Skipping step."
+                        )
+                        sys.stdout.flush()
+                    # Barrier to ensure all ranks are at the same point before continuing.
+                    if self.distributed and dist.is_initialized() and self.world_size > 1:
+                        dist.barrier()
                     continue
 
-                # --- Check for empty batch --- (Optional but good practice)
-                # This check should ideally happen *before* moving data potentially
-                if not inputs or not targets or not any(v.numel() > 0 for v in inputs.values()):
-                    if not self.distributed or self.rank == 0:
-                        print(f"\nRank {self.rank}: Warning: Received empty batch at step {step}. Skipping.")
-                    continue
+                # The rest of the training step (normalization check, forward, backward, etc.)
+                # only proceeds if final_load_status == 1.
+                # This entire block was originally after the try/except for data loading.
 
                 # --- BEGIN: One-time Normalization Check ---
                 if step == 0 and (not self.distributed or self.rank == 0):
