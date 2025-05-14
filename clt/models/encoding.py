@@ -123,10 +123,6 @@ def _apply_batch_topk_helper(
 ) -> Dict[int, torch.Tensor]:
     """Helper to apply BatchTopK globally across concatenated layer pre-activations."""
 
-    world_size = 1
-    if process_group is not None and dist.is_initialized():
-        world_size = dist.get_world_size(process_group)
-
     if not preactivations_dict:
         logger.warning(f"Rank {rank}: _apply_batch_topk_helper received empty preactivations_dict.")
         return {}
@@ -216,26 +212,32 @@ def _apply_batch_topk_helper(
     # k_total_batch = min(k_val * B, concatenated_preactivations_original.numel()) # Clamp k
 
     # Compute mask on rank 0 and broadcast
-    mask_shape = concatenated_preactivations_original.shape
-    mask = torch.empty(mask_shape, dtype=torch.bool, device=device)
+    # mask_shape = concatenated_preactivations_original.shape # Original line, now unused
+    # mask = torch.empty(mask_shape, dtype=torch.bool, device=device) # Original allocation
 
-    if world_size > 1:
-        if rank == 0:
-            # Rank 0 computes the mask
-            local_mask = BatchTopK._compute_mask(
-                concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
-            )
-            mask.copy_(local_mask)  # Copy computed mask to the buffer
-            # Broadcast the mask tensor from rank 0
-            dist.broadcast(mask, src=0, group=process_group)
-        else:
-            # Other ranks receive the broadcasted mask
-            dist.broadcast(mask, src=0, group=process_group)
-    else:
-        # Single GPU case: compute mask directly
-        mask = BatchTopK._compute_mask(
-            concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
-        )
+    # --- TEMPORARY MODIFICATION FOR DEBUGGING ---
+    print(f"[DEBUG _apply_batch_topk_helper Rank {rank}] Bypassing dist.broadcast, computing mask locally.", flush=True)
+    mask = BatchTopK._compute_mask(concatenated_preactivations_original, k_val, concatenated_preactivations_normalized)
+    # --- END TEMPORARY MODIFICATION ---
+
+    # Original broadcast logic:
+    # if world_size > 1:
+    #     if rank == 0:
+    #         # Rank 0 computes the mask
+    #         local_mask = BatchTopK._compute_mask(
+    #             concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
+    #         )
+    #         mask.copy_(local_mask)  # Copy computed mask to the buffer
+    #         # Broadcast the mask tensor from rank 0
+    #         dist.broadcast(mask, src=0, group=process_group)
+    #     else:
+    #         # Other ranks receive the broadcasted mask
+    #         dist.broadcast(mask, src=0, group=process_group)
+    # else:
+    #     # Single GPU case: compute mask directly
+    #     mask = BatchTopK._compute_mask(
+    #         concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
+    #     )
 
     # Apply the identical mask on all ranks
     activated_concatenated = concatenated_preactivations_original * mask.to(dtype)
