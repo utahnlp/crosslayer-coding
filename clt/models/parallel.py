@@ -398,6 +398,8 @@ class ColumnParallelLinear(_ParallelLinear):
         gathered_output = _gather(
             local_output.contiguous(), self.process_group, dim=-1, full_dim_size=self.full_out_features
         )
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
         return gathered_output
 
