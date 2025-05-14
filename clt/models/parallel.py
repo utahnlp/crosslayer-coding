@@ -6,6 +6,7 @@ from torch.distributed import ProcessGroup
 import math
 from typing import Callable, Optional, Tuple
 import logging
+from typing import cast
 
 from . import mark_replicated
 
@@ -113,7 +114,7 @@ class _Gather(torch.autograd.Function):
             ctx.dim = dim
             ctx.local_dim = input_.size(dim)
             ctx.full_dim_size = full_dim_size or input_.size(dim)
-            ctx.process_group = None  # Mark non-distributed case
+            ctx.process_group = None
             return input_
 
         world_size = dist.get_world_size(process_group)
@@ -124,68 +125,23 @@ class _Gather(torch.autograd.Function):
         ctx.full_dim_size = full_dim_size if full_dim_size is not None else ctx.local_dim * world_size
         ctx.process_group = process_group
 
-        # Ensure a contiguous tensor before communication for NCCL efficiency.
+        # Ensure contiguous input before communication
         input_contig = input_.contiguous()
 
-        print(
-            f"[Gather-fwd Rank {rank}] BEFORE all_gather: input_contig shape={input_contig.shape}, dtype={input_contig.dtype}, device={input_contig.device}, is_contiguous={input_contig.is_contiguous()}, data_ptr={input_contig.data_ptr()}",
-            flush=True,
-        )
-
         # ------------------------------------------------------------------
-        # Allocate a single output tensor for all_gather_into_tensor
-        # The shape must be (world_size * local_input_shape[dim], other_dims...)
-        # if dim is not the first dimension, or (world_size, local_input_shape...)
-        # if dim is 0 and we want to gather along a new first dimension.
-        # For typical TP gather (dim=-1), it's (..., world_size * local_input_shape[-1])
+        # Safe list-based gather (avoids CUDA-12.x bug in all_gather_into_tensor)
+        # Each element in gather_list must have the same shape as input_contig.
         # ------------------------------------------------------------------
-        output_tensor_shape = list(input_contig.shape)
-        # if dim < 0: # Handle negative dim # Removed unused dim_to_gather
-        #     dim_to_gather = output_tensor_shape[dim]
-        # else:
-        #     dim_to_gather = output_tensor_shape[dim]
+        gather_list = [torch.empty_like(input_contig) for _ in range(world_size)]
+        dist.all_gather(gather_list, input_contig, group=process_group)
 
-        # The output tensor for all_gather_into_tensor should be large enough to hold all gathered data.
-        # If local_dim is the size of the input tensor's gather dimension for one rank,
-        # then the output tensor's gather dimension should be world_size * local_dim.
-        output_tensor_shape[dim] = world_size * ctx.local_dim  # ctx.local_dim is input_.size(dim)
-
-        # Ensure the output tensor is created on the correct device with the correct dtype.
-        output_tensor = torch.empty(output_tensor_shape, dtype=input_contig.dtype, device=input_contig.device)
-
-        print(
-            f"[Gather-fwd Rank {rank}] BEFORE all_gather_into_tensor: output_tensor shape={output_tensor.shape}, input_contig shape={input_contig.shape}",
-            flush=True,
-        )
-
-        # Perform the all-gather into the single output tensor.
-        try:
-            print(f"[Gather-fwd Rank {rank}] CALLING dist.all_gather_into_tensor", flush=True)
-            dist.all_gather_into_tensor(output_tensor, input_contig, group=process_group)
-            print(f"[Gather-fwd Rank {rank}] AFTER dist.all_gather_into_tensor SUCCEEDED", flush=True)
-            print(
-                f"[Gather-fwd Rank {rank}] AFTER all_gather_into_tensor: output_tensor shape={output_tensor.shape}, dtype={output_tensor.dtype}, device={output_tensor.device}, is_contiguous={output_tensor.is_contiguous()}, data_ptr={output_tensor.data_ptr()}",
-                flush=True,
-            )
-        except Exception as e_ag:
-            print(f"[Gather-fwd Rank {rank}] EXCEPTION during dist.all_gather_into_tensor: {e_ag}", flush=True)
-            raise
-
-        # Note: torch.cat is no longer needed as all_gather_into_tensor directly produces the concatenated result.
-        # The `output_tensor` is now the `output` we need, but it might need truncation if padding was involved.
-        output = output_tensor  # Assign output_tensor to output
+        output = torch.cat(gather_list, dim=dim)
 
         # If we padded the tensor dimension for divisibility, remove the excess
-        # so that downstream code always sees exactly ``full_dim_size`` cols.
-        # ctx.full_dim_size is the target size of the gathered dimension AFTER concatenation.
         if output.size(dim) > ctx.full_dim_size:
             idx = [slice(None)] * output.dim()
             idx[dim] = slice(0, ctx.full_dim_size)
             output = output[tuple(idx)]
-            print(
-                f"[Gather-fwd Rank {rank}] Truncated output to shape {output.shape} along dim {dim} to match full_dim_size {ctx.full_dim_size}",
-                flush=True,
-            )
 
         # ------------------------------------------------------------------
         # Save the *actual* (unpadded) number of columns owned by this rank.
@@ -197,13 +153,12 @@ class _Gather(torch.autograd.Function):
         start_idx = rank * local_dim_padded
         ctx.actual_local_dim = max(0, min(local_dim_padded, ctx.full_dim_size - start_idx))
 
-        # Ensure logger is defined and accessible for the following debug log
-        # If logger is module-level, this check might be redundant but safe.
         if "logger" in globals() and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"[Gather-fwd] rank={rank} local_dim_padded={local_dim_padded} "
                 f"actual_local_dim={ctx.actual_local_dim} full_dim={ctx.full_dim_size}"
             )
+
         return output
 
     @staticmethod
@@ -503,23 +458,4 @@ def _gather(
     full_dim_size: Optional[int] = None,
 ) -> torch.Tensor:
     """Wrapper around :class:`_Gather` to match original functional interface."""
-
-    # --- TEMPORARY MODIFICATION FOR DEBUGGING ---
-    # Bypass the actual gather operation and return the input directly.
-    # This will make the model's computation incorrect but helps isolate
-    # if the gather operation itself is the source of memory corruption.
-    print(
-        f"[DEBUG _gather Rank {dist.get_rank(process_group) if process_group and dist.is_initialized() else 'N/A'}] Bypassing actual gather, returning input directly.",
-        flush=True,
-    )
-    if process_group is None or not dist.is_initialized() or dist.get_world_size(process_group) == 1:
-        return input_  # Original behavior for non-distributed or world_size 1
-
-    # For distributed case, still return local input to avoid breaking shapes too much downstream,
-    # though the assembled tensor will be wrong.
-    # The key is to avoid the dist.all_gather_into_tensor call.
-    return input_
-    # --- END TEMPORARY MODIFICATION ---
-
-    # Original line:
-    # return cast(torch.Tensor, _Gather.apply(input_, process_group, dim, full_dim_size))
+    return cast(torch.Tensor, _Gather.apply(input_, process_group, dim, full_dim_size))
