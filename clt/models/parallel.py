@@ -128,14 +128,17 @@ class _Gather(torch.autograd.Function):
         # Ensure contiguous input before communication
         input_contig = input_.contiguous()
 
-        # ------------------------------------------------------------------
-        # Safe list-based gather (avoids CUDA-12.x bug in all_gather_into_tensor)
-        # Each element in gather_list must have the same shape as input_contig.
-        # ------------------------------------------------------------------
-        gather_list = [torch.empty_like(input_contig) for _ in range(world_size)]
-        dist.all_gather(gather_list, input_contig, group=process_group)
+        # Work-around NCCL 2.26 / CUDA-12.x bug: gather 1-D flattened buffers.
+        input_flat = input_contig.view(-1)
+        gather_list = [torch.empty_like(input_flat) for _ in range(world_size)]
+        dist.all_gather(gather_list, input_flat, group=process_group)
 
-        output = torch.cat(gather_list, dim=dim)
+        output_flat = torch.cat(gather_list, dim=0)  # 1-D
+
+        # Reshape back to expected output shape (world_size * local_dim along dim)
+        output_shape = list(input_contig.shape)
+        output_shape[dim] = world_size * ctx.local_dim
+        output = output_flat.view(*output_shape)
 
         # If we padded the tensor dimension for divisibility, remove the excess
         if output.size(dim) > ctx.full_dim_size:
