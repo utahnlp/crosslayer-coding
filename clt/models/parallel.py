@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import math
-from typing import Callable, Optional, cast, Tuple
+from typing import Callable, Optional, Tuple
 import logging
 
 from . import mark_replicated
@@ -504,4 +504,22 @@ def _gather(
 ) -> torch.Tensor:
     """Wrapper around :class:`_Gather` to match original functional interface."""
 
-    return cast(torch.Tensor, _Gather.apply(input_, process_group, dim, full_dim_size))
+    # --- TEMPORARY MODIFICATION FOR DEBUGGING ---
+    # Bypass the actual gather operation and return the input directly.
+    # This will make the model's computation incorrect but helps isolate
+    # if the gather operation itself is the source of memory corruption.
+    print(
+        f"[DEBUG _gather Rank {dist.get_rank(process_group) if process_group and dist.is_initialized() else 'N/A'}] Bypassing actual gather, returning input directly.",
+        flush=True,
+    )
+    if process_group is None or not dist.is_initialized() or dist.get_world_size(process_group) == 1:
+        return input_  # Original behavior for non-distributed or world_size 1
+
+    # For distributed case, still return local input to avoid breaking shapes too much downstream,
+    # though the assembled tensor will be wrong.
+    # The key is to avoid the dist.all_gather_into_tensor call.
+    return input_
+    # --- END TEMPORARY MODIFICATION ---
+
+    # Original line:
+    # return cast(torch.Tensor, _Gather.apply(input_, process_group, dim, full_dim_size))
