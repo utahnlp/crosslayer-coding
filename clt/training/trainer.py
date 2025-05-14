@@ -470,19 +470,19 @@ class CLTTrainer:
                 # --- Forward pass and compute loss --- (All ranks)
                 self.optimizer.zero_grad()
 
-                # Compute feature activations **once** per step to avoid redundant encoder forward passes.
-                feature_activations_batch = self.model.get_feature_activations(inputs)
-
-                # Compute total loss using the pre-computed activations
-                loss, loss_dict = self.loss_manager.compute_total_loss(
-                    self.model,
-                    inputs,
-                    targets,
-                    step,
-                    self.training_config.training_steps,
-                    precomputed_activations=feature_activations_batch,
-                    dead_neuron_mask=self.dead_neurons_mask,
-                )
+                with torch.cuda.amp.autocast(
+                    device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp
+                ):
+                    feature_activations_batch = self.model.get_feature_activations(inputs)
+                    loss, loss_dict = self.loss_manager.compute_total_loss(
+                        self.model,
+                        inputs,
+                        targets,
+                        step,
+                        self.training_config.training_steps,
+                        precomputed_activations=feature_activations_batch,
+                        dead_neuron_mask=self.dead_neurons_mask,
+                    )
 
                 # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
                 # We need *full* feature activations *after* non-linearity
