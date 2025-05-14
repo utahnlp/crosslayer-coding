@@ -401,6 +401,16 @@ class ColumnParallelLinear(_ParallelLinear):
         # Compute local part of the output: [..., local_out_features] (padded)
         local_output = F.linear(input_, self.weight, self.bias_param if self.bias else None)
 
+        # ↓ insert directly after the F.linear call
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(
+            f"[ColPar fwd rank {self.rank}] local_output shape={local_output.shape} "
+            f"weight.shape={self.weight.shape} input_.shape={input_.shape} "
+            f"expected local_in={self.local_in_features} local_out={self.local_out_features}",
+            flush=True,
+        )
+
         # Gather output across ranks: [..., full_out_features] (truncated)
         # Pass the original full dimension size for potential truncation
         gathered_output = _gather(
