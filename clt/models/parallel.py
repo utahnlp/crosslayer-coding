@@ -10,6 +10,13 @@ import logging
 from . import mark_replicated
 
 
+# ---------------------------------------------------------------------------
+# Module-level logger (kept lightweight so it is cheap when DEBUG is disabled)
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+
+
 class _ParallelLinear(nn.Module):
     """Base class for parallel linear layers."""
 
@@ -120,25 +127,40 @@ class _Gather(torch.autograd.Function):
         # Ensure a contiguous tensor before communication for NCCL efficiency.
         input_contig = input_.contiguous()
 
+        # ------------------------------------------------------------------
+        # Allocate distinct receive buffers – no aliasing with the send buf.
+        # NCCL ≥ 2.18 forbids overlapping send/recv pointers in collectives.
+        # ------------------------------------------------------------------
         gathered: list[torch.Tensor] = [torch.empty_like(input_contig) for _ in range(world_size)]
-        # Preserve the *exact* tensor object for the local slice so that autograd
-        # can track the dependency (no copy!).
-        gathered[rank] = input_contig
 
-        # Perform the collective.
+        # Perform the all-gather.  Each element in ``gathered`` receives the
+        # slice contributed by the corresponding rank.
         dist.all_gather(gathered, input_contig, group=process_group)
 
         output = torch.cat(gathered, dim=dim)
 
-        # If we padded the tensor dimension for divisibility, remove the excess.
+        # If we padded the tensor dimension for divisibility, remove the excess
+        # so that downstream code always sees exactly ``full_dim_size`` cols.
         if output.size(dim) > ctx.full_dim_size:
             idx = [slice(None)] * output.dim()
             idx[dim] = slice(0, ctx.full_dim_size)
             output = output[tuple(idx)]
 
-        # Record the *real* number of columns this rank owns after truncation.
-        # That is: ceil(full_dim/world)  except possibly for the last rank.
-        ctx.actual_local_dim = output.size(dim) // world_size
+        # ------------------------------------------------------------------
+        # Save the *actual* (unpadded) number of columns owned by this rank.
+        # Rank r owns the slice [start:end) where
+        #   start = r * local_dim_padded
+        #   end   = min(start + local_dim_padded, full_dim_size)
+        # ------------------------------------------------------------------
+        local_dim_padded: int = ctx.local_dim  # padded allocation size
+        start_idx = rank * local_dim_padded
+        ctx.actual_local_dim = max(0, min(local_dim_padded, ctx.full_dim_size - start_idx))
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"[Gather-fwd] rank={rank} local_dim_padded={local_dim_padded} "
+                f"actual_local_dim={ctx.actual_local_dim} full_dim={ctx.full_dim_size}"
+            )
 
         return output
 
@@ -154,8 +176,8 @@ class _Gather(torch.autograd.Function):
         rank = dist.get_rank(ctx.process_group)
 
         # Compute start/end indices for this rank's slice along the gather dim.
-        local_dim_padded = ctx.local_dim  # padded allocation size
-        actual_local_dim = ctx.actual_local_dim
+        local_dim_padded: int = ctx.local_dim  # padded allocation size
+        actual_local_dim: int = ctx.actual_local_dim
         start = rank * local_dim_padded
         end = start + actual_local_dim
 
