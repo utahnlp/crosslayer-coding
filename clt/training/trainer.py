@@ -129,6 +129,16 @@ class CLTTrainer:
 
         self.model = CrossLayerTranscoder(clt_config, process_group=self.process_group, device=self.device)
 
+        # --- Optionally convert model to FP16 (Step 8) ---
+        if self.mixed_precision == "fp16" and self.training_config.fp16_convert_weights:
+            logger.info(f"Rank {self.rank}: Converting model weights and buffers to FP16.")
+            self.model.half()  # Converts all parameters and buffers
+            # Keep LayerNorm buffers in FP32 for stability
+            for name, buf in self.model.named_buffers():
+                if buf.dtype == torch.float16 and "norm" in name.lower():
+                    logger.info(f"Rank {self.rank}: Converting buffer '{name}' from FP16 back to FP32.")
+                    buf.data = buf.data.float()
+
         # Initialize optimizer - works on local parameters
         # Explicitly type the kwargs dict for clarity and linting
         optimizer_kwargs: Dict[str, Any] = {"lr": training_config.learning_rate}

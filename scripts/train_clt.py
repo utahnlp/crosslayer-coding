@@ -230,6 +230,11 @@ def parse_args():
         help="Training precision: 'fp32', 'fp16' (mixed precision with AMP), or 'bf16' (mixed precision with AMP).",
     )
     train_group.add_argument(
+        "--fp16-convert-weights",
+        action="store_true",
+        help="If --precision is fp16, also convert model weights to fp16. Saves memory but model parameters remain fp32 by default with AMP. Default is False.",
+    )
+    train_group.add_argument(
         "--debug-anomaly",
         action="store_true",
         help="Enable PyTorch autograd anomaly detection for debugging NaN issues. Default is False.",
@@ -562,6 +567,7 @@ def main():
         # Precision & Debugging
         precision=args.precision,
         debug_anomaly=args.debug_anomaly,
+        fp16_convert_weights=args.fp16_convert_weights,
     )
     logger.info(f"Training Config: {training_config}")
 

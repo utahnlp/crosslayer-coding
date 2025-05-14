@@ -103,6 +103,8 @@ class TrainingConfig:
 
     # Precision for training
     precision: Literal["fp32", "fp16", "bf16"] = "fp32"  # Default to fp32
+    # If precision is fp16, whether to also convert model weights to fp16 (saves memory, model params remain fp32 by default with AMP)
+    fp16_convert_weights: bool = False
     # Enable PyTorch anomaly detection for debugging NaN issues
     debug_anomaly: bool = False
 
