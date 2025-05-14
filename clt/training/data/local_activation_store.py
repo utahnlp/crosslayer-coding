@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 import logging
 import json
 from pathlib import Path
@@ -116,16 +117,27 @@ class LocalActivationStore(ManifestActivationStore):
             logger.error(f"Error reading norm_stats file {path}: {e}")
             return None
 
-    def _fetch_slice(self, chunk_id: int, row_indices: np.ndarray) -> bytes:
-        chunk_path = self.dataset_path / f"chunk_{chunk_id}.h5"
+    @lru_cache(maxsize=256)
+    def _load_chunk(self, chunk_path: str, layer_key: str, data_type: str):
+        """Loads entire HDF5 chunk from disk and caches"""
+
+        logger.debug(f"Fetching chunk {chunk_path} / {layer_key} / {data_type}")
+
         try:
-            hf = _open_h5(chunk_path)
+            return _open_h5(chunk_path)[layer_key][data_type][:]
         except FileNotFoundError:
             logger.error(f"Chunk file not found for fetch: {chunk_path}")
             raise
+        except KeyError as e:
+            raise RuntimeError(f"Missing 'inputs' or 'targets' dataset in layer group '{layer_key}' of chunk {chunk_path}") from e
         except Exception as e:
-            logger.error(f"Failed to open chunk {chunk_id} at {chunk_path}: {e}")
+            logger.error(f"Failed to open chunk at {chunk_path}: {e}")
             raise RuntimeError(f"Failed to access chunk HDF5 file: {chunk_path}") from e
+
+    def _fetch_slice(self, chunk_id: int, row_indices: np.ndarray) -> bytes:
+
+        chunk_path = self.dataset_path / f"chunk_{chunk_id}.h5"
+        hf = _open_h5(chunk_path)
 
         try:
 
@@ -150,12 +162,8 @@ class LocalActivationStore(ManifestActivationStore):
                 row_indices_h5 = row_indices
 
             for i, lk in enumerate(layer_keys):
-                layer_group = hf[lk]
-                if "inputs" not in layer_group or "targets" not in layer_group:
-                    raise KeyError(f"Missing 'inputs' or 'targets' dataset in layer group '{lk}' of chunk {chunk_id}")
-
-                input_data = layer_group["inputs"][row_indices_h5, :]
-                target_data = layer_group["targets"][row_indices_h5, :]
+                input_data = self._load_chunk(chunk_path, lk, 'inputs')[row_indices_h5, :]
+                target_data = self._load_chunk(chunk_path, lk, 'targets')[row_indices_h5, :]
                 bufs.append(input_data.tobytes())
                 bufs.append(target_data.tobytes())
             return b"".join(bufs)
