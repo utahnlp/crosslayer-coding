@@ -529,6 +529,24 @@ class CLTTrainer:
                 # Compute feature activations **once** per step to avoid redundant encoder forward passes.
                 feature_activations_batch = self.model.get_feature_activations(inputs)
 
+                # --- DISTRIBUTED CONSISTENCY CHECK (token count) ---
+                if dist.is_initialized() and dist.get_world_size() > 1:
+                    try:
+                        local_tok_cnt_t = torch.tensor([x.shape[0] if x.dim() in (2, 3) else 0], device=x.device)
+                        gathered_tok = [torch.zeros_like(local_tok_cnt_t) for _ in range(dist.get_world_size())]
+                        dist.all_gather(gathered_tok, local_tok_cnt_t)
+                        gathered_tok_counts = [int(t.item()) for t in gathered_tok]
+                        if len(set(gathered_tok_counts)) != 1:
+                            # Only rank 0 prints the full mismatch for brevity
+                            if self.rank == 0:
+                                logger.error(
+                                    f"Token-count mismatch BEFORE encoder at layer {li}: {gathered_tok_counts}. "
+                                    "All ranks must have identical token counts. The step will likely crash."
+                                )
+                    except Exception as e:
+                        # Catch-all to avoid crashes in the diagnostic itself
+                        logger.error(f"Rank {self.rank}: Error during token-count diagnostic for layer {li}: {e}")
+
                 # Compute total loss using the pre-computed activations
                 loss, loss_dict = self.loss_manager.compute_total_loss(
                     self.model,
