@@ -127,17 +127,52 @@ class _Gather(torch.autograd.Function):
         # Ensure a contiguous tensor before communication for NCCL efficiency.
         input_contig = input_.contiguous()
 
+        print(
+            f"[Gather-fwd Rank {rank}] BEFORE all_gather: input_contig shape={input_contig.shape}, dtype={input_contig.dtype}, device={input_contig.device}, is_contiguous={input_contig.is_contiguous()}, data_ptr={input_contig.data_ptr()}",
+            flush=True,
+        )
+
         # ------------------------------------------------------------------
         # Allocate distinct receive buffers – no aliasing with the send buf.
         # NCCL ≥ 2.18 forbids overlapping send/recv pointers in collectives.
         # ------------------------------------------------------------------
         gathered: list[torch.Tensor] = [torch.empty_like(input_contig) for _ in range(world_size)]
+        for i, t in enumerate(gathered):
+            print(
+                f"[Gather-fwd Rank {rank}] BEFORE all_gather: gathered[{i}] shape={t.shape}, dtype={t.dtype}, device={t.device}, data_ptr={t.data_ptr()}",
+                flush=True,
+            )
 
         # Perform the all-gather.  Each element in ``gathered`` receives the
         # slice contributed by the corresponding rank.
-        dist.all_gather(gathered, input_contig, group=process_group)
+        try:
+            print(f"[Gather-fwd Rank {rank}] CALLING dist.all_gather", flush=True)
+            dist.all_gather(gathered, input_contig, group=process_group)
+            print(f"[Gather-fwd Rank {rank}] AFTER dist.all_gather SUCCEEDED", flush=True)
+            for i, t in enumerate(gathered):
+                print(
+                    f"[Gather-fwd Rank {rank}] AFTER all_gather: gathered[{i}] shape={t.shape}, dtype={t.dtype}, device={t.device}, is_contiguous={t.is_contiguous()}, data_ptr={t.data_ptr()}",
+                    flush=True,
+                )
+        except Exception as e_ag:
+            print(f"[Gather-fwd Rank {rank}] EXCEPTION during dist.all_gather: {e_ag}", flush=True)
+            raise
 
-        output = torch.cat(gathered, dim=dim)
+        try:
+            print(f"[Gather-fwd Rank {rank}] CALLING torch.cat", flush=True)
+            output = torch.cat(gathered, dim=dim)
+            print(
+                f"[Gather-fwd Rank {rank}] AFTER torch.cat SUCCEEDED: output shape={output.shape}, dtype={output.dtype}, device={output.device}",
+                flush=True,
+            )
+        except Exception as e_cat:
+            print(f"[Gather-fwd Rank {rank}] EXCEPTION during torch.cat: {e_cat}", flush=True)
+            for i, t in enumerate(gathered):
+                print(
+                    f"[Gather-fwd Rank {rank}] State of gathered[{i}] at torch.cat exception: shape={t.shape}, dtype={t.dtype}, device={t.device}, data_ptr={t.data_ptr()}",
+                    flush=True,
+                )
+            raise
 
         # If we padded the tensor dimension for divisibility, remove the excess
         # so that downstream code always sees exactly ``full_dim_size`` cols.
@@ -152,31 +187,32 @@ class _Gather(torch.autograd.Function):
         #   start = r * local_dim_padded
         #   end   = min(start + local_dim_padded, full_dim_size)
         # ------------------------------------------------------------------
-        local_dim_padded: int = ctx.local_dim  # padded allocation size
+        local_dim_padded: int = ctx.local_dim
         start_idx = rank * local_dim_padded
         ctx.actual_local_dim = max(0, min(local_dim_padded, ctx.full_dim_size - start_idx))
 
-        if logger.isEnabledFor(logging.DEBUG):
+        # Ensure logger is defined and accessible for the following debug log
+        # If logger is module-level, this check might be redundant but safe.
+        if "logger" in globals() and logger.isEnabledFor(logging.DEBUG):
             logger.debug(
                 f"[Gather-fwd] rank={rank} local_dim_padded={local_dim_padded} "
                 f"actual_local_dim={ctx.actual_local_dim} full_dim={ctx.full_dim_size}"
             )
-
         return output
 
     @staticmethod
-    def backward(ctx, *grad_outputs):
+    def backward(ctx, *grad_outputs: torch.Tensor) -> Tuple[Optional[torch.Tensor], None, None, None, None]:
         # Expect exactly one gradient tensor from downstream.
         grad_output = grad_outputs[0]
 
         # Non-distributed: gradient flows straight through.
         if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
-            return grad_output, None, None, None
+            return grad_output, None, None, None, None
 
         rank = dist.get_rank(ctx.process_group)
 
         # Compute start/end indices for this rank's slice along the gather dim.
-        local_dim_padded: int = ctx.local_dim  # padded allocation size
+        local_dim_padded: int = ctx.local_dim
         actual_local_dim: int = ctx.actual_local_dim
         start = rank * local_dim_padded
         end = start + actual_local_dim
@@ -197,7 +233,7 @@ class _Gather(torch.autograd.Function):
             end <= grad_output.shape[ctx.dim]
         ), f"Rank {rank}: gradient slice overruns tensor (end {end} > {grad_output.shape[ctx.dim]})"
 
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None
 
 
 class _Reduce(torch.autograd.Function):
@@ -227,17 +263,17 @@ class _Reduce(torch.autograd.Function):
         return input_contig
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], None]:
+    def backward(ctx, *grad_outputs: torch.Tensor) -> Tuple[Optional[torch.Tensor], None]:
         # Non-distributed: gradient flows straight through.
         if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
             # Match the number of forward inputs in return for consistency
-            return grad_output.contiguous() if grad_output is not None else None, None
+            return grad_outputs[0].contiguous() if grad_outputs[0] is not None else None, None
 
         # The gradient dL/dX_local for each rank's local input X_local is simply dL/dY_sum,
         # where Y_sum is the all-reduced sum, because dY_sum/dX_local = 1.
         # grad_output is dL/dY_sum and is identical on all ranks.
         # Ensure contiguous and handle if grad_output might be None (though unlikely for scalar loss)
-        grad_for_input = grad_output.contiguous() if grad_output is not None else None
+        grad_for_input = grad_outputs[0].contiguous() if grad_outputs[0] is not None else None
         return grad_for_input, None  # Grad for input_, None for process_group
 
 
