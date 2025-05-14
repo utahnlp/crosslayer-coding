@@ -437,12 +437,23 @@ class CLTTrainer:
                         tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
                         gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
                         dist.all_gather(gathered, tok_cnt_t)
+                        gathered_counts = [int(x.item()) for x in gathered]
                         if self.rank == 0:
-                            # Clarify print source and step
-                            print(
-                                f"Rank 0: Batch token-count per rank (step {step}): {[int(x.item()) for x in gathered]}"
-                            )
-                            sys.stdout.flush()  # Ensure print appears
+                            print(f"Rank 0: Batch token-count per rank (step {step}): {gathered_counts}")
+                            sys.stdout.flush()
+
+                        # --- NEW: Consistency check ---
+                        if len(set(gathered_counts)) != 1:
+                            # Mismatch in token counts across ranks → skip this batch safely
+                            if not self.distributed or self.rank == 0:
+                                print(
+                                    f"Token-count mismatch across ranks at step {step}: {gathered_counts}. "
+                                    "Skipping this step to maintain collective alignment."
+                                )
+                                sys.stdout.flush()
+                            # Ensure all ranks agree to skip
+                            dist.barrier()
+                            continue
 
                     # --- Check for empty batch --- (Moved here, after successful load confirmed by all)
                     if not inputs or not targets or not any(v.numel() > 0 for v in inputs.values()):
