@@ -470,9 +470,7 @@ class CLTTrainer:
                 # --- Forward pass and compute loss --- (All ranks)
                 self.optimizer.zero_grad()
 
-                with torch.cuda.amp.autocast(
-                    device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp
-                ):
+                with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
                     feature_activations_batch = self.model.get_feature_activations(inputs)
                     loss, loss_dict = self.loss_manager.compute_total_loss(
                         self.model,
