@@ -28,6 +28,37 @@ def get_preactivations(
     result: Optional[torch.Tensor] = None
     fallback_shape: Optional[Tuple[int, int]] = None
 
+    # --- DEBUG: cross-rank token-count consistency --------------------
+    # We gather the number of tokens that *this exact tensor* holds on every
+    # rank.  A mismatch almost always precedes NCCL illegal-memory-access
+    # errors inside the ColumnParallelLinear all_gather.
+    if dist.is_initialized() and dist.get_world_size() > 1:
+        debug_max = 5  # print only for first few invocations
+        if not hasattr(get_preactivations, "_dbg_calls"):
+            get_preactivations._dbg_calls = 0  # type: ignore[attr-defined]
+
+        if get_preactivations._dbg_calls < debug_max:  # type: ignore[attr-defined]
+            try:
+                tok_cnt_local = x.shape[0] if x.dim() in (2, 3) else 0
+                tok_cnt_t = torch.tensor([tok_cnt_local], device=x.device, dtype=torch.int64)
+                gathered = [torch.zeros_like(tok_cnt_t) for _ in range(dist.get_world_size())]
+                dist.all_gather(gathered, tok_cnt_t)
+                counts = [int(t.item()) for t in gathered]
+
+                if len(set(counts)) != 1 and rank == 0:
+                    logger.error(
+                        f"[TP-DEBUG] Token-count mismatch before encoder | "
+                        f"layer {layer_idx}: counts per rank = {counts}"
+                    )
+                elif rank == 0:
+                    logger.debug(f"[TP-DEBUG] layer {layer_idx}: token count consistent across ranks = {counts[0]}")
+            except Exception as dbg_e:
+                if rank == 0:
+                    logger.error(f"[TP-DEBUG] Error during token-count diagnostic: {dbg_e}")
+
+            get_preactivations._dbg_calls += 1  # type: ignore[attr-defined]
+    # ------------------------------------------------------------------
+
     try:
         # 1. Check input shape and reshape if necessary
         if x.dim() == 2:
