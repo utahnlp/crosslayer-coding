@@ -133,77 +133,59 @@ class _Gather(torch.autograd.Function):
         )
 
         # ------------------------------------------------------------------
-        # Allocate distinct receive buffers – no aliasing with the send buf.
-        # NCCL ≥ 2.18 forbids overlapping send/recv pointers in collectives.
+        # Allocate a single output tensor for all_gather_into_tensor
+        # The shape must be (world_size * local_input_shape[dim], other_dims...)
+        # if dim is not the first dimension, or (world_size, local_input_shape...)
+        # if dim is 0 and we want to gather along a new first dimension.
+        # For typical TP gather (dim=-1), it's (..., world_size * local_input_shape[-1])
         # ------------------------------------------------------------------
-        gathered: list[torch.Tensor] = [torch.empty_like(input_contig) for _ in range(world_size)]
-        for i, t in enumerate(gathered):
+        output_tensor_shape = list(input_contig.shape)
+        # if dim < 0: # Handle negative dim # Removed unused dim_to_gather
+        #     dim_to_gather = output_tensor_shape[dim]
+        # else:
+        #     dim_to_gather = output_tensor_shape[dim]
+
+        # The output tensor for all_gather_into_tensor should be large enough to hold all gathered data.
+        # If local_dim is the size of the input tensor's gather dimension for one rank,
+        # then the output tensor's gather dimension should be world_size * local_dim.
+        output_tensor_shape[dim] = world_size * ctx.local_dim  # ctx.local_dim is input_.size(dim)
+
+        # Ensure the output tensor is created on the correct device with the correct dtype.
+        output_tensor = torch.empty(output_tensor_shape, dtype=input_contig.dtype, device=input_contig.device)
+
+        print(
+            f"[Gather-fwd Rank {rank}] BEFORE all_gather_into_tensor: output_tensor shape={output_tensor.shape}, input_contig shape={input_contig.shape}",
+            flush=True,
+        )
+
+        # Perform the all-gather into the single output tensor.
+        try:
+            print(f"[Gather-fwd Rank {rank}] CALLING dist.all_gather_into_tensor", flush=True)
+            dist.all_gather_into_tensor(output_tensor, input_contig, group=process_group)
+            print(f"[Gather-fwd Rank {rank}] AFTER dist.all_gather_into_tensor SUCCEEDED", flush=True)
             print(
-                f"[Gather-fwd Rank {rank}] BEFORE all_gather: gathered[{i}] shape={t.shape}, dtype={t.dtype}, device={t.device}, data_ptr={t.data_ptr()}",
+                f"[Gather-fwd Rank {rank}] AFTER all_gather_into_tensor: output_tensor shape={output_tensor.shape}, dtype={output_tensor.dtype}, device={output_tensor.device}, is_contiguous={output_tensor.is_contiguous()}, data_ptr={output_tensor.data_ptr()}",
                 flush=True,
             )
-
-        # Perform the all-gather.  Each element in ``gathered`` receives the
-        # slice contributed by the corresponding rank.
-        try:
-            print(f"[Gather-fwd Rank {rank}] CALLING dist.all_gather", flush=True)
-            dist.all_gather(gathered, input_contig, group=process_group)
-            print(f"[Gather-fwd Rank {rank}] AFTER dist.all_gather SUCCEEDED", flush=True)
-            for i, t in enumerate(gathered):
-                print(
-                    f"[Gather-fwd Rank {rank}] AFTER all_gather: gathered[{i}] shape={t.shape}, dtype={t.dtype}, device={t.device}, is_contiguous={t.is_contiguous()}, data_ptr={t.data_ptr()}",
-                    flush=True,
-                )
         except Exception as e_ag:
-            print(f"[Gather-fwd Rank {rank}] EXCEPTION during dist.all_gather: {e_ag}", flush=True)
+            print(f"[Gather-fwd Rank {rank}] EXCEPTION during dist.all_gather_into_tensor: {e_ag}", flush=True)
             raise
 
-        # --- BEGIN DEBUG: Clone tensors before cat ---
-        cloned_gathered = []
-        for i, t in enumerate(gathered):
-            print(
-                f"[Gather-fwd Rank {rank}] Cloning gathered[{i}] (shape={t.shape}, device={t.device}) before torch.cat",
-                flush=True,
-            )
-            try:
-                cloned_t = t.clone()  # Create a fresh copy
-                cloned_gathered.append(cloned_t)
-                print(
-                    f"[Gather-fwd Rank {rank}] Successfully cloned gathered[{i}] to cloned_gathered[{i}] (shape={cloned_t.shape}, device={cloned_t.device}, data_ptr={cloned_t.data_ptr()})",
-                    flush=True,
-                )
-            except Exception as e_clone:
-                print(f"[Gather-fwd Rank {rank}] EXCEPTION during .clone() of gathered[{i}]: {e_clone}", flush=True)
-                # If clone fails, try to proceed with original to see if cat still fails, or raise immediately
-                # For now, let's try to append original and let cat fail to keep focus on cat
-                cloned_gathered.append(t)  # Fallback to original if clone fails
-        # --- END DEBUG ---
-
-        try:
-            print(
-                f"[Gather-fwd Rank {rank}] CALLING torch.cat with {'cloned_gathered' if cloned_gathered else 'gathered'}",
-                flush=True,
-            )
-            output = torch.cat(cloned_gathered, dim=dim)  # Use cloned_gathered
-            print(
-                f"[Gather-fwd Rank {rank}] AFTER torch.cat SUCCEEDED: output shape={output.shape}, dtype={output.dtype}, device={output.device}",
-                flush=True,
-            )
-        except Exception as e_cat:
-            print(f"[Gather-fwd Rank {rank}] EXCEPTION during torch.cat: {e_cat}", flush=True)
-            for i, t in enumerate(gathered):
-                print(
-                    f"[Gather-fwd Rank {rank}] State of gathered[{i}] at torch.cat exception: shape={t.shape}, dtype={t.dtype}, device={t.device}, data_ptr={t.data_ptr()}",
-                    flush=True,
-                )
-            raise
+        # Note: torch.cat is no longer needed as all_gather_into_tensor directly produces the concatenated result.
+        # The `output_tensor` is now the `output` we need, but it might need truncation if padding was involved.
+        output = output_tensor  # Assign output_tensor to output
 
         # If we padded the tensor dimension for divisibility, remove the excess
         # so that downstream code always sees exactly ``full_dim_size`` cols.
+        # ctx.full_dim_size is the target size of the gathered dimension AFTER concatenation.
         if output.size(dim) > ctx.full_dim_size:
             idx = [slice(None)] * output.dim()
             idx[dim] = slice(0, ctx.full_dim_size)
             output = output[tuple(idx)]
+            print(
+                f"[Gather-fwd Rank {rank}] Truncated output to shape {output.shape} along dim {dim} to match full_dim_size {ctx.full_dim_size}",
+                flush=True,
+            )
 
         # ------------------------------------------------------------------
         # Save the *actual* (unpadded) number of columns owned by this rank.
