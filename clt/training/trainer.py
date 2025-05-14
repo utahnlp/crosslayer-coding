@@ -599,31 +599,67 @@ class CLTTrainer:
                         dist.barrier()  # Sync before evaluation starts so that all ranks enter together
 
                     # Compute evaluation metrics on all ranks to keep collective ops aligned
-                    current_dead_mask = self.dead_neurons_mask.detach().clone()
-                    eval_metrics = self.evaluator.compute_metrics(
-                        inputs,
-                        targets,
-                        dead_neuron_mask=current_dead_mask,
-                    )
+                    # Wrap the evaluation logic in autocast
+                    with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
+                        current_dead_mask = self.dead_neurons_mask.detach().clone()
+                        eval_metrics = self.evaluator.compute_metrics(
+                            inputs,  # These inputs are from the current training batch
+                            targets,  # These targets are from the current training batch
+                            dead_neuron_mask=current_dead_mask,
+                        )
 
-                    # --- Log per-layer standard deviation of pre-activations ---
-                    # This requires getting the pre-activations first.
-                    # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
-                    preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
-                    layerwise_preact_std_dev: Dict[str, float] = {}
-                    if preactivations_eval_dict:
-                        for layer_idx, preact_tensor in preactivations_eval_dict.items():
-                            if preact_tensor.numel() > 0:
-                                # Calculate std dev of all elements in the preactivation tensor for this layer
-                                std_dev_val = preact_tensor.std().item()
-                                layerwise_preact_std_dev[f"layer_{layer_idx}"] = std_dev_val
-                            else:
-                                layerwise_preact_std_dev[f"layer_{layer_idx}"] = float("nan")  # Or 0.0
+                        # --- Log per-layer standard deviation of pre-activations ---
+                        # This requires getting the pre-activations first.
+                        # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
+                        preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
+                        layerwise_preact_std_dev: Dict[str, float] = {}
+                        if preactivations_eval_dict:
+                            for layer_idx, preact_tensor in preactivations_eval_dict.items():
+                                if preact_tensor.numel() > 0:
+                                    # Calculate std dev of all elements in the preactivation tensor for this layer
+                                    std_dev_val = preact_tensor.std().item()
+                                    layerwise_preact_std_dev[f"layer_{layer_idx}"] = std_dev_val
+                                else:
+                                    layerwise_preact_std_dev[f"layer_{layer_idx}"] = float("nan")  # Or 0.0
 
-                    # Add to eval_metrics for WandB logging
-                    if layerwise_preact_std_dev:
-                        eval_metrics["layerwise/preactivation_std_dev"] = layerwise_preact_std_dev
-                    # --- End logging pre-activation std dev ---
+                        # Add to eval_metrics for WandB logging
+                        if layerwise_preact_std_dev:
+                            eval_metrics["layerwise/preactivation_std_dev"] = layerwise_preact_std_dev
+                        # --- End logging pre-activation std dev ---
+
+                        # Optionally compute and log sparsity diagnostics (can be slow).
+                        # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
+                        # internally calls `get_decoder_norms`, which performs distributed all-reduces.
+                        # We therefore compute the diagnostics on **all** ranks to keep the NCCL
+                        # collectives aligned, but we still only merge the returned values into
+                        # `eval_metrics` and log them on rank 0.
+                        if self.training_config.compute_sparsity_diagnostics:
+                            # feature_activations_batch is from the training step, might be stale or not what's desired for eval
+                            # For eval, it's better to recompute activations if needed by diagnostics, or pass inputs.
+                            # Assuming compute_sparsity_diagnostics can take `inputs` and get activations internally
+                            # or that `feature_activations_batch` is intentionally used here.
+                            # If `compute_sparsity_diagnostics` relies on activations from the autocasted `model.get_feature_activations`
+                            # it should be called *inside* this autocast block if it does its own forward pass.
+                            # The current `feature_activations_batch` was computed *outside* this specific eval autocast block
+                            # (it was for the training step loss). Let's assume `compute_sparsity_diagnostics` handles its own forward if needed.
+                            # For safety, if `compute_sparsity_diagnostics` does a forward pass, it should be inside an autocast.
+                            # The plan says "wrap the forward in the same autocast context".
+                            # `compute_sparsity_diagnostics` internally calls `model.get_decoder_norms()` which does not do a forward pass on inputs,
+                            # but it does operate on model parameters which might be .half().
+                            # `feature_activations_batch` was from the training step, it is already autocasted if AMP was on.
+                            sparsity_diag_metrics = compute_sparsity_diagnostics(
+                                model=self.model,
+                                training_config=self.training_config,
+                                feature_activations=feature_activations_batch,  # This uses activations from training step
+                            )
+                            # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
+                            if (not self.distributed) or (self.rank == 0):
+                                if sparsity_diag_metrics:
+                                    eval_metrics.update(sparsity_diag_metrics)
+                                    # Logging of eval_metrics including sparsity_diag happens later by MetricLogger
+                                    # self.wandb_logger.log_evaluation(step, eval_metrics) # This was an old direct call
+
+                    # --- END of autocast block for evaluation ---
 
                     if not self.distributed or self.rank == 0:
                         # Store evaluation metrics (for saving to JSON) - Handled by MetricLogger
@@ -643,25 +679,6 @@ class CLTTrainer:
 
                         # --- Log evaluation metrics (now done by MetricLogger) ---
                         self.metric_logger.log_evaluation_metrics(step, eval_metrics)
-
-                    # Optionally compute and log sparsity diagnostics (can be slow).
-                    # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
-                    # internally calls `get_decoder_norms`, which performs distributed all-reduces.
-                    # We therefore compute the diagnostics on **all** ranks to keep the NCCL
-                    # collectives aligned, but we still only merge the returned values into
-                    # `eval_metrics` and log them on rank 0.
-                    if self.training_config.compute_sparsity_diagnostics:
-                        sparsity_diag_metrics = compute_sparsity_diagnostics(
-                            model=self.model,
-                            training_config=self.training_config,
-                            feature_activations=feature_activations_batch,
-                        )
-
-                        # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
-                        if (not self.distributed) or (self.rank == 0):
-                            if sparsity_diag_metrics:
-                                eval_metrics.update(sparsity_diag_metrics)
-                                self.wandb_logger.log_evaluation(step, eval_metrics)
 
                     # Ensure all ranks finish evaluation before proceeding
                     if self.distributed:
