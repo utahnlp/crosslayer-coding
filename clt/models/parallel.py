@@ -5,6 +5,7 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import math
 from typing import Callable, Optional, cast, Tuple
+import logging
 
 from . import mark_replicated
 
@@ -135,6 +136,10 @@ class _Gather(torch.autograd.Function):
             idx[dim] = slice(0, ctx.full_dim_size)
             output = output[tuple(idx)]
 
+        # Record the *real* number of columns this rank owns after truncation.
+        # That is: ceil(full_dim/world)  except possibly for the last rank.
+        ctx.actual_local_dim = output.size(dim) // world_size
+
         return output
 
     @staticmethod
@@ -149,14 +154,26 @@ class _Gather(torch.autograd.Function):
         rank = dist.get_rank(ctx.process_group)
 
         # Compute start/end indices for this rank's slice along the gather dim.
-        local_dim_padded = ctx.local_dim  # Already accounts for padding in weight shape.
+        local_dim_padded = ctx.local_dim  # padded allocation size
+        actual_local_dim = ctx.actual_local_dim
         start = rank * local_dim_padded
-        end = start + ctx.local_dim
+        end = start + actual_local_dim
 
         # Extract the gradient slice that corresponds to this rank.
         idx = [slice(None)] * grad_output.dim()
         idx[ctx.dim] = slice(start, end)
         grad_input = grad_output[tuple(idx)].contiguous()
+
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"[Gather-bwd] rank={rank} slice=({start}:{end}) "
+                f"grad_cols={grad_output.shape[ctx.dim]}  "
+                f"local_dim={ctx.local_dim}  actual_local_dim={ctx.actual_local_dim}"
+            )
+
+        assert (
+            end <= grad_output.shape[ctx.dim]
+        ), f"Rank {rank}: gradient slice overruns tensor (end {end} > {grad_output.shape[ctx.dim]})"
 
         return grad_input, None, None, None
 
