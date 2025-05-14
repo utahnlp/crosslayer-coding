@@ -468,7 +468,7 @@ class CLTTrainer:
                 # --- END: One-time Normalization Check ---
 
                 # --- Forward pass and compute loss --- (All ranks)
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
                 with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
                     feature_activations_batch = self.model.get_feature_activations(inputs)
@@ -513,30 +513,30 @@ class CLTTrainer:
                             f"Skipping backward pass and optimizer step."
                         )
                 else:
-                    try:
-                        loss.backward()
+                    # ---- Back-prop with gradient scaling ----
+                    self.scaler.scale(loss).backward()
 
-                        # --- Synchronise gradients of replicated parameters --- #
-                        if self.distributed and self.world_size > 1:  # Guard before calling the static/util function
-                            average_shared_parameter_grads(self.model, self.world_size)  # New call
+                    # Unscale gradients before clipping and distributed averaging
+                    self.scaler.unscale_(self.optimizer)
 
-                        # --- Gradient clipping --- #
-                        if self.training_config.gradient_clip_val is not None:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.training_config.gradient_clip_val,
-                            )
-                    except RuntimeError as e:
-                        if not self.distributed or self.rank == 0:
-                            print(
-                                f"\nRank {self.rank}: Error during backward pass at step {step}: {e}. Skipping optimizer step."
-                            )
-                        continue
+                    # --- Synchronise gradients of replicated parameters --- #
+                    if self.distributed and self.world_size > 1:
+                        average_shared_parameter_grads(self.model, self.world_size)
 
-                    # --- Optimizer step --- (Applied to local parameters using local gradients)
-                    self.optimizer.step()
+                    # --- Gradient clipping (operates on unscaled gradients) --- #
+                    if self.training_config.gradient_clip_val is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.training_config.gradient_clip_val,
+                        )
 
-                    # --- Invalidate Caches --- #
+                    # --- Optimizer step (scaler handles scaling/unscaling) ---
+                    self.scaler.step(self.optimizer)
+
+                    # --- Update scaler for next iteration ---
+                    self.scaler.update()
+
+                    # --- Invalidate Caches (moved after optimizer step) --- #
                     if hasattr(self.model, "_cached_decoder_norms"):
                         self.model._cached_decoder_norms = None
 
