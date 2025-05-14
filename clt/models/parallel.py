@@ -158,9 +158,33 @@ class _Gather(torch.autograd.Function):
             print(f"[Gather-fwd Rank {rank}] EXCEPTION during dist.all_gather: {e_ag}", flush=True)
             raise
 
+        # --- BEGIN DEBUG: Clone tensors before cat ---
+        cloned_gathered = []
+        for i, t in enumerate(gathered):
+            print(
+                f"[Gather-fwd Rank {rank}] Cloning gathered[{i}] (shape={t.shape}, device={t.device}) before torch.cat",
+                flush=True,
+            )
+            try:
+                cloned_t = t.clone()  # Create a fresh copy
+                cloned_gathered.append(cloned_t)
+                print(
+                    f"[Gather-fwd Rank {rank}] Successfully cloned gathered[{i}] to cloned_gathered[{i}] (shape={cloned_t.shape}, device={cloned_t.device}, data_ptr={cloned_t.data_ptr()})",
+                    flush=True,
+                )
+            except Exception as e_clone:
+                print(f"[Gather-fwd Rank {rank}] EXCEPTION during .clone() of gathered[{i}]: {e_clone}", flush=True)
+                # If clone fails, try to proceed with original to see if cat still fails, or raise immediately
+                # For now, let's try to append original and let cat fail to keep focus on cat
+                cloned_gathered.append(t)  # Fallback to original if clone fails
+        # --- END DEBUG ---
+
         try:
-            print(f"[Gather-fwd Rank {rank}] CALLING torch.cat", flush=True)
-            output = torch.cat(gathered, dim=dim)
+            print(
+                f"[Gather-fwd Rank {rank}] CALLING torch.cat with {'cloned_gathered' if cloned_gathered else 'gathered'}",
+                flush=True,
+            )
+            output = torch.cat(cloned_gathered, dim=dim)  # Use cloned_gathered
             print(
                 f"[Gather-fwd Rank {rank}] AFTER torch.cat SUCCEEDED: output shape={output.shape}, dtype={output.dtype}, device={output.device}",
                 flush=True,
