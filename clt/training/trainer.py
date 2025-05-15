@@ -130,14 +130,29 @@ class CLTTrainer:
         self.model = CrossLayerTranscoder(clt_config, process_group=self.process_group, device=self.device)
 
         # --- Optionally convert model to FP16 (Step 8) ---
-        if self.mixed_precision == "fp16" and self.training_config.fp16_convert_weights:
-            logger.info(f"Rank {self.rank}: Converting model weights and buffers to FP16.")
-            self.model.half()  # Converts all parameters and buffers
-            # Keep LayerNorm buffers in FP32 for stability
-            for name, buf in self.model.named_buffers():
-                if buf.dtype == torch.float16 and "norm" in name.lower():
-                    logger.info(f"Rank {self.rank}: Converting buffer '{name}' from FP16 back to FP32.")
-                    buf.data = buf.data.float()
+        # If precision is "fp16", GradScaler is used, which expects FP32 optimizer parameters.
+        # Therefore, if precision is "fp16", we do not convert model to .half() before optimizer init,
+        # regardless of fp16_convert_weights. Autocast handles FP16 computations.
+        # fp16_convert_weights will apply if precision is not "fp16" (e.g., "bf16" or "fp32" training
+        # where user still wants to store/use fp16 weights directly without GradScaler for fp16).
+        if self.training_config.fp16_convert_weights:
+            if self.mixed_precision == "fp16":
+                logger.warning(
+                    f"Rank {self.rank}: 'fp16_convert_weights=True' is set with 'precision=fp16'. "
+                    "GradScaler expects FP32 optimizer parameters. Model weights will NOT be converted to FP16 "
+                    "before optimizer initialization to ensure GradScaler compatibility. "
+                    "Autocast will still use FP16 for computations."
+                )
+            else:  # mixed_precision is 'bf16' or 'fp32' (autocast_dtype is bfloat16 or float32, GradScaler is disabled for fp16)
+                logger.info(
+                    f"Rank {self.rank}: Converting model weights and buffers to FP16 (fp16_convert_weights=True, precision={self.mixed_precision})."
+                )
+                self.model.half()  # Converts all parameters and buffers
+                # Keep LayerNorm buffers in FP32 for stability
+                for name, buf in self.model.named_buffers():
+                    if buf.dtype == torch.float16 and "norm" in name.lower():
+                        logger.info(f"Rank {self.rank}: Converting buffer '{name}' from FP16 back to FP32.")
+                        buf.data = buf.data.float()
 
         # Initialize optimizer - works on local parameters
         # Explicitly type the kwargs dict for clarity and linting
