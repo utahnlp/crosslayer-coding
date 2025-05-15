@@ -46,6 +46,30 @@ def _open_h5(path: Path) -> h5py.File:
     return h5py.File(path, "r")
 
 
+@lru_cache(maxsize=64)  # Tuned down from 256 to fit 14GB RAM better
+def _load_layer_data_cached(chunk_path: Path, layer_key: str, data_type: str) -> np.ndarray:
+    """Loads an entire dataset (e.g., 'inputs' or 'targets' for a layer) from an HDF5 chunk and caches it."""
+    logger.debug(f"Cache miss or first load: Reading {data_type} for layer {layer_key} from {chunk_path}")
+    hf = _open_h5(chunk_path)  # This itself is cached
+    try:
+        # Ensure the dataset exists before trying to slice
+        if layer_key not in hf:
+            raise KeyError(f"Layer {layer_key} not found in chunk {chunk_path}")
+        if data_type not in hf[layer_key]:
+            raise KeyError(f"Data type {data_type} not found in layer {layer_key} of chunk {chunk_path}")
+
+        data = hf[layer_key][data_type][:]  # Load entire dataset
+        return data
+    except KeyError as e:
+        logger.error(f"Error accessing HDF5 dataset: {chunk_path} / {layer_key} / {data_type} - {e}")
+        # Re-raise as HTTPException or a custom server error if this function is directly used by an endpoint handler
+        # For now, re-raise KeyError for the caller (slice_chunk) to handle as HTTPException(500)
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error loading HDF5 dataset: {chunk_path} / {layer_key} / {data_type} - {e}")
+        raise  # Let slice_chunk handle this as a 500 error
+
+
 # ---------------------------------------------------------------------------
 # Upload endpoint – unchanged except for file ext check
 # ---------------------------------------------------------------------------
@@ -128,13 +152,20 @@ async def slice_chunk(
         accumulating them in a BytesIO buffer.
         """
         for lk in layer_keys:
-            g = hf[lk]
-            # h5py returns a NumPy array; .tobytes() gives a view‑copy of the data
-            # Ensure we access the dataset correctly
-            inputs_dataset = g["inputs"]
-            targets_dataset = g["targets"]
-            yield inputs_dataset[row_idx, :].tobytes()
-            yield targets_dataset[row_idx, :].tobytes()
+            try:
+                # Load full data (potentially from cache)
+                inputs_data_full = _load_layer_data_cached(chunk_path, lk, "inputs")
+                targets_data_full = _load_layer_data_cached(chunk_path, lk, "targets")
+
+                # Slice the (potentially cached) full data
+                yield inputs_data_full[row_idx, :].tobytes()
+                yield targets_data_full[row_idx, :].tobytes()
+            except KeyError as e:  # Catch KeyErrors from _load_layer_data_cached
+                logger.error(f"Data integrity issue for chunk {chunk_path}, layer {lk}: {e}")
+                raise HTTPException(status_code=500, detail=f"Missing data in chunk {chunk}, layer {lk}")
+            except Exception as e:
+                logger.error(f"Unexpected error processing layer {lk} in chunk {chunk_path}: {e}")
+                raise HTTPException(status_code=500, detail=f"Error processing chunk {chunk}, layer {lk}")
 
     return StreamingResponse(
         iter_layers(),
