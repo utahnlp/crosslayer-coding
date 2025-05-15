@@ -46,7 +46,7 @@ def _open_h5(path: Path) -> h5py.File:
     return h5py.File(path, "r")
 
 
-@lru_cache(maxsize=256)  # Maxsize can be tuned based on typical dataset sizes and server memory
+@lru_cache(maxsize=64)  # Tuned down from 256 to fit 14GB RAM better
 def _load_layer_data_cached(chunk_path: Path, layer_key: str, data_type: str) -> np.ndarray:
     """Loads an entire dataset (e.g., 'inputs' or 'targets' for a layer) from an HDF5 chunk and caches it."""
     logger.debug(f"Cache miss or first load: Reading {data_type} for layer {layer_key} from {chunk_path}")
