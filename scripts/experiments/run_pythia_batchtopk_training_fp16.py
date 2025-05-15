@@ -46,7 +46,7 @@ clt_config = CLTConfig(
     num_layers=num_layers,
     d_model=d_model,
     activation_fn="batchtopk",
-    batchtopk_k=None,
+    batchtopk_k=200,
     batchtopk_straight_through=True,
 )
 print("CLT Configuration (BatchTopK):")
