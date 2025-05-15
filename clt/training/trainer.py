@@ -93,6 +93,22 @@ class CLTTrainer:
             # Process group is None when not distributed
             self.process_group = None
 
+        # --- Mixed Precision Setup ---
+        self.mixed_precision = self.training_config.precision.lower()
+        self.use_cuda_amp = torch.cuda.is_available() and self.mixed_precision in {"fp16", "bf16"}
+        self.autocast_dtype = (
+            torch.float16
+            if self.mixed_precision == "fp16"
+            else torch.bfloat16 if self.mixed_precision == "bf16" else torch.float32
+        )
+        # Initialize GradScaler (enabled only for fp16 on CUDA)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.mixed_precision == "fp16" and self.use_cuda_amp))
+
+        logger.info(
+            f"Rank {self.rank}: Mixed precision mode: {self.mixed_precision}, use_cuda_amp: {self.use_cuda_amp}, autocast_dtype: {self.autocast_dtype}"
+        )
+        logger.info(f"Rank {self.rank}: GradScaler enabled: {self.scaler.is_enabled()}")
+
         # Set up log directory - only rank 0 creates it
         self.log_dir = log_dir or f"clt_train_{int(time.time())}"
         if not self.distributed or self.rank == 0:
@@ -112,6 +128,31 @@ class CLTTrainer:
             logger.warning(f"Rank {self.rank}: No seed provided in TrainingConfig. Using default torch seeding.")
 
         self.model = CrossLayerTranscoder(clt_config, process_group=self.process_group, device=self.device)
+
+        # --- Optionally convert model to FP16 (Step 8) ---
+        # If precision is "fp16", GradScaler is used, which expects FP32 optimizer parameters.
+        # Therefore, if precision is "fp16", we do not convert model to .half() before optimizer init,
+        # regardless of fp16_convert_weights. Autocast handles FP16 computations.
+        # fp16_convert_weights will apply if precision is not "fp16" (e.g., "bf16" or "fp32" training
+        # where user still wants to store/use fp16 weights directly without GradScaler for fp16).
+        if self.training_config.fp16_convert_weights:
+            if self.mixed_precision == "fp16":
+                logger.warning(
+                    f"Rank {self.rank}: 'fp16_convert_weights=True' is set with 'precision=fp16'. "
+                    "GradScaler expects FP32 optimizer parameters. Model weights will NOT be converted to FP16 "
+                    "before optimizer initialization to ensure GradScaler compatibility. "
+                    "Autocast will still use FP16 for computations."
+                )
+            else:  # mixed_precision is 'bf16' or 'fp32' (autocast_dtype is bfloat16 or float32, GradScaler is disabled for fp16)
+                logger.info(
+                    f"Rank {self.rank}: Converting model weights and buffers to FP16 (fp16_convert_weights=True, precision={self.mixed_precision})."
+                )
+                self.model.half()  # Converts all parameters and buffers
+                # Keep LayerNorm buffers in FP32 for stability
+                for name, buf in self.model.named_buffers():
+                    if buf.dtype == torch.float16 and "norm" in name.lower():
+                        logger.info(f"Rank {self.rank}: Converting buffer '{name}' from FP16 back to FP32.")
+                        buf.data = buf.data.float()
 
         # Initialize optimizer - works on local parameters
         # Explicitly type the kwargs dict for clarity and linting
@@ -357,6 +398,12 @@ class CLTTrainer:
             dummy_out.backward()
             print("!!! END DIAGNOSTIC !!!\n")
 
+        # --- Enable Anomaly Detection (if configured) ---
+        if self.training_config.debug_anomaly:
+            torch.autograd.set_detect_anomaly(True)
+            if not self.distributed or self.rank == 0:
+                logger.info("PyTorch Anomaly Detection ENABLED.")
+
         # Create progress bar only on rank 0
         pbar: Union[tqdm, range]
         if not self.distributed or self.rank == 0:
@@ -446,21 +493,19 @@ class CLTTrainer:
                 # --- END: One-time Normalization Check ---
 
                 # --- Forward pass and compute loss --- (All ranks)
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
 
-                # Compute feature activations **once** per step to avoid redundant encoder forward passes.
-                feature_activations_batch = self.model.get_feature_activations(inputs)
-
-                # Compute total loss using the pre-computed activations
-                loss, loss_dict = self.loss_manager.compute_total_loss(
-                    self.model,
-                    inputs,
-                    targets,
-                    step,
-                    self.training_config.training_steps,
-                    precomputed_activations=feature_activations_batch,
-                    dead_neuron_mask=self.dead_neurons_mask,
-                )
+                with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
+                    feature_activations_batch = self.model.get_feature_activations(inputs)
+                    loss, loss_dict = self.loss_manager.compute_total_loss(
+                        self.model,
+                        inputs,
+                        targets,
+                        step,
+                        self.training_config.training_steps,
+                        precomputed_activations=feature_activations_batch,
+                        dead_neuron_mask=self.dead_neurons_mask,
+                    )
 
                 # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
                 # We need *full* feature activations *after* non-linearity
@@ -493,30 +538,30 @@ class CLTTrainer:
                             f"Skipping backward pass and optimizer step."
                         )
                 else:
-                    try:
-                        loss.backward()
+                    # ---- Back-prop with gradient scaling ----
+                    self.scaler.scale(loss).backward()
 
-                        # --- Synchronise gradients of replicated parameters --- #
-                        if self.distributed and self.world_size > 1:  # Guard before calling the static/util function
-                            average_shared_parameter_grads(self.model, self.world_size)  # New call
+                    # Unscale gradients before clipping and distributed averaging
+                    self.scaler.unscale_(self.optimizer)
 
-                        # --- Gradient clipping --- #
-                        if self.training_config.gradient_clip_val is not None:
-                            torch.nn.utils.clip_grad_norm_(
-                                self.model.parameters(),
-                                self.training_config.gradient_clip_val,
-                            )
-                    except RuntimeError as e:
-                        if not self.distributed or self.rank == 0:
-                            print(
-                                f"\nRank {self.rank}: Error during backward pass at step {step}: {e}. Skipping optimizer step."
-                            )
-                        continue
+                    # --- Synchronise gradients of replicated parameters --- #
+                    if self.distributed and self.world_size > 1:
+                        average_shared_parameter_grads(self.model, self.world_size)
 
-                    # --- Optimizer step --- (Applied to local parameters using local gradients)
-                    self.optimizer.step()
+                    # --- Gradient clipping (operates on unscaled gradients) --- #
+                    if self.training_config.gradient_clip_val is not None:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.model.parameters(),
+                            self.training_config.gradient_clip_val,
+                        )
 
-                    # --- Invalidate Caches --- #
+                    # --- Optimizer step (scaler handles scaling/unscaling) ---
+                    self.scaler.step(self.optimizer)
+
+                    # --- Update scaler for next iteration ---
+                    self.scaler.update()
+
+                    # --- Invalidate Caches (moved after optimizer step) --- #
                     if hasattr(self.model, "_cached_decoder_norms"):
                         self.model._cached_decoder_norms = None
 
@@ -579,31 +624,67 @@ class CLTTrainer:
                         dist.barrier()  # Sync before evaluation starts so that all ranks enter together
 
                     # Compute evaluation metrics on all ranks to keep collective ops aligned
-                    current_dead_mask = self.dead_neurons_mask.detach().clone()
-                    eval_metrics = self.evaluator.compute_metrics(
-                        inputs,
-                        targets,
-                        dead_neuron_mask=current_dead_mask,
-                    )
+                    # Wrap the evaluation logic in autocast
+                    with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
+                        current_dead_mask = self.dead_neurons_mask.detach().clone()
+                        eval_metrics = self.evaluator.compute_metrics(
+                            inputs,  # These inputs are from the current training batch
+                            targets,  # These targets are from the current training batch
+                            dead_neuron_mask=current_dead_mask,
+                        )
 
-                    # --- Log per-layer standard deviation of pre-activations ---
-                    # This requires getting the pre-activations first.
-                    # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
-                    preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
-                    layerwise_preact_std_dev: Dict[str, float] = {}
-                    if preactivations_eval_dict:
-                        for layer_idx, preact_tensor in preactivations_eval_dict.items():
-                            if preact_tensor.numel() > 0:
-                                # Calculate std dev of all elements in the preactivation tensor for this layer
-                                std_dev_val = preact_tensor.std().item()
-                                layerwise_preact_std_dev[f"layer_{layer_idx}"] = std_dev_val
-                            else:
-                                layerwise_preact_std_dev[f"layer_{layer_idx}"] = float("nan")  # Or 0.0
+                        # --- Log per-layer standard deviation of pre-activations ---
+                        # This requires getting the pre-activations first.
+                        # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
+                        preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
+                        layerwise_preact_std_dev: Dict[str, float] = {}
+                        if preactivations_eval_dict:
+                            for layer_idx, preact_tensor in preactivations_eval_dict.items():
+                                if preact_tensor.numel() > 0:
+                                    # Calculate std dev of all elements in the preactivation tensor for this layer
+                                    std_dev_val = preact_tensor.std().item()
+                                    layerwise_preact_std_dev[f"layer_{layer_idx}"] = std_dev_val
+                                else:
+                                    layerwise_preact_std_dev[f"layer_{layer_idx}"] = float("nan")  # Or 0.0
 
-                    # Add to eval_metrics for WandB logging
-                    if layerwise_preact_std_dev:
-                        eval_metrics["layerwise/preactivation_std_dev"] = layerwise_preact_std_dev
-                    # --- End logging pre-activation std dev ---
+                        # Add to eval_metrics for WandB logging
+                        if layerwise_preact_std_dev:
+                            eval_metrics["layerwise/preactivation_std_dev"] = layerwise_preact_std_dev
+                        # --- End logging pre-activation std dev ---
+
+                        # Optionally compute and log sparsity diagnostics (can be slow).
+                        # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
+                        # internally calls `get_decoder_norms`, which performs distributed all-reduces.
+                        # We therefore compute the diagnostics on **all** ranks to keep the NCCL
+                        # collectives aligned, but we still only merge the returned values into
+                        # `eval_metrics` and log them on rank 0.
+                        if self.training_config.compute_sparsity_diagnostics:
+                            # feature_activations_batch is from the training step, might be stale or not what's desired for eval
+                            # For eval, it's better to recompute activations if needed by diagnostics, or pass inputs.
+                            # Assuming compute_sparsity_diagnostics can take `inputs` and get activations internally
+                            # or that `feature_activations_batch` is intentionally used here.
+                            # If `compute_sparsity_diagnostics` relies on activations from the autocasted `model.get_feature_activations`
+                            # it should be called *inside* this autocast block if it does its own forward pass.
+                            # The current `feature_activations_batch` was computed *outside* this specific eval autocast block
+                            # (it was for the training step loss). Let's assume `compute_sparsity_diagnostics` handles its own forward if needed.
+                            # For safety, if `compute_sparsity_diagnostics` does a forward pass, it should be inside an autocast.
+                            # The plan says "wrap the forward in the same autocast context".
+                            # `compute_sparsity_diagnostics` internally calls `model.get_decoder_norms()` which does not do a forward pass on inputs,
+                            # but it does operate on model parameters which might be .half().
+                            # `feature_activations_batch` was from the training step, it is already autocasted if AMP was on.
+                            sparsity_diag_metrics = compute_sparsity_diagnostics(
+                                model=self.model,
+                                training_config=self.training_config,
+                                feature_activations=feature_activations_batch,  # This uses activations from training step
+                            )
+                            # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
+                            if (not self.distributed) or (self.rank == 0):
+                                if sparsity_diag_metrics:
+                                    eval_metrics.update(sparsity_diag_metrics)
+                                    # Logging of eval_metrics including sparsity_diag happens later by MetricLogger
+                                    # self.wandb_logger.log_evaluation(step, eval_metrics) # This was an old direct call
+
+                    # --- END of autocast block for evaluation ---
 
                     if not self.distributed or self.rank == 0:
                         # Store evaluation metrics (for saving to JSON) - Handled by MetricLogger
@@ -623,25 +704,6 @@ class CLTTrainer:
 
                         # --- Log evaluation metrics (now done by MetricLogger) ---
                         self.metric_logger.log_evaluation_metrics(step, eval_metrics)
-
-                    # Optionally compute and log sparsity diagnostics (can be slow).
-                    # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
-                    # internally calls `get_decoder_norms`, which performs distributed all-reduces.
-                    # We therefore compute the diagnostics on **all** ranks to keep the NCCL
-                    # collectives aligned, but we still only merge the returned values into
-                    # `eval_metrics` and log them on rank 0.
-                    if self.training_config.compute_sparsity_diagnostics:
-                        sparsity_diag_metrics = compute_sparsity_diagnostics(
-                            model=self.model,
-                            training_config=self.training_config,
-                            feature_activations=feature_activations_batch,
-                        )
-
-                        # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
-                        if (not self.distributed) or (self.rank == 0):
-                            if sparsity_diag_metrics:
-                                eval_metrics.update(sparsity_diag_metrics)
-                                self.wandb_logger.log_evaluation(step, eval_metrics)
 
                     # Ensure all ranks finish evaluation before proceeding
                     if self.distributed:

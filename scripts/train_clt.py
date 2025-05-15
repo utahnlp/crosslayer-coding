@@ -223,6 +223,23 @@ def parse_args():
         help="Target number of tokens per training batch.",
     )
     train_group.add_argument(
+        "--precision",
+        type=str,
+        choices=["fp32", "fp16", "bf16"],
+        default="fp32",  # Default to fp32 as per TrainingConfig
+        help="Training precision: 'fp32', 'fp16' (mixed precision with AMP), or 'bf16' (mixed precision with AMP).",
+    )
+    train_group.add_argument(
+        "--fp16-convert-weights",
+        action="store_true",
+        help="If --precision is fp16, also convert model weights to fp16. Saves memory but model parameters remain fp32 by default with AMP. Default is False.",
+    )
+    train_group.add_argument(
+        "--debug-anomaly",
+        action="store_true",
+        help="Enable PyTorch autograd anomaly detection for debugging NaN issues. Default is False.",
+    )
+    train_group.add_argument(
         "--normalization-method",
         type=str,
         choices=["auto", "none", "estimated_mean_std"],  # Added estimated_mean_std from TrainingConfig
@@ -547,6 +564,10 @@ def main():
         wandb_entity=args.wandb_entity,
         wandb_run_name=wandb_run_name,
         wandb_tags=args.wandb_tags,
+        # Precision & Debugging
+        precision=args.precision,
+        debug_anomaly=args.debug_anomaly,
+        fp16_convert_weights=args.fp16_convert_weights,
     )
     logger.info(f"Training Config: {training_config}")
 
