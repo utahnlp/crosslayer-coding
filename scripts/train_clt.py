@@ -86,7 +86,7 @@ def parse_args():
         "--output-dir",
         type=str,
         default=f"clt_train_{int(time.time())}",
-        help="Directory to save logs, checkpoints, and final model.",
+        help="Directory to save logs, checkpoints, and final model. If resuming, this might be overridden by --resume_from_checkpoint_dir.",
     )
     core_group.add_argument(
         "--model-name",
@@ -104,6 +104,18 @@ def parse_args():
         "--distributed",
         action="store_true",
         help="Enable distributed training (requires torchrun/appropriate launcher).",
+    )
+    core_group.add_argument(
+        "--resume_from_checkpoint_dir",
+        type=str,
+        default=None,
+        help="Path to the output directory of a previous run to resume from. Will attempt to load 'latest' or a specific step if --resume_step is also given.",
+    )
+    core_group.add_argument(
+        "--resume_step",
+        type=int,
+        default=None,
+        help="Optional specific step to resume from. Used in conjunction with --resume_from_checkpoint_dir.",
     )
 
     # --- Local Activation Source Parameters ---
@@ -407,7 +419,11 @@ def parse_args():
             parser.error("--dataset-id is required when --activation-source is 'remote'")
     elif args.activation_source == "local_manifest":
         if not args.activation_path:
-            parser.error("--activation-path is required when --activation-source is 'local_manifest'")
+            # Allow activation_path to be None if resuming, as it will be loaded from cli_args.json
+            if not args.resume_from_checkpoint_dir:
+                parser.error(
+                    "--activation-path is required when --activation-source is 'local_manifest' and not resuming."
+                )
 
     return args
 
@@ -416,17 +432,109 @@ def main():
     """Main function to configure and run the CLTTrainer."""
     args = parse_args()
 
-    # --- Setup Output Directory ---
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(exist_ok=True, parents=True)
-    logger.info(f"Output directory: {output_dir.resolve()}")
+    output_dir_for_trainer_str = args.output_dir
+    actual_checkpoint_path_to_load: Optional[str] = None
+    resuming_run = False
 
-    # Save command-line arguments
-    try:
-        with open(output_dir / "cli_args.json", "w") as f:
-            json.dump(vars(args), f, indent=2)
-    except Exception as e:
-        logger.warning(f"Could not save command-line args: {e}")
+    if args.resume_from_checkpoint_dir:
+        resuming_run = True
+        resume_base_dir = Path(args.resume_from_checkpoint_dir)
+        logger.info(f"Attempting to resume training from directory: {resume_base_dir}")
+
+        # Override output_dir to be the resume directory
+        output_dir_for_trainer_str = str(resume_base_dir.resolve())
+
+        # Load original CLI args from the run being resumed
+        original_cli_args_path = resume_base_dir / "cli_args.json"
+        if original_cli_args_path.exists():
+            logger.info(f"Loading original CLI arguments from {original_cli_args_path}")
+            with open(original_cli_args_path, "r") as f:
+                original_cli_vars = json.load(f)
+
+            # Create a new argparse.Namespace from the loaded dict
+            # Update this new namespace with the original args, then override with any current CLI args
+            # that are relevant for resuming (like resume_step, or if user wants to change e.g. training_steps for the resumed run)
+
+            # Start with current args (which include resume_from_checkpoint_dir, resume_step)
+            # Then load original args, but current resume-specific args should take precedence if they were specified.
+            # Also, things like output_dir might change if we allow resuming to a NEW directory (not supported yet, logs to original)
+
+            current_args_dict = vars(args).copy()
+            # args_from_file = argparse.Namespace(**original_cli_vars) # Unused / Can be removed
+
+            # Update args_from_file with any overriding CLI args from current invocation
+            # For most params, we want the original run's params. But some (e.g. training_steps) user might want to extend.
+            # For now, let's prioritize original CLI args for most things, except for resume flags and potentially output_dir.
+
+            # Convert original_cli_vars to Namespace and then update it with relevant current args.
+            # The `args` variable will be rebuilt from original_cli_vars, with care for resume flags.
+            temp_args_dict = original_cli_vars.copy()
+
+            # Keep current resume flags and potentially new output_dir if we decide to support it
+            # For now, output_dir is forced to be the resume_from_checkpoint_dir
+            temp_args_dict["resume_from_checkpoint_dir"] = args.resume_from_checkpoint_dir
+            temp_args_dict["resume_step"] = args.resume_step
+            temp_args_dict["output_dir"] = (
+                output_dir_for_trainer_str  # Ensure output_dir is the one we are resuming into
+            )
+            # If user wants to override training_steps for a resumed run, they can pass it.
+            if current_args_dict.get("training_steps") != original_cli_vars.get("training_steps"):
+                logger.info(
+                    f"Overriding training_steps from {original_cli_vars.get('training_steps')} to {current_args_dict.get('training_steps')}"
+                )
+                temp_args_dict["training_steps"] = current_args_dict.get("training_steps")
+            # Potentially other overridable args like learning_rate, wandb settings etc.
+
+            args = argparse.Namespace(**temp_args_dict)  # Re-assign args with merged values
+            logger.info(f"Effective arguments for resumed run: {vars(args)}")
+
+        else:
+            logger.warning(
+                f"Original cli_args.json not found at {original_cli_args_path}. "
+                f"Configuration will be based on the currently provided command-line arguments. "
+                f"Ensure all necessary configuration parameters are supplied."
+            )
+            # In this case, `args` remains as parsed from the current command line, which is desired.
+
+        # Determine the specific checkpoint path to load (model file or distributed dir)
+        # This logic assumes CLTTrainer's load_checkpoint handles whether it's a file or dir based on distributed status
+        if args.distributed:
+            if args.resume_step is not None:
+                actual_checkpoint_path_to_load = str(resume_base_dir / f"step_{args.resume_step}")
+            else:
+                actual_checkpoint_path_to_load = str(resume_base_dir / "latest")
+        else:  # Non-distributed
+            if args.resume_step is not None:
+                actual_checkpoint_path_to_load = str(resume_base_dir / f"clt_checkpoint_{args.resume_step}.safetensors")
+            else:
+                actual_checkpoint_path_to_load = str(resume_base_dir / "clt_checkpoint_latest.safetensors")
+
+        if not Path(actual_checkpoint_path_to_load).exists():
+            logger.error(f"Checkpoint to load does not exist: {actual_checkpoint_path_to_load}")
+            if args.distributed and (
+                actual_checkpoint_path_to_load.endswith("latest")
+                or actual_checkpoint_path_to_load.endswith(f"step_{args.resume_step}")
+            ):
+                logger.error("For distributed runs, ensure the directory exists.")
+            elif not args.distributed and actual_checkpoint_path_to_load.endswith(".safetensors"):
+                logger.error("For non-distributed runs, ensure the .safetensors file exists.")
+            return
+
+        logger.info(f"Will attempt to load checkpoint state from: {actual_checkpoint_path_to_load}")
+
+    # --- Setup Output Directory (now based on output_dir_for_trainer_str) ---
+    output_dir_path = Path(output_dir_for_trainer_str)
+    output_dir_path.mkdir(exist_ok=True, parents=True)
+    logger.info(f"Using output directory: {output_dir_path.resolve()}")
+
+    # Save command-line arguments (only if not resuming, or save effective if resuming?)
+    # For now, let's only save if it's a new run, to avoid overwriting original if resuming.
+    if not resuming_run:
+        try:
+            with open(output_dir_path / "cli_args.json", "w") as f:
+                json.dump(vars(args), f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save command-line args: {e}")
 
     # --- Determine Device ---
     if args.device:
@@ -493,34 +601,47 @@ def main():
         logger.info(f"Using remote activation source: {args.server_url}, dataset: {args.dataset_id}")
 
     # --- Determine WandB Run Name ---
-    wandb_run_name = args.wandb_run_name
-    if not wandb_run_name and args.enable_wandb:  # Auto-generate if not provided and wandb is enabled
-        name_parts = [f"{args.num_features}-width"]
-        if args.activation_fn == "batchtopk":
-            name_parts.append("batchtopk")
-            if args.batchtopk_k is not None:
-                name_parts.append(f"k{args.batchtopk_k}")
-        elif args.activation_fn == "topk":
-            name_parts.append("topk")
-            if args.topk_k is not None:
-                name_parts.append(f"k{args.topk_k}")
-        else:  # jumprelu or relu
-            name_parts.append(args.activation_fn)
-            name_parts.append(f"{args.sparsity_lambda:.1e}-slambda")
-            name_parts.append(f"{args.sparsity_c:.1f}-sc")
+    wandb_run_name_for_config: Optional[str] = None  # Initialize to None
 
-        name_parts.append(f"{args.train_batch_size_tokens}-batch")
-        name_parts.append(f"{args.learning_rate:.1e}-lr")
-        if args.activation_source == "remote" and args.dataset_id:
-            # Sanitize dataset_id for use in filename/run name
-            sanitized_dataset_id = args.dataset_id.replace("/", "_")
-            name_parts.append(f"ds_{sanitized_dataset_id[:20]}")  # Truncate if too long
-        elif args.activation_source == "local_manifest" and args.activation_path:
-            path_basename = Path(args.activation_path).name
-            name_parts.append(f"path_{path_basename[:20]}")
+    if resuming_run:
+        # If resuming, we prioritize the ID from the checkpoint.
+        # WandBLogger will use the ID and resume="must".
+        # Explicitly set run name to None to avoid conflicts.
+        wandb_run_name_for_config = None
+        logger.info("Resuming run: wandb_run_name will be None; WandB ID from checkpoint will be used.")
+    else:
+        # This is a new run (not resuming)
+        wandb_run_name_for_config = args.wandb_run_name
+        if (
+            not wandb_run_name_for_config and args.enable_wandb
+        ):  # Auto-generate if not provided and wandb is enabled for a new run
+            name_parts = [f"{args.num_features}-width"]
+            if args.activation_fn == "batchtopk":
+                name_parts.append("batchtopk")
+                if args.batchtopk_k is not None:
+                    name_parts.append(f"k{args.batchtopk_k}")
+            elif args.activation_fn == "topk":
+                name_parts.append("topk")
+                if args.topk_k is not None:
+                    name_parts.append(f"k{args.topk_k}")
+            else:  # jumprelu or relu
+                name_parts.append(args.activation_fn)
+                name_parts.append(f"{args.sparsity_lambda:.1e}-slambda")
+                name_parts.append(f"{args.sparsity_c:.1f}-sc")
 
-        wandb_run_name = "-".join(name_parts)
-        logger.info(f"Generated WandB run name: {wandb_run_name}")
+            name_parts.append(f"{args.train_batch_size_tokens}-batch")
+            name_parts.append(f"{args.learning_rate:.1e}-lr")
+            if args.activation_source == "remote" and args.dataset_id:
+                # Sanitize dataset_id for use in filename/run name
+                sanitized_dataset_id = args.dataset_id.replace("/", "_")
+                name_parts.append(f"ds_{sanitized_dataset_id[:20]}")  # Truncate if too long
+            elif args.activation_source == "local_manifest" and args.activation_path:
+                path_basename = Path(args.activation_path).name
+                name_parts.append(f"path_{path_basename[:20]}")
+
+            wandb_run_name_for_config = "-".join(name_parts)
+            logger.info(f"Generated WandB run name for new run: {wandb_run_name_for_config}")
+    # --- End Determine WandB Run Name ---
 
     training_config = TrainingConfig(
         # Core Training
@@ -562,7 +683,7 @@ def main():
         enable_wandb=args.enable_wandb,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
-        wandb_run_name=wandb_run_name,
+        wandb_run_name=wandb_run_name_for_config,  # Use the decision from above
         wandb_tags=args.wandb_tags,
         # Precision & Debugging
         precision=args.precision,
@@ -577,9 +698,10 @@ def main():
         trainer = CLTTrainer(
             clt_config=clt_config,
             training_config=training_config,
-            log_dir=str(output_dir),
-            device=device_str,  # Pass the string, trainer handles torch.device
+            log_dir=str(output_dir_path),  # Use the resolved output_dir_path
+            device=device_str,
             distributed=args.distributed,
+            resume_from_checkpoint_path=actual_checkpoint_path_to_load if resuming_run else None,
         )
     except Exception as e:
         logger.exception(f"Failed to initialize CLTTrainer: {e}")
@@ -594,7 +716,7 @@ def main():
     try:
         trainer.train()  # eval_every is handled by eval_interval in TrainingConfig
         logger.info("Training complete!")
-        logger.info(f"Final model and logs saved in: {output_dir.resolve()}")
+        logger.info(f"Final model and logs saved in: {output_dir_path.resolve()}")
     except Exception as e:
         logger.exception(f"Training failed: {e}")
         raise

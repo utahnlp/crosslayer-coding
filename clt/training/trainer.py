@@ -10,6 +10,8 @@ import logging  # Add logging import
 import torch.distributed as dist  # Import torch.distributed
 from torch.distributed import ProcessGroup  # Import ProcessGroup
 from dataclasses import asdict  # Add dataclasses import
+import numpy as np  # For numpy RNG state
+import random  # For python RNG state
 
 from clt.config import CLTConfig, TrainingConfig
 from clt.models.clt import CrossLayerTranscoder
@@ -48,6 +50,7 @@ class CLTTrainer:
         log_dir: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
         distributed: bool = False,  # Add distributed flag
+        resume_from_checkpoint_path: Optional[str] = None,  # For resuming
     ):
         """Initialize the CLT trainer.
 
@@ -57,10 +60,14 @@ class CLTTrainer:
             log_dir: Directory to save logs and checkpoints
             device: Device to use for training (ignored if distributed)
             distributed: Whether to use distributed training
+            resume_from_checkpoint_path: Path to a checkpoint file to resume from.
+                                         For non-distributed, path to .safetensors model file.
+                                         For distributed, path to checkpoint directory (e.g. step_XXX or latest).
         """
         self.clt_config = clt_config
         self.training_config = training_config
         self.distributed = distributed
+        self.loaded_trainer_state: Optional[Dict[str, Any]] = None  # Store loaded state here
 
         # Initialize distributed training if enabled
         self.rank = 0
@@ -92,6 +99,7 @@ class CLTTrainer:
             self.device = torch.device(_device_input) if isinstance(_device_input, str) else _device_input
             # Process group is None when not distributed
             self.process_group = None
+            # world_size is 1 if not distributed, rank is 0 (already initialized)
 
         # --- Mixed Precision Setup ---
         self.mixed_precision = self.training_config.precision.lower()
@@ -295,27 +303,90 @@ class CLTTrainer:
             dtype=torch.long,
         )
 
-        # Initialize WandB logger - only on rank 0
-        if not self.distributed or self.rank == 0:
-            self.wandb_logger: Union[WandBLogger, DummyWandBLogger] = WandBLogger(
-                training_config=training_config, clt_config=clt_config, log_dir=self.log_dir
-            )
-        else:
-            # Dummy logger for non-rank-0 processes
-            self.wandb_logger = DummyWandBLogger()
+        # ------------------------------------------------------------------
+        #  CheckpointManager EARLY init (use Dummy logger placeholder)
+        # ------------------------------------------------------------------
+        # We create a placeholder DummyWandBLogger so that we can construct the
+        # CheckpointManager and load the checkpoint *before* creating the real
+        # WandBLogger.  This lets us obtain the stored `wandb_run_id` from the
+        # checkpoint and feed it into WandBLogger for a proper resume.
+        placeholder_wandb_logger: Union[WandBLogger, DummyWandBLogger]
+        placeholder_wandb_logger = DummyWandBLogger(
+            training_config=training_config, clt_config=clt_config, log_dir=self.log_dir, resume_wandb_id=None
+        )
 
-        # Initialize CheckpointManager
         self.checkpoint_manager = CheckpointManager(
             model=self.model,
             activation_store=self.activation_store,
-            wandb_logger=self.wandb_logger,
+            wandb_logger=placeholder_wandb_logger,
             log_dir=self.log_dir,
             distributed=self.distributed,
             rank=self.rank,
             device=self.device,
+            world_size=self.world_size,
         )
 
-        # Initialize MetricLogger
+        # ------------------------------------------------------------------
+        #  Load checkpoint (if any) *before* real WandB logger init
+        # ------------------------------------------------------------------
+        if resume_from_checkpoint_path:
+            logger.info(
+                f"Rank {self.rank}: Attempting to resume training from checkpoint: {resume_from_checkpoint_path}"
+            )
+            # load_checkpoint loads model and activation store state internally
+            # and returns the trainer_state dictionary (optimizer, scheduler, step, etc.)
+            self.loaded_trainer_state = self.checkpoint_manager.load_checkpoint(resume_from_checkpoint_path)
+            if self.loaded_trainer_state:
+                loaded_step_for_log = self.loaded_trainer_state.get("step", -1)
+                logger.info(
+                    f"Rank {self.rank}: Successfully loaded checkpoint. Trainer state recovered for step {loaded_step_for_log}."
+                )
+                # ADDED: Detailed logging of loaded_trainer_state keys and step value
+                logger.info(f"Rank {self.rank}: Keys in loaded_trainer_state: {list(self.loaded_trainer_state.keys())}")
+                logger.info(
+                    f"Rank {self.rank}: Value of 'step' in loaded_trainer_state: {self.loaded_trainer_state.get('step')}"
+                )
+                logger.info(
+                    f"Rank {self.rank}: Value of 'wandb_run_id' in loaded_trainer_state: {self.loaded_trainer_state.get('wandb_run_id')}"
+                )
+            else:
+                logger.warning(
+                    f"Rank {self.rank}: Checkpoint loaded, but trainer state (optimizer, step, etc.) was empty or not found. Starting from scratch."
+                )
+                # loaded_trainer_state will be None or empty, so train() will start fresh
+
+        # ------------------------------------------------------------------
+        #  Initialize WandB logger (after checkpoint load so we have run_id)
+        # ------------------------------------------------------------------
+        if not self.distributed or self.rank == 0:
+            loaded_wandb_run_id_for_init: Optional[str] = None
+            if self.loaded_trainer_state:  # Check if resuming and state was loaded
+                loaded_wandb_run_id_for_init = self.loaded_trainer_state.get("wandb_run_id")
+                if loaded_wandb_run_id_for_init:
+                    logger.info(
+                        f"Rank {self.rank}: Found WandB run ID {loaded_wandb_run_id_for_init} in loaded checkpoint state. Attempting to resume."
+                    )
+
+            self.wandb_logger = WandBLogger(
+                training_config=training_config,
+                clt_config=clt_config,
+                log_dir=self.log_dir,
+                resume_wandb_id=loaded_wandb_run_id_for_init,
+            )
+        else:
+            self.wandb_logger = DummyWandBLogger(
+                training_config=training_config,  # type: ignore[arg-type]
+                clt_config=clt_config,  # type: ignore[arg-type]
+                log_dir=self.log_dir,  # type: ignore[arg-type]
+                resume_wandb_id=None,  # type: ignore[arg-type]
+            )
+
+        # Replace placeholder in CheckpointManager with the real logger
+        self.checkpoint_manager.wandb_logger = self.wandb_logger
+
+        # ------------------------------------------------------------------
+        #  MetricLogger (uses the real wandb_logger)
+        # ------------------------------------------------------------------
         self.metric_logger = MetricLogger(
             distributed=self.distributed,
             rank=self.rank,
@@ -406,16 +477,66 @@ class CLTTrainer:
 
         # Create progress bar only on rank 0
         pbar: Union[tqdm, range]
+
+        initial_step = 0
+        if self.loaded_trainer_state:  # Check if we are resuming and state was loaded
+            initial_step = self.loaded_trainer_state.get("step", 0) + 1  # Start from next step
+            if initial_step > 0:
+                logger.info(f"Rank {self.rank}: Resuming training from step {initial_step}")
+                try:
+                    self.optimizer.load_state_dict(self.loaded_trainer_state["optimizer_state_dict"])
+                    logger.info(f"Rank {self.rank}: Optimizer state loaded.")
+                    if self.scheduler and self.loaded_trainer_state.get("scheduler_state_dict"):
+                        self.scheduler.load_state_dict(self.loaded_trainer_state["scheduler_state_dict"])
+                        logger.info(f"Rank {self.rank}: Scheduler state loaded.")
+                    if self.scaler and self.scaler.is_enabled() and self.loaded_trainer_state.get("scaler_state_dict"):
+                        self.scaler.load_state_dict(self.loaded_trainer_state["scaler_state_dict"])
+                        logger.info(f"Rank {self.rank}: GradScaler state loaded.")
+
+                    loaded_n_passes = self.loaded_trainer_state.get("n_forward_passes_since_fired")
+                    if loaded_n_passes is not None:
+                        self.n_forward_passes_since_fired.data = loaded_n_passes.to(self.device)
+                        logger.info(f"Rank {self.rank}: n_forward_passes_since_fired state loaded.")
+
+                    # Restore RNG states
+                    if "torch_rng_state" in self.loaded_trainer_state:
+                        torch.set_rng_state(
+                            self.loaded_trainer_state["torch_rng_state"].cpu()
+                        )  # Ensure it's on CPU before loading
+                        logger.info(f"Rank {self.rank}: PyTorch RNG state loaded.")
+                    if "numpy_rng_state" in self.loaded_trainer_state:
+                        np.random.set_state(self.loaded_trainer_state["numpy_rng_state"])
+                        logger.info(f"Rank {self.rank}: NumPy RNG state loaded.")
+                    if "python_rng_state" in self.loaded_trainer_state:
+                        random.setstate(self.loaded_trainer_state["python_rng_state"])
+                        logger.info(f"Rank {self.rank}: Python RNG state loaded.")
+
+                except KeyError as e:
+                    logger.error(
+                        f"Rank {self.rank}: KeyError when loading trainer state ({e}). Some states might not be restored correctly. Check checkpoint compatibility."
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Rank {self.rank}: Error loading trainer state: {e}. Training might not resume correctly."
+                    )
+            else:
+                logger.info(
+                    f"Rank {self.rank}: Loaded step is {initial_step - 1}, starting training from step 0 or continuing if step was 0."
+                )
+                initial_step = 0  # Ensure we don't start from 1 if loaded step was 0
+
         if not self.distributed or self.rank == 0:
             pbar = tqdm(
-                range(self.training_config.training_steps),
+                range(initial_step, self.training_config.training_steps),
                 desc="Training CLT",
                 leave=True,
+                initial=initial_step,  # Set initial for tqdm to show correct progress
+                total=self.training_config.training_steps,  # Set total for tqdm
             )
         else:
-            pbar = range(self.training_config.training_steps)
+            pbar = range(initial_step, self.training_config.training_steps)
 
-        step = 0
+        step = initial_step  # Initialize step before the loop, in case loop doesn't run
         try:
             for step in pbar:
                 # Refresh progress bar on rank 0
@@ -495,7 +616,7 @@ class CLTTrainer:
                 # --- Forward pass and compute loss --- (All ranks)
                 self.optimizer.zero_grad(set_to_none=True)
 
-                with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
+                with torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
                     feature_activations_batch = self.model.get_feature_activations(inputs)
                     loss, loss_dict = self.loss_manager.compute_total_loss(
                         self.model,
@@ -625,7 +746,9 @@ class CLTTrainer:
 
                     # Compute evaluation metrics on all ranks to keep collective ops aligned
                     # Wrap the evaluation logic in autocast
-                    with torch.amp.autocast(self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
+                    with torch.autocast(
+                        device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp
+                    ):
                         current_dead_mask = self.dead_neurons_mask.detach().clone()
                         eval_metrics = self.evaluator.compute_metrics(
                             inputs,  # These inputs are from the current training batch
@@ -711,7 +834,24 @@ class CLTTrainer:
 
                 # --- Checkpointing (All ranks participate) ---
                 if save_checkpoint_flag:
-                    self.checkpoint_manager._save_checkpoint(step)
+                    current_trainer_state_for_checkpoint = {
+                        "step": step,
+                        "optimizer_state_dict": self.optimizer.state_dict(),
+                        "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+                        "scaler_state_dict": (
+                            self.scaler.state_dict() if self.scaler and self.scaler.is_enabled() else None
+                        ),
+                        "n_forward_passes_since_fired": (
+                            self.n_forward_passes_since_fired.cpu()
+                            if self.n_forward_passes_since_fired is not None
+                            else None
+                        ),
+                        "wandb_run_id": self.wandb_logger.get_current_wandb_run_id(),
+                        "torch_rng_state": torch.get_rng_state(),
+                        "numpy_rng_state": np.random.get_state(),
+                        "python_rng_state": random.getstate(),
+                    }
+                    self.checkpoint_manager._save_checkpoint(step, current_trainer_state_for_checkpoint)
 
             # --- Explicitly delete tensors at the very end of the loop iteration --- #
             # Do this on all ranks
@@ -745,9 +885,23 @@ class CLTTrainer:
         # All ranks save final model state
         try:
             # final_model_state_dict = self.model.state_dict() # Not strictly needed here if CheckpointManager handles it
+            final_trainer_state_for_checkpoint = {
+                "step": step,  # Use the actual last completed step
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+                "scaler_state_dict": self.scaler.state_dict() if self.scaler and self.scaler.is_enabled() else None,
+                "n_forward_passes_since_fired": (
+                    self.n_forward_passes_since_fired.cpu() if self.n_forward_passes_since_fired is not None else None
+                ),
+                "wandb_run_id": self.wandb_logger.get_current_wandb_run_id(),
+                "torch_rng_state": torch.get_rng_state(),
+                "numpy_rng_state": np.random.get_state(),
+                "python_rng_state": random.getstate(),
+            }
             self.checkpoint_manager._save_checkpoint(
-                step=self.training_config.training_steps
-            )  # step value indicates final
+                step=step,  # Save at the actual last completed step
+                trainer_state_to_save=final_trainer_state_for_checkpoint,
+            )
         except Exception as e:
             print(f"Rank {self.rank}: Warning: Failed to save final distributed model state: {e}")
 

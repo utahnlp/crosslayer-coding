@@ -181,7 +181,7 @@ training_config = TrainingConfig(
     dead_feature_window=200,
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-hp-sweeps-pythia-70m",
+    wandb_project="clt-tutorial",
     wandb_run_name=wdb_run_name,
 )
 print("\nTraining Configuration (TopK):")
@@ -336,4 +336,22 @@ print(f"Logs and checkpoints will be saved to: {log_dir}")
 
 # %%
 # weights.keys()
+# %%
+import torch
+
+checkpoint_path = (
+    "clt_training_logs/clt_pythia_topk_train_1747350938/trainer_state_latest.pt"  # Or the specific step's file
+)
+# checkpoint_path = "tutorials/clt_training_logs/clt_pythia_topk_train_1747350938/step_X/trainer_state.pt" # For distributed
+try:
+    data = torch.load(checkpoint_path, map_location="cpu")
+    print(data.keys())
+    if "wandb_run_id" in data:
+        print(f"WandB Run ID found: {data['wandb_run_id']}")
+    else:
+        print("WandB Run ID NOT found in checkpoint.")
+except FileNotFoundError:
+    print(f"Checkpoint file not found: {checkpoint_path}")
+except Exception as e:
+    print(f"Error loading checkpoint: {e}")
 # %%

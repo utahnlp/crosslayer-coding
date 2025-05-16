@@ -147,21 +147,21 @@ Assume you have 4 GPUs available on the current machine. Use `torchrun --nproc_p
 
 ```bash
 # Example using local manifest data on 4 GPUs
-torchrun --nproc_per_node=4 scripts/train_clt.py \\
-    --activation-source local_manifest \\
-    --activation-path ./tutorial_activations/gpt2/pile-uncopyrighted_train \\
-    --output-dir ./clt_output_local_4gpu \\
-    --model-name gpt2 \\
-    --num-features 3072 \\
-    --activation-fn jumprelu \\
-    --learning-rate 3e-4 \\
-    --training-steps 50000 \\
-    --train-batch-size-tokens 4096 \\
-    --sparsity-lambda 1e-3 \\
-    --normalization-method auto \\
-    --log-interval 100 \\
-    --eval-interval 1000 \\
-    --checkpoint-interval 1000 \\
+torchrun --nproc_per_node=4 scripts/train_clt.py \
+    --activation-source local_manifest \
+    --activation-path ./tutorial_activations/gpt2/pile-uncopyrighted_train \
+    --output-dir ./clt_output_local_4gpu \
+    --model-name gpt2 \
+    --num-features 3072 \
+    --activation-fn jumprelu \
+    --learning-rate 3e-4 \
+    --training-steps 50000 \
+    --train-batch-size-tokens 4096 \
+    --sparsity-lambda 1e-3 \
+    --normalization-method auto \
+    --log-interval 100 \
+    --eval-interval 1000 \
+    --checkpoint-interval 1000 \
     --enable-wandb --wandb-project clt-training-local-4gpu
     # Add other arguments as needed
 ```
@@ -171,8 +171,46 @@ Scaling to multiple nodes requires:
 1.  Setting up the `torchrun` command appropriately with `--nnodes`, `--node_rank`, `--rdzv_id`, `--rdzv_backend`, and `--rdzv_endpoint`. See the [torchrun documentation](https://pytorch.org/docs/stable/elastic/run.html).
 2.  Ensuring data accessibility for all nodes:
     *   **Local Manifest:** Requires a shared filesystem mounted at the *same path* on all nodes.
-    *   **Remote Server:** The activation server URL must be reachable from all training nodes. The central server might become a bottleneck.
+    *   **Remote Server:** The activation server URL must be reachable from all training nodes. The central server might become a bottleneck; make sure it is fast and has a good connection.
 3.  Ensuring the `--output-dir` is on a shared filesystem for checkpointing, or implementing custom checkpointing logic to save/load shards from a central location (e.g., cloud storage). The default `CheckpointManager` assumes ranks can write to the same directory structure.
+
+### Resuming Training from a Checkpoint
+
+To resume training from a previously saved checkpoint, use the `--resume_from_checkpoint_dir` argument with the `scripts/train_clt.py` command. The script will attempt to load the latest checkpoint (`clt_checkpoint_latest.safetensors` and `trainer_state_latest.pt` for non-distributed, or the `latest/` directory for distributed runs) from the specified directory.
+
+**Key aspects of resuming:**
+
+1.  **Configuration Loading**: When resuming, the script will look for `cli_args.json` in the `--resume_from_checkpoint_dir`. If found, it loads the command-line arguments from the original run. You can override certain parameters by providing them in the current command (e.g., extend `--training-steps`). If `cli_args.json` is not found, a warning is issued, and the current command-line arguments are used (you must ensure all necessary configurations are provided).
+2.  **Output Directory**: The `output_dir` for the resumed run will be the same as the `--resume_from_checkpoint_dir`.
+3.  **WandB Resumption**: If the original run used Weights & Biases (WandB) and the WandB run ID was saved in the checkpoint (`trainer_state_latest.pt`), the resumed training will attempt to continue logging to the *same* WandB run. Do **not** specify `--wandb-run-name` when resuming if you want to continue the original run; the ID from the checkpoint will be used.
+4.  **Specific Step**: You can resume from a specific checkpoint step (instead of `latest`) by also providing the `--resume_step <step_number>` argument. For non-distributed runs, it will look for `clt_checkpoint_<step_number>.safetensors`. For distributed runs, it will look for the `step_<step_number>/` directory.
+5.  **State Restoration**: The trainer restores the model weights, optimizer state, scheduler state, gradient scaler state, and the state of the data sampler (including RNG states for PyTorch, NumPy, and Python's `random` module). 
+
+**Example: Resuming a Non-Distributed Run**
+
+```bash
+python scripts/train_clt.py \
+    --resume_from_checkpoint_dir ./clt_output_local \
+    # Optional: --resume_step 10000 # To resume from step 10000 specifically
+    # Optional: --training-steps 60000 # To extend training beyond original steps (this number should be total including past steps)
+    # Ensure other necessary args are present if cli_args.json is missing or you need to override them.
+    # For example, if the original run used WandB, include --enable-wandb if not in cli_args.json.
+    --enable-wandb 
+```
+
+**Example: Resuming a Distributed Run (e.g., 4 GPUs)**
+
+```bash
+torchrun --nproc_per_node=4 scripts/train_clt.py \
+    --resume_from_checkpoint_dir ./clt_output_local_4gpu \
+    # Optional: --resume_step 10000
+    # Optional: --training-steps 60000
+    --enable-wandb
+```
+
+**Important Notes for Resuming:**
+*   Ensure the activation data specified in the original `cli_args.json` (or provided in the resume command if `cli_args.json` is missing) is still accessible at the same path.
+*   If you modify critical architectural parameters (e.g., `--num-features`, `--model-name` leading to different `d_model` or `num_layers`) when resuming, it will likely lead to errors when loading the model weights.
 
 ## Converting BatchTopK Models to JumpReLU
 If you train a CLT model using `batchtopk` as the activation function (`--activation-fn batchtopk`), the learned thresholds are implicit. The `scripts/convert_batchtopk_to_jumprelu.py` script allows you to perform a post-hoc estimation of these thresholds from a dataset of activations and convert the model to use an explicit `jumprelu` activation function with these learned per-feature thresholds.
