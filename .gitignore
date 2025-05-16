@@ -201,6 +201,9 @@ conversion_test/
 server_data/
 tutorials/old/
 clt_remote_runs/
+*tutorial_activations*/
+
+
 
 # models
 *.pt
