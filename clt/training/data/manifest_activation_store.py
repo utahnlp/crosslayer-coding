@@ -63,6 +63,7 @@ class ChunkRowSampler(Sampler):
         world: int,
         sampling_strategy: str = "sequential",  # Added sampling strategy
         shard_data: bool = True,  # ---> ADDED PARAMETER <---
+        initial_sampler_state: Optional[Dict[str, Any]] = None,  # For restoring state
     ):
         # Handle chunk_sizes as either a dict mapping chunk_id → size or an array of sizes
         if isinstance(chunk_sizes, dict):
@@ -75,11 +76,10 @@ class ChunkRowSampler(Sampler):
         self.rank = rank
         self.world = world
         self.num_chunks = num_chunks
-        self.seed = seed
+        self.seed = seed  # Base seed for the run
         self.epoch = epoch
-        self.shard_data = shard_data  # ---> STORE PARAMETER <---
+        self.shard_data = shard_data
 
-        # Added: Validate and store sampling strategy
         if sampling_strategy not in ["sequential", "random_chunk"]:
             raise ValueError(
                 f"Invalid sampling_strategy: '{sampling_strategy}'. Must be 'sequential' or 'random_chunk'."
@@ -93,59 +93,48 @@ class ChunkRowSampler(Sampler):
         if not (0 <= self.rank < self.world):
             raise ValueError(f"Invalid rank/world: {rank}/{world}")
 
-        # Initialize generator here to set state for the first epoch
-        self._reset_generator()
+        # Initialize RNG using a seed that combines the base seed and current epoch
+        self.rng = np.random.default_rng(self.seed + self.epoch)
 
-    def _reset_generator(self):
-        """Resets the numpy random generator and internal state for a new epoch."""
-        logger.debug(
-            f"Rank {self.rank}: ChunkRowSampler._reset_generator called for epoch {self.epoch} with seed {self.seed}, world_size {self.world}"
-        )  # DEBUG
-        self.rng = np.random.default_rng(self.seed + self.epoch)  # Use instance RNG
+        if initial_sampler_state:
+            self.load_state_dict(initial_sampler_state)
+        else:
+            self._reset_generator_internal_state()  # Renamed from _reset_generator
 
+    def _reset_generator_internal_state(self):
+        """Resets internal state for a new epoch or initial setup, assuming RNG is already set for the current epoch."""
+        logger.debug(f"Rank {self.rank}: ChunkRowSampler._reset_generator_internal_state for epoch {self.epoch}")
         # --- State common to both strategies ---
-        # Create chunk_id → row_ids mapping for each chunk FOR THIS RANK
         self.rows_by_chunk_for_epoch: Dict[int, np.ndarray] = {}
         for chunk_id, chunk_size in self.chunk_sizes.items():
             if chunk_id >= self.num_chunks:
-                continue  # Skip chunks beyond considered range
+                continue
 
-            # Get rows assigned to this rank
             chunk_rows = np.arange(chunk_size, dtype=np.uint32)
-            # ---> MODIFIED LOGIC <---
             if self.shard_data:
                 rows_for_rank = chunk_rows[self.rank :: self.world]
             else:
-                # If not sharding, every rank gets all rows for the chunk.
-                # This is for Tensor Parallelism where each rank needs the full batch.
-                # The rank/world information is still useful for logging or other non-sharding logic.
-                rows_for_rank = chunk_rows[:]  # Get all rows
-            # ---> END MODIFICATION <---
-            # DEBUG: Log row counts before and after sharding for a specific chunk (e.g., chunk 0)
+                rows_for_rank = chunk_rows[:]
+
             if chunk_id == 0:
                 logger.debug(
-                    f"Rank {self.rank}: Chunk 0 total rows: {chunk_size}. Shard_data: {self.shard_data}. Rows after sharding (or not): {len(rows_for_rank)}"
+                    f"Rank {self.rank}: Chunk 0 total rows: {chunk_size}. Shard_data: {self.shard_data}. Rows for this rank: {len(rows_for_rank)}"
                 )
 
-            # Shuffle rows *within* the chunk for this rank for the epoch
-            self.rng.shuffle(rows_for_rank)
+            self.rng.shuffle(rows_for_rank)  # Shuffle rows for this rank using current RNG state
             self.rows_by_chunk_for_epoch[chunk_id] = rows_for_rank
 
-        # Count total rows across all chunks for this rank (used for __len__)
         self.total_rows_this_rank = sum(len(rows) for rows in self.rows_by_chunk_for_epoch.values())
         self.total_batches_this_rank = self.total_rows_this_rank // self.batch
 
         # --- Strategy-specific state reset ---
         if self.sampling_strategy == "sequential":
-            # Shuffle chunk order for sequential iteration
             self.chunk_order = self.rng.permutation(
-                # Only shuffle chunks that actually have rows for this rank
                 [cid for cid, rows in self.rows_by_chunk_for_epoch.items() if len(rows) > 0]
             )
             self.current_chunk_idx_in_order = 0
             self.current_row_offset_in_chunk = 0
         elif self.sampling_strategy == "random_chunk":
-            # Track next starting row offset for each chunk independently
             self.next_row_offset_by_chunk = {chunk_id: 0 for chunk_id in self.rows_by_chunk_for_epoch}
             self.batches_yielded_this_epoch = 0
 
@@ -264,6 +253,61 @@ class ChunkRowSampler(Sampler):
         # Calculation remains the same regardless of strategy
         return self.total_batches_this_rank
 
+    def state_dict(self) -> Dict[str, Any]:
+        """Return the detailed state of the sampler for exact resumption."""
+        state = {
+            "epoch": self.epoch,
+            "seed": self.seed,  # Base seed for the run
+            "sampling_strategy": self.sampling_strategy,
+            "rng_state": self.rng.bit_generator.state,
+            # shard_data is part of store's state, not sampler directly after init
+        }
+        if self.sampling_strategy == "sequential":
+            state["chunk_order"] = self.chunk_order.tolist()  # Convert numpy array to list for JSON
+            state["current_chunk_idx_in_order"] = self.current_chunk_idx_in_order
+            state["current_row_offset_in_chunk"] = self.current_row_offset_in_chunk
+        elif self.sampling_strategy == "random_chunk":
+            state["next_row_offset_by_chunk"] = self.next_row_offset_by_chunk
+            state["batches_yielded_this_epoch"] = self.batches_yielded_this_epoch
+
+        # Save rows_by_chunk_for_epoch as it contains the per-epoch shuffling for this rank
+        # To make it JSON serializable, convert numpy arrays to lists
+        state["rows_by_chunk_for_epoch"] = {cid: rows.tolist() for cid, rows in self.rows_by_chunk_for_epoch.items()}
+        return state
+
+    def load_state_dict(self, state: Dict[str, Any]):
+        """Load the sampler state for exact resumption."""
+        self.epoch = state["epoch"]
+        self.seed = state.get("seed", self.seed)  # Use loaded seed if present, else keep current
+        self.sampling_strategy = state["sampling_strategy"]
+
+        # Restore RNG state
+        # The RNG should be re-initialized with self.seed + self.epoch *before* setting its state
+        self.rng = np.random.default_rng(self.seed + self.epoch)
+        self.rng.bit_generator.state = state["rng_state"]
+
+        # Restore strategy-specific attributes
+        if self.sampling_strategy == "sequential":
+            self.chunk_order = np.array(state["chunk_order"], dtype=np.int32)  # Convert list back to numpy array
+            self.current_chunk_idx_in_order = state["current_chunk_idx_in_order"]
+            self.current_row_offset_in_chunk = state["current_row_offset_in_chunk"]
+        elif self.sampling_strategy == "random_chunk":
+            self.next_row_offset_by_chunk = state["next_row_offset_by_chunk"]
+            self.batches_yielded_this_epoch = state["batches_yielded_this_epoch"]
+
+        # Restore the per-epoch shuffled rows for this rank
+        self.rows_by_chunk_for_epoch = {
+            cid: np.array(rows_list, dtype=np.uint32) for cid, rows_list in state["rows_by_chunk_for_epoch"].items()
+        }
+
+        # Recalculate dependent properties
+        self.total_rows_this_rank = sum(len(rows) for rows in self.rows_by_chunk_for_epoch.values())
+        self.total_batches_this_rank = self.total_rows_this_rank // self.batch
+
+        logger.info(
+            f"Rank {self.rank}: Sampler state loaded for epoch {self.epoch}, strategy {self.sampling_strategy}."
+        )
+
     def set_epoch(self, epoch: int):
         """Sets the epoch for this sampler, resetting the RNG and internal state."""
         self.epoch = epoch
@@ -294,16 +338,16 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         normalization_method: str = "none",  # Added normalization method
         prefetch_batches: int = 1,  # Number of batches to prefetch (1 means no prefetching)
         shard_data: bool = True,  # ---> ADDED PARAMETER <---
+        initial_store_state: Optional[Dict[str, Any]] = None,  # For restoring store + sampler state
     ):
         self.train_batch_size_tokens = train_batch_size_tokens  # From Base
         self.rank = rank
         self.world = world
-        self.seed = seed
-        self.epoch = 0  # Initial epoch
-        # Added: Store sampling strategy
-        self.prefetch_batches = max(1, prefetch_batches)  # Ensure at least 1
+        self.seed = seed  # Base seed for the run
+        self.epoch = 0  # Initial epoch, will be overridden by initial_store_state if provided
+        self.prefetch_batches = max(1, prefetch_batches)
         self.sampling_strategy = sampling_strategy
-        self.shard_data = shard_data  # ---> STORE PARAMETER <---
+        self.shard_data = shard_data
 
         # Device setup
         _device_input = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -449,12 +493,13 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             chunk_sizes=self.chunk_sizes,
             num_chunks=self.num_chunks,
             batch=self.train_batch_size_tokens,
-            seed=self.seed,
-            epoch=self.epoch,
+            seed=self.seed,  # Pass base seed
+            epoch=self.epoch,  # Initial epoch
             rank=self.rank,
             world=self.world,
-            sampling_strategy=self.sampling_strategy,  # Pass the strategy
-            shard_data=self.shard_data,  # ---> PASS PARAMETER <---
+            sampling_strategy=self.sampling_strategy,
+            shard_data=self.shard_data,
+            initial_sampler_state=initial_store_state.get("sampler_state") if initial_store_state else None,
         )
         self.sampler_iter = iter(self.sampler)
 
@@ -911,12 +956,11 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         # We only need to save the epoch to reconstruct the sampler state
         return {
             "store_type": self.__class__.__name__,  # Include specific type
-            "epoch": self.epoch,
-            "seed": self.seed,
+            "epoch": self.epoch,  # Store's current epoch
+            "seed": self.seed,  # Store's base seed
             "sampling_strategy": self.sampling_strategy,
-            "shard_data": self.shard_data,  # ---> ADD TO STATE DICT <---
-            # Sampler state (chunk order, position) is implicitly restored
-            # by re-initializing ChunkRowSampler with the saved epoch and seed.
+            "shard_data": self.shard_data,
+            "sampler_state": self.sampler.state_dict(),  # Include sampler's detailed state
         }
 
     def load_state_dict(self, state_dict: Dict[str, Any]):
@@ -927,35 +971,39 @@ class ManifestActivationStore(BaseActivationStore, ABC):
             )
 
         loaded_epoch = int(state_dict.get("epoch", 0))
+        # If seed is in state_dict (from new version), use it. Else, keep current (old checkpoint)
         loaded_seed = int(state_dict.get("seed", self.seed))
-        # Default to sequential if not found for backward compatibility
         loaded_sampling_strategy = state_dict.get("sampling_strategy", "sequential")
-        loaded_shard_data = state_dict.get("shard_data", True)  # Default to True if missing
+        loaded_shard_data = state_dict.get("shard_data", True)
+        sampler_state_from_checkpoint = state_dict.get("sampler_state")
 
         if loaded_seed != self.seed:
             logger.warning(
-                f"Loading state with different seed ({loaded_seed}) than current ({self.seed}). Sampler sequence will differ."
+                f"Loading state with different base seed ({loaded_seed}) than current ({self.seed}). Sampler sequence will differ unless sampler_state overrides."
             )
-            self.seed = loaded_seed  # Update own seed to match loaded state
+            # We let the sampler handle its own seed from sampler_state if present
+            # self.seed = loaded_seed # Don't update self.seed here, sampler's state_dict has its own seed.
 
         self.epoch = loaded_epoch
-        self.sampling_strategy = loaded_sampling_strategy  # Update strategy
-        self.shard_data = loaded_shard_data  # Update shard_data
+        self.sampling_strategy = loaded_sampling_strategy
+        self.shard_data = loaded_shard_data
 
-        # Re‑create sampler iterator starting from the loaded epoch/state
         logger.info(
-            f"Resetting sampler to epoch {self.epoch} with seed {self.seed}, strategy '{self.sampling_strategy}', shard_data={self.shard_data}."
+            f"ManifestStore: Resetting sampler. Epoch={self.epoch}, Seed in SamplerState={sampler_state_from_checkpoint.get('seed', 'N/A') if sampler_state_from_checkpoint else 'N/A'}, Strategy='{self.sampling_strategy}', ShardData={self.shard_data}."
         )
+
+        # Re-create sampler instance, passing the loaded sampler_state to its __init__
         self.sampler = ChunkRowSampler(
             chunk_sizes=self.chunk_sizes,
             num_chunks=self.num_chunks,
             batch=self.train_batch_size_tokens,
-            seed=self.seed,
-            epoch=self.epoch,
+            seed=loaded_seed,  # Use the seed from the store's state_dict for consistency if sampler_state is old
+            epoch=self.epoch,  # Sampler will internally use its epoch from its state if present
             rank=self.rank,
             world=self.world,
-            sampling_strategy=self.sampling_strategy,  # Use loaded/updated strategy
-            shard_data=self.shard_data,  # ---> PASS LOADED PARAMETER <---
+            sampling_strategy=self.sampling_strategy,
+            shard_data=self.shard_data,
+            initial_sampler_state=sampler_state_from_checkpoint,  # Pass the detailed sampler state
         )
         self.sampler_iter = iter(self.sampler)
 

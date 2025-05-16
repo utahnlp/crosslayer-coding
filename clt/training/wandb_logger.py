@@ -7,6 +7,11 @@ from clt.config import CLTConfig, TrainingConfig
 
 # Define the dummy logger class explicitly for better type checking
 class DummyWandBLogger:
+    _run_id: Optional[str] = None
+
+    def __init__(self, *args, **kwargs):
+        pass
+
     def log_step(self, *args, **kwargs):
         pass
 
@@ -19,17 +24,29 @@ class DummyWandBLogger:
     def finish(self, *args, **kwargs):
         pass
 
+    def get_current_wandb_run_id(self) -> Optional[str]:
+        return None
+
 
 class WandBLogger:
     """Wrapper class for Weights & Biases logging."""
 
-    def __init__(self, training_config: TrainingConfig, clt_config: CLTConfig, log_dir: str):
+    _run_id: Optional[str] = None
+
+    def __init__(
+        self,
+        training_config: TrainingConfig,
+        clt_config: CLTConfig,
+        log_dir: str,
+        resume_wandb_id: Optional[str] = None,
+    ):
         """Initialize the WandB logger.
 
         Args:
             training_config: Training configuration
             clt_config: CLT model configuration
             log_dir: Directory to save logs
+            resume_wandb_id: Optional WandB run ID to resume a previous run.
         """
         self.enabled = training_config.enable_wandb
         self.log_dir = log_dir
@@ -55,21 +72,49 @@ class WandBLogger:
             run_name = f"clt-{time.strftime('%Y%m%d-%H%M%S')}"
 
         # Initialize wandb
-        wandb.init(
-            project=training_config.wandb_project,
-            entity=training_config.wandb_entity,
-            name=run_name,
-            dir=log_dir,
-            tags=training_config.wandb_tags,
-            config={
+        wandb_init_kwargs = {
+            "project": training_config.wandb_project,
+            "entity": training_config.wandb_entity,
+            "name": run_name,
+            "dir": log_dir,
+            "tags": training_config.wandb_tags,
+            "config": {
                 **clt_config.__dict__,
                 **training_config.__dict__,
                 "log_dir": log_dir,
             },
-        )
+        }
+
+        if resume_wandb_id:
+            wandb_init_kwargs["id"] = resume_wandb_id
+            wandb_init_kwargs["resume"] = "must"
+            # If resuming by ID, let WandB use the original run's name or handle naming.
+            # Setting name explicitly here might conflict if the auto-generated name differs.
+            # Let's try removing the name from kwargs if resume_wandb_id is present.
+            if "name" in wandb_init_kwargs:
+                # Important: Only remove 'name' if we are truly trying to resume by ID.
+                # If resume_wandb_id was found, we prioritize it.
+                del wandb_init_kwargs["name"]
+            print(
+                f"Attempting to resume WandB run with ID: {resume_wandb_id} and resume='must'. Name will be sourced from existing run."
+            )
+
+        wandb.init(**wandb_init_kwargs)
 
         if wandb.run is not None:
-            print(f"WandB logging initialized: {wandb.run.name}")
+            print(f"WandB logging initialized: {wandb.run.name} (ID: {wandb.run.id})")
+            self._run_id = wandb.run.id
+        else:
+            if resume_wandb_id:
+                print(
+                    f"Warning: Failed to resume WandB run {resume_wandb_id}. A new run might have been started or init failed."
+                )
+            else:
+                print("Warning: WandB run initialization failed.")
+
+    def get_current_wandb_run_id(self) -> Optional[str]:
+        """Returns the current WandB run ID, if a run is active."""
+        return self._run_id
 
     def log_step(
         self,

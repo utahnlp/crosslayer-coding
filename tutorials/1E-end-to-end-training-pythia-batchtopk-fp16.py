@@ -86,7 +86,7 @@ d_model = 512
 expansion_factor = 32
 clt_num_features = d_model * expansion_factor
 
-batchtopk_k = 200
+batchtopk_k = 590
 
 clt_config = CLTConfig(
     num_features=clt_num_features,
@@ -103,7 +103,7 @@ print(clt_config)
 # --- Activation Generation Configuration ---
 # Same as before - generate activations to train on
 # Use the same directory as the first tutorial, since generation is independent of CLT activation fn
-activation_dir = "./tutorial_activations_local_1M_pythia"  # Point back to original activations
+activation_dir = "./tutorial_activations_local_1M_pythia_fp16"  # Point back to original activations
 dataset_name = "monology/pile-uncopyrighted"
 activation_config = ActivationConfig(
     # Model Source
@@ -131,7 +131,7 @@ activation_config = ActivationConfig(
     output_format="hdf5",
     compression="gzip",
     chunk_token_threshold=8_000,
-    activation_dtype="float32",
+    activation_dtype="float16",
     # Normalization
     compute_norm_stats=True,
     # NNsight args
@@ -170,10 +170,12 @@ training_config = TrainingConfig(
     # Activation source
     activation_source="local_manifest",
     activation_path=expected_activation_path,
-    activation_dtype="float32",
+    activation_dtype="float16",
     # Training batch size
     train_batch_size_tokens=_batch_size,
     sampling_strategy="sequential",
+    precision="fp16",
+    debug_anomaly=True,
     # Normalization
     normalization_method="auto",  # Use pre-calculated stats
     # Loss function coefficients
@@ -196,7 +198,7 @@ training_config = TrainingConfig(
     dead_feature_window=200,
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-hp-sweeps-pythia-70m",
+    wandb_project="clt-fp16-testing",
     wandb_run_name=wdb_run_name,
 )
 print("\nTraining Configuration (BatchTopK):")
