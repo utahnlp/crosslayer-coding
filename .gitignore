@@ -202,7 +202,7 @@ server_data/
 tutorials/old/
 clt_remote_runs/
 *tutorial_activations*/
-
+example_clt_config_gpt2_local.json
 
 
 # models

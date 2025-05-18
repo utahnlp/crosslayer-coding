@@ -7,6 +7,8 @@ import time  # Import time
 import datetime  # Import datetime
 
 from clt.models.clt import CrossLayerTranscoder
+from clt.config import TrainingConfig  # Add TrainingConfig import
+from clt.training.diagnostics import compute_sparsity_diagnostics  # Import for use within evaluator
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -34,6 +36,7 @@ class CLTEvaluator:
         start_time: Optional[float] = None,
         mean_tg: Optional[Dict[int, torch.Tensor]] = None,
         std_tg: Optional[Dict[int, torch.Tensor]] = None,
+        training_config: Optional[TrainingConfig] = None,  # Add training_config
     ):
         """Initialize the evaluator.
 
@@ -43,13 +46,14 @@ class CLTEvaluator:
             start_time: The initial time.time() from the trainer for elapsed time logging.
             mean_tg: Optional dictionary of per-layer target means for de-normalising outputs.
             std_tg: Optional dictionary of per-layer target stds for de-normalising outputs.
+            training_config: Optional TrainingConfig for diagnostics.
         """
         self.model = model
         self.device = device
-        self.start_time = start_time or time.time()  # Store start time
-        # Store normalisation stats if provided
+        self.start_time = start_time or time.time()
         self.mean_tg = mean_tg or {}
         self.std_tg = std_tg or {}
+        self.training_config = training_config  # Store training_config
 
     @staticmethod
     def _log_density(density: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
@@ -85,18 +89,12 @@ class CLTEvaluator:
         inputs: Dict[int, torch.Tensor],
         targets: Dict[int, torch.Tensor],
         dead_neuron_mask: Optional[torch.Tensor] = None,
+        feature_activations_batch: Optional[Dict[int, torch.Tensor]] = None,
+        autocast_dtype: Optional[torch.dtype] = None,
+        use_cuda_amp: bool = False,
     ) -> Dict[str, Any]:
         """Compute all evaluation metrics for the given batch with structured keys.
-
-        Args:
-            inputs: Dictionary mapping layer indices to input activations.
-            targets: Dictionary mapping layer indices to target activations.
-            dead_neuron_mask: Optional mask indicating dead neurons based on trainer's window.
-
-        Returns:
-            Dictionary containing computed metrics structured for WandB logging.
-            Metrics are organized into 'reconstruction', 'sparsity', 'dead_features',
-            'layerwise'.
+        Moved preactivation std_dev and sparsity diagnostics computation here.
         """
         mem_before_eval = 0
         if torch.cuda.is_available() and self.device.type == "cuda":
@@ -104,68 +102,84 @@ class CLTEvaluator:
             elapsed_str = _format_elapsed_time(time.time() - self.start_time)
             logger.debug(f"Eval - Start [{elapsed_str}]. Mem: {mem_before_eval:.2f} MB")
 
-        # Ensure data is on the correct device
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         targets = {k: v.to(self.device) for k, v in targets.items()}
 
-        # Get model outputs (reconstructions and feature activations)
-        reconstructions = self.model(inputs)
-        feature_activations = self.model.get_feature_activations(inputs)
+        if feature_activations_batch is None:
+            with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=use_cuda_amp):
+                reconstructions = self.model(inputs)
+                feature_activations = self.model.get_feature_activations(inputs)
+        else:
+            feature_activations = {k: v.to(self.device) for k, v in feature_activations_batch.items()}
+            with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=use_cuda_amp):
+                reconstructions = self.model(inputs)
 
-        # --- Compute Metrics ---
         sparsity_metrics = self._compute_sparsity(feature_activations)
         reconstruction_metrics = self._compute_reconstruction_metrics(targets, reconstructions)
         density_metrics = self._compute_feature_density(feature_activations)
-        # Compute layerwise dead features based on the provided mask
         dead_neuron_metrics = self._compute_dead_neuron_metrics(dead_neuron_mask)
 
-        # --- Calculate Aggregate Metrics & Histograms ---
+        layerwise_preact_std_dev_metrics: Dict[str, Any] = {"layerwise/preactivation_std_dev": {}}
+        try:
+            with torch.autocast(device_type=self.device.type, dtype=autocast_dtype, enabled=use_cuda_amp):
+                preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
+            if preactivations_eval_dict:
+                for layer_idx, preact_tensor in preactivations_eval_dict.items():
+                    if preact_tensor.numel() > 0:
+                        std_dev_val = preact_tensor.std().item()
+                        layerwise_preact_std_dev_metrics["layerwise/preactivation_std_dev"][
+                            f"layer_{layer_idx}"
+                        ] = std_dev_val
+                    else:
+                        layerwise_preact_std_dev_metrics["layerwise/preactivation_std_dev"][f"layer_{layer_idx}"] = (
+                            float("nan")
+                        )
+        except Exception as e:
+            logger.warning(f"Could not compute preactivation_std_dev: {e}", exc_info=True)
+
+        sparsity_diag_metrics_calculated: Dict[str, Any] = {}
+        if self.training_config and self.training_config.compute_sparsity_diagnostics:
+            try:
+                sparsity_diag_metrics_calculated = compute_sparsity_diagnostics(
+                    model=self.model,
+                    training_config=self.training_config,
+                    feature_activations=feature_activations,
+                )
+            except Exception as e:
+                logger.warning(f"Could not compute sparsity_diagnostics: {e}", exc_info=True)
+
         log_feature_density_layerwise = density_metrics.get("layerwise/log_feature_density", {})
         consistent_activation_heuristic_layerwise = density_metrics.get("layerwise/consistent_activation_heuristic", {})
-
-        # Calculate aggregate mean values
         feature_density_mean = self._calculate_aggregate_metric(log_feature_density_layerwise)
         consistent_activation_heuristic_mean = self._calculate_aggregate_metric(
             consistent_activation_heuristic_layerwise
         )
-
-        # Calculate aggregate histogram data (flattened lists)
         log_feature_density_agg_hist_data = self._calculate_aggregate_histogram_data(log_feature_density_layerwise)
         consistent_activation_heuristic_agg_hist_data = self._calculate_aggregate_histogram_data(
             consistent_activation_heuristic_layerwise
         )
-
-        # Add aggregate metrics to sparsity section
         if feature_density_mean is not None:
             sparsity_metrics["sparsity/feature_density_mean"] = feature_density_mean
         if consistent_activation_heuristic_mean is not None:
             sparsity_metrics["sparsity/consistent_activation_heuristic_mean"] = consistent_activation_heuristic_mean
-        # Add aggregate histogram data
         if log_feature_density_agg_hist_data:
             sparsity_metrics["sparsity/log_feature_density_agg_hist"] = log_feature_density_agg_hist_data
         if consistent_activation_heuristic_agg_hist_data:
             sparsity_metrics["sparsity/consistent_activation_heuristic_agg_hist"] = (
                 consistent_activation_heuristic_agg_hist_data
             )
-
-        # Calculate total dead features from layerwise eval data
         total_dead_eval = sum(dead_neuron_metrics.get("layerwise/dead_features", {}).values())
         dead_neuron_metrics["dead_features/total_eval"] = total_dead_eval
 
-        # --- Combine results into structured dictionary ---
         all_metrics = {
             **reconstruction_metrics,
             **sparsity_metrics,
-            **density_metrics,  # Contains the layerwise density/heuristic data
-            **dead_neuron_metrics,  # Contains layerwise dead features and total eval dead features
+            **density_metrics,
+            **dead_neuron_metrics,
+            **layerwise_preact_std_dev_metrics,
+            **sparsity_diag_metrics_calculated,
         }
-        # Explicitly delete intermediate tensors to potentially free memory sooner
-        del reconstructions
-        del feature_activations
-        # Optionally empty cache, though it has a performance cost
-        # if torch.cuda.is_available():
-        #     torch.cuda.empty_cache()
-
+        del reconstructions, feature_activations
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_after_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
             elapsed_str = _format_elapsed_time(time.time() - self.start_time)

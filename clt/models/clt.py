@@ -696,6 +696,21 @@ class CrossLayerTranscoder(BaseTranscoder):
     def get_decoder_norms(self) -> torch.Tensor:
         """Get L2 norms of all decoder matrices for each feature (gathered across ranks).
 
+        This method calculates the L2 norm for each feature's corresponding decoder weight vector.
+        In a tensor-parallel setup (specifically, row-parallel sharding for decoders),
+        each full decoder weight vector for a feature is distributed across ranks such that
+        the rows of the decoder matrix (output dimension `d_model`) are sharded, while the
+        columns (input dimension `num_features`) are contiguous on a single rank for a
+        slice of features.
+
+        Consequently, the complete set of weights for a single feature (across all its `d_model`
+        output dimensions) resides on one specific rank. The `RowParallelLinear` layer's
+        weight is of shape `[d_model, local_num_features_padded]`.
+        To get the global norm for a feature, we calculate norms on local shards. Since each
+        feature's full set of weights is on exactly one rank, a `ReduceOp.SUM` across ranks
+        correctly reconstructs the global norm. Averaging would incorrectly scale down the
+        norms by `world_size`.
+
         Returns:
             Tensor of shape [num_layers, num_features] containing decoder norms
         """
@@ -707,8 +722,19 @@ class CrossLayerTranscoder(BaseTranscoder):
             self.config.num_layers, self.config.num_features, device=self.device, dtype=self.dtype  # Match model dtype
         )
 
-        # Use self.world_size which is correctly set for non-distributed case
-        # rank = self.rank # Removed unused variable
+        # Assertion to clarify distributed context expectations
+        if self.process_group is not None and dist.is_initialized():
+            assert self.world_size > 1, "Process group is initialized, world_size should be > 1 for distributed norms."
+        elif self.process_group is None:
+            assert self.world_size == 1, "Process group is None, world_size should be 1 for non-distributed norms."
+        else:
+            # This case (process_group not None but dist not initialized) should ideally not occur.
+            # Or, dist might be initialized but this model instance isn't part of that group.
+            # For safety, assume non-distributed if dist isn't initialized for this model's group.
+            if not dist.is_initialized():  # Check global dist status if process_group is ambiguous
+                assert (
+                    self.world_size == 1
+                ), "Process group is set but dist not initialized globally, expecting world_size == 1."
 
         for src_layer in range(self.config.num_layers):
             # Accumulate squared norms locally first, then reduce
@@ -776,6 +802,7 @@ class CrossLayerTranscoder(BaseTranscoder):
             # drastically weaken the sparsity penalty.
             if self.process_group is not None and dist.is_initialized():
                 dist.all_reduce(local_norms_sq_accum, op=dist.ReduceOp.SUM, group=self.process_group)
+            # Else, if not distributed, local_norms_sq_accum already holds the full sum.
 
             # Now take the square root and store in the final tensor (cast back to model dtype)
             full_decoder_norms[src_layer] = torch.sqrt(local_norms_sq_accum).to(self.dtype)
