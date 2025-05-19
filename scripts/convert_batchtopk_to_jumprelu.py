@@ -4,7 +4,8 @@ import json
 import argparse
 import sys
 import logging
-from typing import Dict
+from typing import Dict, List, Optional, Union
+import math
 
 # Ensure the project root is in the Python path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,13 +15,15 @@ if project_root not in sys.path:
 try:
     from clt.config import CLTConfig
     from clt.models.clt import CrossLayerTranscoder
-    from clt.training.data import BaseActivationStore  # For type hinting
-    from clt.training.local_activation_store import LocalActivationStore  # Default store for this script
+    from clt.training.data.local_activation_store import LocalActivationStore  # Default store for this script
+    from clt.training.evaluator import CLTEvaluator  # Added for NMSE check
+    from safetensors.torch import load_file as load_safetensors_file  # Added for safetensors support
 
     # Add other store types if needed, e.g., RemoteActivationStore
 except ImportError as e:
     print(f"ImportError: {e}")
     print("Please ensure the 'clt' library is installed or the clt directory is in your PYTHONPATH.")
+    print("If the error is related to 'safetensors', please install it: pip install safetensors")
     raise
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -42,15 +45,17 @@ def main(args):
         config_dict_batchtopk = json.load(f)
 
     # Ensure the loaded config is indeed for BatchTopK for loading the checkpoint
-    if config_dict_batchtopk.get("activation_fn") != "batchtopk":
+    config_activation_fn = config_dict_batchtopk.get("activation_fn")
+    if config_activation_fn not in ["batchtopk", "topk"]:
         logger.warning(
-            f"Warning: Config at {args.config_path} has activation_fn='{config_dict_batchtopk.get('activation_fn')}'. "
-            f"Proceeding as if it's a BatchTopK config for loading the checkpoint, "
+            f"Warning: Config at {args.config_path} has activation_fn='{config_activation_fn}'. "
+            f"This script is designed for 'batchtopk' or 'topk' models. "
+            f"Proceeding as if it's a compatible config for loading the checkpoint, "
             f"but ensure this is intended and the checkpoint matches."
         )
         # Override to ensure BatchTopK for initial loading if needed, though ideally cfg.json matches.
-        # config_dict_batchtopk['activation_fn'] = 'batchtopk'
-        # It is better if the user provides the correct config file that was used to save the batchtopk checkpoint.
+        # config_dict_batchtopk['activation_fn'] = 'batchtopk' # Or 'topk'
+        # It is better if the user provides the correct config file that was used to save the checkpoint.
 
     try:
         clt_config_batchtopk = CLTConfig(**config_dict_batchtopk)
@@ -71,12 +76,12 @@ def main(args):
 
     logger.info(f"Loading BatchTopK model state from: {args.batchtopk_checkpoint_path}")
     try:
-        # Load checkpoint, handling potential sharded format if it\'s a directory
+        # Load checkpoint, handling potential sharded format if it's a directory
         if os.path.isdir(args.batchtopk_checkpoint_path):
-            from torch.distributed.checkpoint import load_state_dict as dist_load_state_dict
+            from torch.distributed.checkpoint.state_dict_loader import load_state_dict as dist_load_state_dict
             from torch.distributed.checkpoint.filesystem import FileSystemReader
 
-            logger.info(f"Checkpoint path is a directory, attempting distributed load into a single model.")
+            logger.info("Checkpoint path is a directory, attempting distributed load into a single model.")
             state_dict_to_populate = model.state_dict()  # Get state_dict from the instantiated model
             dist_load_state_dict(
                 state_dict=state_dict_to_populate,
@@ -86,7 +91,13 @@ def main(args):
             model.load_state_dict(state_dict_to_populate)
 
         else:  # Standard single-file checkpoint
-            model.load_state_dict(torch.load(args.batchtopk_checkpoint_path, map_location=device))
+            if args.batchtopk_checkpoint_path.endswith(".safetensors"):
+                logger.info(f"Loading BatchTopK model state from safetensors file: {args.batchtopk_checkpoint_path}")
+                state_dict = load_safetensors_file(args.batchtopk_checkpoint_path, device=device.type)
+                model.load_state_dict(state_dict)
+            else:
+                logger.info(f"Loading BatchTopK model state from .pt file: {args.batchtopk_checkpoint_path}")
+                model.load_state_dict(torch.load(args.batchtopk_checkpoint_path, map_location=device))
 
         model.eval()
         logger.info("BatchTopK model loaded and set to eval mode.")
@@ -94,8 +105,8 @@ def main(args):
         logger.error(f"Error loading BatchTopK model state: {e}")
         return
 
-    # 3. Initialize ActivationStore
-    logger.info(f"Initializing LocalActivationStore from: {args.activation_data_path}")
+    # 3. Initialize ActivationStore for theta estimation
+    logger.info(f"Initializing LocalActivationStore from: {args.activation_data_path} for theta estimation")
     if not os.path.exists(args.activation_data_path):
         logger.error(f"Activation data path not found: {args.activation_data_path}")
         return
@@ -103,7 +114,7 @@ def main(args):
     try:
         # For simplicity, this script defaults to LocalActivationStore.
         # Users can modify this to use other store types if needed.
-        activation_store = LocalActivationStore(
+        activation_store_theta = LocalActivationStore(
             dataset_path=args.activation_data_path,
             train_batch_size_tokens=args.estimation_batch_size_tokens,  # Use a batch size for estimation
             device=device,
@@ -114,9 +125,9 @@ def main(args):
             sampling_strategy="sequential",  # Sequential is fine for estimation
             normalization_method="auto",  # Or "none" if data is not normalized
         )
-        logger.info("Activation store initialized.")
+        logger.info("Activation store for theta estimation initialized.")
     except Exception as e:
-        logger.error(f"Error initializing activation store: {e}")
+        logger.error(f"Error initializing activation store for theta estimation: {e}")
         return
 
     # 4. Estimate Theta and Convert Model
@@ -124,10 +135,12 @@ def main(args):
         f"Starting theta estimation using {args.num_batches_for_theta_estimation} batches "
         f"with scale_factor={args.scale_factor} and default_theta_value={args.default_theta_value}."
     )
+    # Store original K before it gets wiped by model conversion
+    # original_batchtopk_k = clt_config_batchtopk.batchtopk_k # Will be determined later in scale search section
+
     try:
-        data_iterator = iter(activation_store)
         estimated_thetas = model.estimate_theta_posthoc(
-            data_iter=data_iterator,
+            data_iter=activation_store_theta,
             num_batches=args.num_batches_for_theta_estimation,
             default_theta_value=args.default_theta_value,
             scale_factor=args.scale_factor,
@@ -139,14 +152,10 @@ def main(args):
         logger.info(f"Model config after conversion: {model.config}")
     except Exception as e:
         logger.error(f"Error during estimate_theta_posthoc: {e}")
-        if hasattr(e, "__traceback__"):
-            import traceback
-
-            traceback.print_tb(e.__traceback__)
         return
     finally:
-        if hasattr(activation_store, "close") and callable(getattr(activation_store, "close")):
-            activation_store.close()
+        if hasattr(activation_store_theta, "close") and callable(getattr(activation_store_theta, "close")):
+            activation_store_theta.close()
 
     # 5. Save the Converted JumpReLU Model and its Config
     logger.info(f"Saving converted JumpReLU model state to: {args.output_model_path}")
@@ -159,104 +168,373 @@ def main(args):
         # model.config is updated inplace by convert_to_jumprelu_inplace (called by estimate_theta_posthoc)
         json.dump(model.config.__dict__, f, indent=4)
 
-    # 6. Perform a quick L0 check on the converted model
-    logger.info("Performing L0 check on the converted JumpReLU model...")
-    # Re-initialize data_iterator for the L0 check if it was exhausted or if you want a fresh sample
-    # For this script, we will try to get one batch. If store is exhausted, dummy_l0 might be based on zeros.
-    sample_batch_for_l0_inputs: Dict[int, torch.Tensor] = {}
+    # 6. Perform a quick L0 and NMSE check on the converted model
+    logger.info("Performing L0 and NMSE check on the converted JumpReLU model...")
+
+    all_sample_inputs_for_l0: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
+    all_sample_targets_for_nmse: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
+    # total_tokens_collected_per_layer: Dict[int, int] = {i: 0 for i in range(model.config.num_layers)} # No longer needed with direct cat
+
+    l0_check_fetch_batch_size = (
+        args.l0_check_batch_size_tokens
+        if hasattr(args, "l0_check_batch_size_tokens") and args.l0_check_batch_size_tokens is not None
+        else args.estimation_batch_size_tokens
+    )
+
+    logger.info(
+        f"Collecting data for L0/NMSE check using {args.num_batches_for_l0_check} batches with fetch batch size {l0_check_fetch_batch_size} tokens."
+    )
+
+    mean_tg_for_eval = None  # To store normalization stats for Evaluator
+    std_tg_for_eval = None
+
     try:
-        # Need to re-open the store or ensure it can be iterated again if it was fully consumed.
-        # For simplicity, re-create the iterator. If the store was exhausted, this might still yield nothing.
-        # A more robust solution might involve a resettable store or loading a specific small dataset for this check.
         activation_store_for_l0_check = LocalActivationStore(
             dataset_path=args.activation_data_path,
-            train_batch_size_tokens=args.estimation_batch_size_tokens,
+            train_batch_size_tokens=l0_check_fetch_batch_size,
             device=device,
             dtype=args.activation_dtype or clt_config_batchtopk.expected_input_dtype or "float32",
             rank=0,
             world=1,
-            seed=args.seed + 1,  # Use a different seed or ensure sequential to get different data if possible
+            seed=args.seed + 1,
             sampling_strategy="sequential",
             normalization_method="auto",
         )
         data_iterator_for_l0_check = iter(activation_store_for_l0_check)
-        sample_inputs_l0, _ = next(data_iterator_for_l0_check)
-        sample_batch_for_l0_inputs = sample_inputs_l0
+
+        # Retrieve mean_tg and std_tg if store has them (after iter is created, stats should be available if auto)
+        if hasattr(activation_store_for_l0_check, "mean_tg") and hasattr(activation_store_for_l0_check, "std_tg"):
+            mean_tg_for_eval = activation_store_for_l0_check.mean_tg
+            std_tg_for_eval = activation_store_for_l0_check.std_tg
+            if mean_tg_for_eval and std_tg_for_eval:
+                logger.info("Retrieved mean_tg and std_tg from L0 check activation store for NMSE de-normalization.")
+            else:
+                logger.info(
+                    "mean_tg or std_tg not available from L0 check store. NMSE will be on potentially normalized values."
+                )
+
+        for batch_idx in range(args.num_batches_for_l0_check):
+            try:
+                sample_inputs_batch, sample_targets_batch = next(data_iterator_for_l0_check)
+                for layer_idx in sample_inputs_batch.keys():  # Iterate over layers present in the input batch
+                    if layer_idx in all_sample_inputs_for_l0:
+                        input_tensor_data = sample_inputs_batch[layer_idx]
+                        if input_tensor_data.dim() == 3:
+                            num_tokens = input_tensor_data.shape[0] * input_tensor_data.shape[1]
+                            all_sample_inputs_for_l0[layer_idx].append(
+                                input_tensor_data.reshape(num_tokens, model.config.d_model)
+                            )
+                        elif input_tensor_data.dim() == 2:
+                            all_sample_inputs_for_l0[layer_idx].append(input_tensor_data)
+
+                    if (
+                        layer_idx in sample_targets_batch and layer_idx in all_sample_targets_for_nmse
+                    ):  # Check if target exists for the layer
+                        target_tensor_data = sample_targets_batch[layer_idx]
+                        if target_tensor_data.dim() == 3:
+                            num_tokens = target_tensor_data.shape[0] * target_tensor_data.shape[1]
+                            all_sample_targets_for_nmse[layer_idx].append(
+                                target_tensor_data.reshape(num_tokens, model.config.d_model)
+                            )
+                        elif target_tensor_data.dim() == 2:
+                            all_sample_targets_for_nmse[layer_idx].append(target_tensor_data)
+
+            except StopIteration:
+                logger.warning(
+                    f"Activation store exhausted after {batch_idx + 1} batches during L0/NMSE check data collection. Proceeding with collected data."
+                )
+                break
+
         if hasattr(activation_store_for_l0_check, "close") and callable(
             getattr(activation_store_for_l0_check, "close")
         ):
             activation_store_for_l0_check.close()
-    except StopIteration:
-        logger.warning("Activation store exhausted. L0 check will use zero input.")
+
     except Exception as e_l0_fetch:
-        logger.warning(f"Error fetching batch for L0 check: {e_l0_fetch}. L0 check will use zero input.")
+        logger.warning(
+            f"Error initializing or fetching batches for L0/NMSE check: {e_l0_fetch}. Check might use zero or incomplete input."
+        )
 
-    model_for_l0_check = model  # Always use the converted model, no more overriding k for L0 check here
+    final_sample_batch_for_l0_inputs: Dict[int, torch.Tensor] = {}
+    for layer_idx, tensor_list in all_sample_inputs_for_l0.items():
+        if tensor_list:
+            final_sample_batch_for_l0_inputs[layer_idx] = torch.cat(tensor_list, dim=0)
+            logger.info(
+                f"Layer {layer_idx}: Collected {final_sample_batch_for_l0_inputs[layer_idx].shape[0]} total input tokens for L0/NMSE check."
+            )
+        else:
+            logger.warning(f"Layer {layer_idx}: No input tokens collected for L0/NMSE check.")
+            final_sample_batch_for_l0_inputs[layer_idx] = torch.empty(
+                (0, model.config.d_model), device=device, dtype=model.dtype
+            )
 
-    avg_empirical_l0, expected_l0 = run_quick_l0_checks_script(
-        model_for_l0_check, sample_batch_for_l0_inputs, args.num_tokens_for_l0_check_script
+    final_sample_targets_for_nmse_check: Dict[int, torch.Tensor] = {}
+    for layer_idx, tensor_list in all_sample_targets_for_nmse.items():
+        if tensor_list:
+            final_sample_targets_for_nmse_check[layer_idx] = torch.cat(tensor_list, dim=0)
+            logger.info(
+                f"Layer {layer_idx}: Collected {final_sample_targets_for_nmse_check[layer_idx].shape[0]} total target tokens for NMSE check."
+            )
+        else:
+            logger.warning(f"Layer {layer_idx}: No target tokens collected for NMSE check.")
+            final_sample_targets_for_nmse_check[layer_idx] = torch.empty(
+                (0, model.config.d_model), device=device, dtype=model.dtype
+            )
+
+    model_for_l0_check = model
+
+    # ------------------------------------------------------------------
+    # Optional binary search over scale_factor to match empirical L0
+    # ------------------------------------------------------------------
+    if args.scale_search_min is not None and args.scale_search_max is not None:
+        if args.scale_search_min <= 0 or args.scale_search_max <= 0:
+            logger.error("scale_search_min and scale_search_max must be > 0. Skipping scale search.")
+        elif args.scale_search_max < args.scale_search_min:
+            logger.error("scale_search_max must be >= scale_search_min. Skipping scale search.")
+        else:
+            logger.info(
+                f"Starting binary search for scale_factor in range [{args.scale_search_min}, {args.scale_search_max}] with 0.1 precision."
+            )
+
+            target_l0_k: Optional[Union[int, float]] = None
+            original_model_config = (
+                clt_config_batchtopk  # This is the config *before* conversion by estimate_theta_posthoc
+            )
+
+            if original_model_config.activation_fn == "batchtopk":
+                if hasattr(original_model_config, "batchtopk_k") and original_model_config.batchtopk_k is not None:
+                    target_l0_k = float(original_model_config.batchtopk_k)
+                    logger.info(f"Targeting L0 sum based on original batchtopk_k: {target_l0_k}")
+                else:
+                    logger.error(
+                        "batchtopk_k not found in the original BatchTopK config. Cannot perform K-targeted scale search."
+                    )
+            elif original_model_config.activation_fn == "topk":
+                if hasattr(original_model_config, "topk_k") and original_model_config.topk_k is not None:
+                    k_param = float(original_model_config.topk_k)
+                    # num_features and num_layers should be available in the config object
+                    num_features = original_model_config.num_features
+                    num_layers = original_model_config.num_layers
+
+                    expected_l0_per_layer: float
+                    if 0 < k_param < 1:  # fraction
+                        expected_l0_per_layer = math.ceil(k_param * num_features)
+                    elif k_param >= 1:  # count
+                        expected_l0_per_layer = float(int(k_param))
+                    else:  # k_param <= 0
+                        logger.error(f"Invalid topk_k value ({k_param}). Must be positive. Skipping scale search.")
+                        # target_l0_k remains None
+
+                    if (
+                        expected_l0_per_layer is not None and num_layers is not None
+                    ):  # Check if expected_l0_per_layer was set
+                        target_l0_k = expected_l0_per_layer * num_layers
+                        logger.info(
+                            f"Targeting L0 sum based on original topk_k ({k_param}), num_features ({num_features}), num_layers ({num_layers}): {target_l0_k}"
+                        )
+                else:
+                    logger.error(
+                        "topk_k not found in the original TopK config. Cannot perform K-targeted scale search."
+                    )
+            else:
+                logger.warning(
+                    f"Scale search for L0 matching is not configured for original activation_fn '{original_model_config.activation_fn}'. Skipping search."
+                )
+
+            if target_l0_k is None:
+                logger.error(
+                    "Target L0 (k) not found or invalid in the original config. Cannot perform K-targeted scale search. Skipping search."
+                )
+            elif not isinstance(target_l0_k, (int, float)) or target_l0_k <= 0:  # Redundant check if None is handled
+                logger.error(f"Invalid target_l0_k value ({target_l0_k}). Must be a positive number. Skipping search.")
+            else:
+                base_theta = torch.exp(model_for_l0_check.log_threshold.detach().clone())
+                low = args.scale_search_min
+                high = args.scale_search_max
+                best_scale = low
+                best_diff = float("inf")
+
+                iteration = 0
+                while high - low > 0.099:  # 0.1 precision (allowing for fp error)
+                    iteration += 1
+                    mid = round((low + high) / 2.0, 1)
+
+                    if mid == low or mid == high and high - low < 0.15:
+                        for test_scale in {low, high}:
+                            scaled_theta_final_check = base_theta * test_scale
+                            model_for_l0_check.log_threshold.data.copy_(torch.log(scaled_theta_final_check))
+                            empirical_l0s_fc = run_quick_l0_checks_script(
+                                model_for_l0_check,
+                                final_sample_batch_for_l0_inputs,
+                                args.num_tokens_for_l0_check_script,
+                            )
+                            empirical_total_fc = sum(
+                                v for v in empirical_l0s_fc.values() if not (isinstance(v, float) and math.isnan(v))
+                            )
+                            diff_fc = abs(empirical_total_fc - target_l0_k)
+                            if diff_fc < best_diff:
+                                best_diff = diff_fc
+                                best_scale = test_scale
+                        break
+
+                    scaled_theta = base_theta * mid
+                    model_for_l0_check.log_threshold.data.copy_(torch.log(scaled_theta.clamp_min(1e-9)))
+
+                    empirical_l0s = run_quick_l0_checks_script(
+                        model_for_l0_check,
+                        final_sample_batch_for_l0_inputs,
+                        args.num_tokens_for_l0_check_script,
+                    )
+                    empirical_total = sum(
+                        v for v in empirical_l0s.values() if not (isinstance(v, float) and math.isnan(v))
+                    )
+                    diff = abs(empirical_total - target_l0_k)
+
+                    if diff < best_diff:
+                        logger.info(
+                            f"[Scale Search] Iter {iteration}: New best scale {mid:.1f} (EmpL0Total={empirical_total:.2f}, |diff|={diff:.2f}) replaces old best {best_scale:.1f} (diff {best_diff:.2f})"
+                        )
+                        best_diff = diff
+                        best_scale = mid
+                    elif diff == best_diff and mid < best_scale:
+                        logger.info(
+                            f"[Scale Search] Iter {iteration}: Tied diff {diff:.2f}, preferring new smaller scale {mid:.1f} over old {best_scale:.1f}"
+                        )
+                        best_scale = mid
+
+                    if empirical_total > target_l0_k:
+                        low = mid
+                    else:
+                        high = mid
+
+                logger.info(
+                    f"Scale search finished. Best scale factor found: {best_scale:.1f} (|diff|={best_diff:.2f} against TargetL0_K={target_l0_k:.2f}). Applying this scale."
+                )
+                final_theta = base_theta * best_scale
+                model_for_l0_check.log_threshold.data.copy_(
+                    torch.log(final_theta.clamp_min(1e-9))
+                )  # clamp to avoid log(0)
+                args.scale_factor = best_scale  # For logging consistency later
+    # ------------------------------------------------------------------
+
+    empirical_l0s_per_layer = run_quick_l0_checks_script(
+        model_for_l0_check, final_sample_batch_for_l0_inputs, args.num_tokens_for_l0_check_script
     )
-    logger.info(
-        f"  Average Empirical L0 (Layer 0, {args.num_tokens_for_l0_check_script} random tokens): {avg_empirical_l0:.2f}"
+    logger.info(f"Empirical L0 per layer (out of {args.num_tokens_for_l0_check_script} sampled tokens):")
+    total_empirical_l0 = 0.0
+    for l_idx, l0_val in empirical_l0s_per_layer.items():
+        logger.info(f"  Layer {l_idx}: {l0_val:.2f}")
+        if not (isinstance(l0_val, float) and math.isnan(l0_val)):
+            total_empirical_l0 += l0_val
+    logger.info(f"Total Empirical L0 across all layers: {total_empirical_l0:.2f}")
+
+    # Compute and log NMSE
+    logger.info("Computing NMSE...")
+    evaluator = CLTEvaluator(model=model_for_l0_check, device=device, mean_tg=mean_tg_for_eval, std_tg=std_tg_for_eval)
+
+    # Ensure inputs and targets for NMSE have corresponding layers and non-empty tensors before calling
+    valid_layers_for_nmse = set(final_sample_batch_for_l0_inputs.keys()) & set(
+        final_sample_targets_for_nmse_check.keys()
     )
-    logger.info(f"  Expected L0 (N(0,1) assumption, all layers): {expected_l0:.2f}")
+    inputs_for_nmse_metric = {
+        k: v for k, v in final_sample_batch_for_l0_inputs.items() if k in valid_layers_for_nmse and v.numel() > 0
+    }
+    targets_for_nmse_metric = {
+        k: v for k, v in final_sample_targets_for_nmse_check.items() if k in valid_layers_for_nmse and v.numel() > 0
+    }
+
+    if (
+        not inputs_for_nmse_metric
+        or not targets_for_nmse_metric
+        or not any(v.numel() > 0 for v in inputs_for_nmse_metric.values())
+        or not any(v.numel() > 0 for v in targets_for_nmse_metric.values())
+    ):
+        logger.warning(
+            "Insufficient data for NMSE calculation after filtering (empty inputs or targets for common layers). Skipping NMSE."
+        )
+    else:
+        # Get reconstructions from the model using the collected inputs
+        with torch.no_grad():  # Ensure no gradients are computed during this forward pass
+            reconstructions_for_nmse = model_for_l0_check(inputs_for_nmse_metric)
+
+        reconstruction_metrics = evaluator._compute_reconstruction_metrics(
+            targets=targets_for_nmse_metric, reconstructions=reconstructions_for_nmse
+        )
+        nmse_value = reconstruction_metrics.get("reconstruction/normalized_mean_reconstruction_error", float("nan"))
+        explained_variance = reconstruction_metrics.get("reconstruction/explained_variance", float("nan"))
+        logger.info(f"Normalized Mean Squared Error (NMSE) on collected data: {nmse_value:.4f}")
+        logger.info(f"Explained Variance (EV) on collected data: {explained_variance:.4f}")
 
     logger.info("Conversion script finished successfully.")
 
 
 def run_quick_l0_checks_script(
     model: CrossLayerTranscoder, sample_batch_inputs: Dict[int, torch.Tensor], num_tokens_to_check: int
-) -> tuple[float, float]:
-    """Helper function for L0 checks within the script."""
+) -> Dict[int, float]:
+    """Helper function for L0 checks within the script.
+    Returns a dictionary of empirical L0 per layer."""
     model.eval()  # Ensure model is in eval mode
-    avg_empirical_l0_layer0 = float("nan")
-    std_normal_dist = torch.distributions.normal.Normal(0, 1)  # Create Normal distribution object
 
-    if not sample_batch_inputs or 0 not in sample_batch_inputs or sample_batch_inputs[0].numel() == 0:
-        logger.warning(
-            "run_quick_l0_checks_script received empty or invalid sample_batch_inputs for layer 0. Empirical L0 will be NaN."
-        )
-        # Keep avg_empirical_l0_layer0 as NaN
-    else:
-        layer0_inputs_all_tokens = sample_batch_inputs[0].to(device=model.device, dtype=model.dtype)
+    empirical_l0s_per_layer: Dict[int, float] = {}
+    # std_normal_dist = torch.distributions.normal.Normal(0, 1) # Removed: No longer needed for expected L0
 
-        if layer0_inputs_all_tokens.dim() == 3:  # B, S, D
-            num_tokens_in_batch = layer0_inputs_all_tokens.shape[0] * layer0_inputs_all_tokens.shape[1]
-            layer0_inputs_flat = layer0_inputs_all_tokens.reshape(num_tokens_in_batch, model.config.d_model)
-        elif layer0_inputs_all_tokens.dim() == 2:  # Already [num_tokens, d_model]
-            num_tokens_in_batch = layer0_inputs_all_tokens.shape[0]
-            layer0_inputs_flat = layer0_inputs_all_tokens
-        else:
+    for layer_idx in range(model.config.num_layers):
+        avg_empirical_l0_this_layer = float("nan")
+        if (
+            not sample_batch_inputs
+            or layer_idx not in sample_batch_inputs
+            or sample_batch_inputs[layer_idx].numel() == 0
+        ):
             logger.warning(
-                f"run_quick_l0_checks_script received unexpected input shape {layer0_inputs_all_tokens.shape} for layer 0. Empirical L0 will be NaN."
+                f"run_quick_l0_checks_script received empty or invalid sample_batch_inputs for layer {layer_idx}. Empirical L0 for this layer will be NaN."
             )
-            layer0_inputs_flat = None
-
-        if layer0_inputs_flat is not None and num_tokens_in_batch > 0:
-            num_to_sample = min(num_tokens_to_check, num_tokens_in_batch)
-            indices = torch.randperm(num_tokens_in_batch, device=model.device)[:num_to_sample]
-            selected_tokens_for_l0 = layer0_inputs_flat[indices]
-
-            if selected_tokens_for_l0.numel() > 0:
-                acts_layer0_selected = model.encode(selected_tokens_for_l0, layer_idx=0)
-                l0_per_token_selected = (acts_layer0_selected > 1e-6).sum(dim=1).float()
-                avg_empirical_l0_layer0 = l0_per_token_selected.mean().item()
-            else:
-                logger.warning("No tokens selected for empirical L0 check after sampling. Empirical L0 will be NaN.")
-        elif layer0_inputs_flat is None:
-            pass
         else:
-            logger.warning("Batch for L0 check contains no tokens for layer 0. Empirical L0 will be NaN.")
+            layer_inputs_all_tokens = sample_batch_inputs[layer_idx].to(device=model.device, dtype=model.dtype)
 
-    expected_l0 = float("nan")
-    if hasattr(model, "log_threshold") and model.log_threshold is not None:
-        theta = model.log_threshold.exp().cpu()
-        p_fire = 1.0 - std_normal_dist.cdf(theta.float())
-        expected_l0 = p_fire.sum().item()
-    else:
-        logger.warning("Model does not have log_threshold. Cannot compute expected_l0.")
+            if layer_inputs_all_tokens.dim() == 3:  # B, S, D
+                num_tokens_in_batch = layer_inputs_all_tokens.shape[0] * layer_inputs_all_tokens.shape[1]
+                layer_inputs_flat = layer_inputs_all_tokens.reshape(num_tokens_in_batch, model.config.d_model)
+            elif layer_inputs_all_tokens.dim() == 2:  # Already [num_tokens, d_model]
+                num_tokens_in_batch = layer_inputs_all_tokens.shape[0]
+                layer_inputs_flat = layer_inputs_all_tokens
+            else:
+                logger.warning(
+                    f"run_quick_l0_checks_script received unexpected input shape {layer_inputs_all_tokens.shape} for layer {layer_idx}. Empirical L0 for this layer will be NaN."
+                )
+                layer_inputs_flat = None
 
-    return avg_empirical_l0_layer0, expected_l0
+            if layer_inputs_flat is not None and num_tokens_in_batch > 0:
+                num_to_sample = min(num_tokens_to_check, num_tokens_in_batch)
+                indices = torch.randperm(num_tokens_in_batch, device=model.device)[:num_to_sample]
+                selected_tokens_for_l0 = layer_inputs_flat[indices]
+
+                if selected_tokens_for_l0.numel() > 0:
+                    acts_layer_selected = model.encode(selected_tokens_for_l0, layer_idx=layer_idx)
+                    l0_per_token_selected = (acts_layer_selected > 1e-6).sum(dim=1).float()
+                    avg_empirical_l0_this_layer = l0_per_token_selected.mean().item()
+                else:
+                    logger.warning(
+                        f"No tokens selected for empirical L0 check for layer {layer_idx} after sampling. Empirical L0 for this layer will be NaN."
+                    )
+            elif layer_inputs_flat is None:
+                pass  # Warning already issued
+            else:  # num_tokens_in_batch == 0
+                logger.warning(
+                    f"Batch for L0 check contains no tokens for layer {layer_idx}. Empirical L0 for this layer will be NaN."
+                )
+
+        empirical_l0s_per_layer[layer_idx] = avg_empirical_l0_this_layer
+
+    # Expected L0 calculation removed
+    # expected_l0_total = float("nan")
+    # if hasattr(model, "log_threshold") and model.log_threshold is not None:
+    #     theta = model.log_threshold.exp().cpu()
+    #     p_fire = 1.0 - std_normal_dist.cdf(theta.float())
+    #     expected_l0_total = p_fire.sum().item()
+    # else:
+    #     logger.warning("Model does not have log_threshold. Cannot compute expected_l0.") # Removed
+
+    return empirical_l0s_per_layer  # Removed expected_l0_total from return
 
 
 if __name__ == "__main__":
@@ -329,8 +607,32 @@ if __name__ == "__main__":
     parser.add_argument(
         "--num_tokens_for_l0_check_script",
         type=int,
-        default=100,
-        help="Number of random tokens to sample from a batch for the empirical L0 check in this script.",
+        default=1024,
+        help="Number of random tokens to sample from the collected data for the empirical L0 check in this script.",
+    )
+    parser.add_argument(
+        "--num_batches_for_l0_check",
+        type=int,
+        default=1,
+        help="Number of batches to fetch from activation store for the empirical L0 check.",
+    )
+    parser.add_argument(
+        "--l0_check_batch_size_tokens",
+        type=int,
+        default=None,  # Default to None, will use estimation_batch_size_tokens if not set
+        help="Number of tokens per batch for fetching data for the L0 check. Defaults to estimation_batch_size_tokens if not specified.",
+    )
+    parser.add_argument(
+        "--scale_search_min",
+        type=float,
+        default=None,
+        help="If set together with --scale_search_max, the script will perform a binary search between these bounds (inclusive) to find a scale factor that best matches empirical and expected L0. Precision 0.1.",
+    )
+    parser.add_argument(
+        "--scale_search_max",
+        type=float,
+        default=None,
+        help="Upper bound for scale search. See --scale_search_min.",
     )
     # Note: clt_dtype for the model will be taken from the loaded config_dict_batchtopk initially.
 
