@@ -791,7 +791,6 @@ class CrossLayerTranscoder(BaseTranscoder):
         data_iter: torch.utils.data.IterableDataset,  # More generic iterable
         num_batches: Optional[int] = None,
         default_theta_value: float = 1e6,
-        scale_factor: float = 1.0,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         """Estimate theta post-hoc using a specified number of batches.
@@ -800,7 +799,6 @@ class CrossLayerTranscoder(BaseTranscoder):
             data_iter: An iterable yielding (inputs, targets) batches.
             num_batches: Number of batches to process for estimation. If None, iterates through all.
             default_theta_value: Value for features never activated. (Note: currently not directly used in final theta calculation in convert_to_jumprelu_inplace)
-            scale_factor: Scaling factor for estimated thetas.
             device: Device to run estimation on.
 
         Returns:
@@ -1057,15 +1055,26 @@ class CrossLayerTranscoder(BaseTranscoder):
             f"Rank {self.rank}: Processed {processed_batches_total} batches for theta estimation and stats accumulation."
         )
 
-        # Finalize average mu and sigma
-        active_stat_batches = self._processed_batches_for_stats.data.unsqueeze(-1).clamp_min(1.0)  # ensure broadcasting
-        if self._avg_layer_means is not None:
-            self._avg_layer_means.data /= active_stat_batches
-        if self._avg_layer_stds is not None:
-            self._avg_layer_stds.data /= active_stat_batches
-        logger.info(f"Rank {self.rank}: Averaged layer-wise normalization stats computed.")
+        # Finalize average mu and sigma if the buffers exist (they should if estimation ran)
+        if (
+            hasattr(self, "_processed_batches_for_stats")
+            and self._processed_batches_for_stats is not None
+            and hasattr(self, "_avg_layer_means")
+            and self._avg_layer_means is not None
+            and hasattr(self, "_avg_layer_stds")
+            and self._avg_layer_stds is not None
+        ):
 
-        self.convert_to_jumprelu_inplace(default_theta_value=default_theta_value, scale_factor=scale_factor)
+            active_stat_batches = self._processed_batches_for_stats.data.unsqueeze(-1).clamp_min(
+                1.0
+            )  # ensure broadcasting
+            self._avg_layer_means.data /= active_stat_batches
+            self._avg_layer_stds.data /= active_stat_batches
+            logger.info(f"Rank {self.rank}: Averaged layer-wise normalization stats computed.")
+        else:
+            logger.warning(f"Rank {self.rank}: Could not finalize normalization stats, buffers missing.")
+
+        self.convert_to_jumprelu_inplace(default_theta_value=default_theta_value)
 
         # Clean up non-persistent buffers
         for buf_name in [
@@ -1085,7 +1094,7 @@ class CrossLayerTranscoder(BaseTranscoder):
         return torch.exp(self.log_threshold.data)
 
     @torch.no_grad()
-    def convert_to_jumprelu_inplace(self, default_theta_value: float = 1e6, *, scale_factor: float = 1.0) -> None:
+    def convert_to_jumprelu_inplace(self, default_theta_value: float = 1e6) -> None:
         """
         Converts the model to use JumpReLU activation based on learned BatchTopK thresholds.
         This method should be called after training with BatchTopK.
@@ -1097,7 +1106,6 @@ class CrossLayerTranscoder(BaseTranscoder):
             default_theta_value: Value for features never activated (used in initial per-feature calculation in normalized space).
                                  (Note: This parameter is not directly used in the current implementation's final theta calculation,
                                   as behavior for non-activating features is handled by fallback_norm_theta_value and clamping.)
-            scale_factor: Optional scaling factor to apply to the learned normalized thetas.
         """
         if self.config.activation_fn not in ["batchtopk", "topk"]:
             logger.warning(
@@ -1149,7 +1157,7 @@ class CrossLayerTranscoder(BaseTranscoder):
             # For consistent unnormalization, all ranks should use the same mu/sigma for a given layer.
             # Let's assume for now estimate_theta_posthoc has made them consistent or this is handled by estimate_theta_posthoc
             # For a truly robust solution, mus and sigmas would also need an all_reduce sum and divide by world_size * num_batches_per_rank.
-            # The current `active_stat_batches` division in estimate_theta_posthoc is per-rank.
+            # The current `active_stat_batches` division in estimate_theta_posthoc is per-rank, then averaged here.
             # Let's assume the per-rank averaged mus/sigmas are what we want to use for unnormalizing that rank's part.
             # But the final log_threshold must be identical. So the unnormalization must use globally agreed mu/sigma.
             # Simplest: AllReduce sum for avg_mus * counts and avg_sigmas * counts, and sum counts, then divide.
@@ -1163,7 +1171,6 @@ class CrossLayerTranscoder(BaseTranscoder):
         # Initialize the final RAW theta tensor (will store per-feature raw thresholds)
         theta_raw = torch.zeros_like(theta_sum_norm)
         fallback_norm_theta_value = 1e-5  # Fallback for a layer's normalized theta
-        min_positive_norm_theta_clamp = 1e-6  # Clamp for layer's normalized theta before unnorm
 
         for l_idx in range(self.config.num_layers):
             layer_theta_sum_norm = theta_sum_norm[l_idx]  # Sums of min selected *normalized* preacts
@@ -1194,29 +1201,6 @@ class CrossLayerTranscoder(BaseTranscoder):
                 logger.warning(
                     f"Rank {self.rank} Layer {l_idx}: No positive, finite per-feature normalized thetas. Using fallback normalized theta = {theta_norm_scalar_for_this_layer:.4e}"
                 )
-
-            # Apply scaling factor to this layer's SCALAR NORMALIZED theta
-            current_scale_factor = scale_factor
-            if not isinstance(current_scale_factor, (int, float)):
-                logger.warning(f"Rank {self.rank} Layer {l_idx}: Invalid scale_factor type. Defaulting to 1.0.")
-                current_scale_factor = 1.0
-            if current_scale_factor <= 0:
-                logger.warning(f"Rank {self.rank} Layer {l_idx}: Invalid scale_factor value <= 0. Defaulting to 1.0.")
-                current_scale_factor = 1.0
-
-            if current_scale_factor != 1.0:
-                theta_norm_scalar_for_this_layer *= current_scale_factor
-                logger.info(
-                    f"Rank {self.rank} Layer {l_idx}: Applied scale_factor={current_scale_factor:.3f}, new normalized scalar theta = {theta_norm_scalar_for_this_layer:.4e}"
-                )
-
-            # Clamp this layer's SCALAR NORMALIZED theta
-            if theta_norm_scalar_for_this_layer <= min_positive_norm_theta_clamp:
-                logger.warning(
-                    f"Rank {self.rank} Layer {l_idx}: Normalized scalar theta ({theta_norm_scalar_for_this_layer:.4e}) is <= {min_positive_norm_theta_clamp}. "
-                    f"Clamping to {min_positive_norm_theta_clamp}."
-                )
-                theta_norm_scalar_for_this_layer = min_positive_norm_theta_clamp
 
             # Un-normalize to get RAW thresholds PER FEATURE for this layer
             mu_vec_layer = avg_mus[l_idx]  # Shape: [num_features]

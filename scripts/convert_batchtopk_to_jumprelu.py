@@ -4,7 +4,7 @@ import json
 import argparse
 import sys
 import logging
-from typing import Dict, List, Optional, Union
+from typing import Dict, List
 import math
 
 # Ensure the project root is in the Python path
@@ -133,7 +133,7 @@ def main(args):
     # 4. Estimate Theta and Convert Model
     logger.info(
         f"Starting theta estimation using {args.num_batches_for_theta_estimation} batches "
-        f"with scale_factor={args.scale_factor} and default_theta_value={args.default_theta_value}."
+        f"with default_theta_value={args.default_theta_value}."
     )
     # Store original K before it gets wiped by model conversion
     # original_batchtopk_k = clt_config_batchtopk.batchtopk_k # Will be determined later in scale search section
@@ -143,7 +143,6 @@ def main(args):
             data_iter=activation_store_theta,
             num_batches=args.num_batches_for_theta_estimation,
             default_theta_value=args.default_theta_value,
-            scale_factor=args.scale_factor,
             device=device,  # Pass device to ensure buffers are on correct device
         )
         logger.info(
@@ -283,140 +282,6 @@ def main(args):
 
     model_for_l0_check = model
 
-    # ------------------------------------------------------------------
-    # Optional binary search over scale_factor to match empirical L0
-    # ------------------------------------------------------------------
-    if args.scale_search_min is not None and args.scale_search_max is not None:
-        if args.scale_search_min <= 0 or args.scale_search_max <= 0:
-            logger.error("scale_search_min and scale_search_max must be > 0. Skipping scale search.")
-        elif args.scale_search_max < args.scale_search_min:
-            logger.error("scale_search_max must be >= scale_search_min. Skipping scale search.")
-        else:
-            logger.info(
-                f"Starting binary search for scale_factor in range [{args.scale_search_min}, {args.scale_search_max}] with 0.1 precision."
-            )
-
-            target_l0_k: Optional[Union[int, float]] = None
-            original_model_config = (
-                clt_config_batchtopk  # This is the config *before* conversion by estimate_theta_posthoc
-            )
-
-            if original_model_config.activation_fn == "batchtopk":
-                if hasattr(original_model_config, "batchtopk_k") and original_model_config.batchtopk_k is not None:
-                    target_l0_k = float(original_model_config.batchtopk_k)
-                    logger.info(f"Targeting L0 sum based on original batchtopk_k: {target_l0_k}")
-                else:
-                    logger.error(
-                        "batchtopk_k not found in the original BatchTopK config. Cannot perform K-targeted scale search."
-                    )
-            elif original_model_config.activation_fn == "topk":
-                if hasattr(original_model_config, "topk_k") and original_model_config.topk_k is not None:
-                    k_param = float(original_model_config.topk_k)
-                    # num_features and num_layers should be available in the config object
-                    num_features = original_model_config.num_features
-                    num_layers = original_model_config.num_layers
-
-                    expected_l0_per_layer: float
-                    if 0 < k_param < 1:  # fraction
-                        expected_l0_per_layer = math.ceil(k_param * num_features)
-                    elif k_param >= 1:  # count
-                        expected_l0_per_layer = float(int(k_param))
-                    else:  # k_param <= 0
-                        logger.error(f"Invalid topk_k value ({k_param}). Must be positive. Skipping scale search.")
-                        # target_l0_k remains None
-
-                    if (
-                        expected_l0_per_layer is not None and num_layers is not None
-                    ):  # Check if expected_l0_per_layer was set
-                        target_l0_k = expected_l0_per_layer * num_layers
-                        logger.info(
-                            f"Targeting L0 sum based on original topk_k ({k_param}), num_features ({num_features}), num_layers ({num_layers}): {target_l0_k}"
-                        )
-                else:
-                    logger.error(
-                        "topk_k not found in the original TopK config. Cannot perform K-targeted scale search."
-                    )
-            else:
-                logger.warning(
-                    f"Scale search for L0 matching is not configured for original activation_fn '{original_model_config.activation_fn}'. Skipping search."
-                )
-
-            if target_l0_k is None:
-                logger.error(
-                    "Target L0 (k) not found or invalid in the original config. Cannot perform K-targeted scale search. Skipping search."
-                )
-            elif not isinstance(target_l0_k, (int, float)) or target_l0_k <= 0:  # Redundant check if None is handled
-                logger.error(f"Invalid target_l0_k value ({target_l0_k}). Must be a positive number. Skipping search.")
-            else:
-                base_theta = torch.exp(model_for_l0_check.log_threshold.detach().clone())
-                low = args.scale_search_min
-                high = args.scale_search_max
-                best_scale = low
-                best_diff = float("inf")
-
-                iteration = 0
-                while high - low > 0.099:  # 0.1 precision (allowing for fp error)
-                    iteration += 1
-                    mid = round((low + high) / 2.0, 1)
-
-                    if mid == low or mid == high and high - low < 0.15:
-                        for test_scale in {low, high}:
-                            scaled_theta_final_check = base_theta * test_scale
-                            model_for_l0_check.log_threshold.data.copy_(torch.log(scaled_theta_final_check))
-                            empirical_l0s_fc = run_quick_l0_checks_script(
-                                model_for_l0_check,
-                                final_sample_batch_for_l0_inputs,
-                                args.num_tokens_for_l0_check_script,
-                            )
-                            empirical_total_fc = sum(
-                                v for v in empirical_l0s_fc.values() if not (isinstance(v, float) and math.isnan(v))
-                            )
-                            diff_fc = abs(empirical_total_fc - target_l0_k)
-                            if diff_fc < best_diff:
-                                best_diff = diff_fc
-                                best_scale = test_scale
-                        break
-
-                    scaled_theta = base_theta * mid
-                    model_for_l0_check.log_threshold.data.copy_(torch.log(scaled_theta.clamp_min(1e-9)))
-
-                    empirical_l0s = run_quick_l0_checks_script(
-                        model_for_l0_check,
-                        final_sample_batch_for_l0_inputs,
-                        args.num_tokens_for_l0_check_script,
-                    )
-                    empirical_total = sum(
-                        v for v in empirical_l0s.values() if not (isinstance(v, float) and math.isnan(v))
-                    )
-                    diff = abs(empirical_total - target_l0_k)
-
-                    if diff < best_diff:
-                        logger.info(
-                            f"[Scale Search] Iter {iteration}: New best scale {mid:.1f} (EmpL0Total={empirical_total:.2f}, |diff|={diff:.2f}) replaces old best {best_scale:.1f} (diff {best_diff:.2f})"
-                        )
-                        best_diff = diff
-                        best_scale = mid
-                    elif diff == best_diff and mid < best_scale:
-                        logger.info(
-                            f"[Scale Search] Iter {iteration}: Tied diff {diff:.2f}, preferring new smaller scale {mid:.1f} over old {best_scale:.1f}"
-                        )
-                        best_scale = mid
-
-                    if empirical_total > target_l0_k:
-                        low = mid
-                    else:
-                        high = mid
-
-                logger.info(
-                    f"Scale search finished. Best scale factor found: {best_scale:.1f} (|diff|={best_diff:.2f} against TargetL0_K={target_l0_k:.2f}). Applying this scale."
-                )
-                final_theta = base_theta * best_scale
-                model_for_l0_check.log_threshold.data.copy_(
-                    torch.log(final_theta.clamp_min(1e-9))
-                )  # clamp to avoid log(0)
-                args.scale_factor = best_scale  # For logging consistency later
-    # ------------------------------------------------------------------
-
     empirical_l0s_per_layer = run_quick_l0_checks_script(
         model_for_l0_check, final_sample_batch_for_l0_inputs, args.num_tokens_for_l0_check_script
     )
@@ -465,7 +330,295 @@ def main(args):
         logger.info(f"Normalized Mean Squared Error (NMSE) on collected data: {nmse_value:.4f}")
         logger.info(f"Explained Variance (EV) on collected data: {explained_variance:.4f}")
 
+    # --- Optional Layer-wise L0 Calibration --- #
+    if args.l0_layerwise_calibrate:
+        logger.info("--- Starting Layer-wise L0 Calibration Step ---")
+
+        # 1. Determine paths for the original model
+        original_config_path = args.l0_target_model_config_path or args.config_path
+        original_checkpoint_path = args.l0_target_model_checkpoint_path or args.batchtopk_checkpoint_path
+
+        logger.info(
+            f"Loading original model for L0 targets from config: {original_config_path} and checkpoint: {original_checkpoint_path}"
+        )
+        if not os.path.exists(original_config_path):
+            logger.error(f"Original model config file not found at: {original_config_path}. Skipping L0 calibration.")
+            return  # Or skip calibration and continue
+        with open(original_config_path, "r") as f:
+            original_config_dict = json.load(f)
+
+        try:
+            original_clt_config = CLTConfig(**original_config_dict)
+            original_model = CrossLayerTranscoder(config=original_clt_config, process_group=None, device=device)
+
+            if not os.path.exists(original_checkpoint_path):
+                logger.error(
+                    f"Original model checkpoint file not found at: {original_checkpoint_path}. Skipping L0 calibration."
+                )
+                return  # Or skip calibration
+
+            if os.path.isdir(original_checkpoint_path):
+                from torch.distributed.checkpoint.state_dict_loader import load_state_dict as dist_load_state_dict
+                from torch.distributed.checkpoint.filesystem import FileSystemReader
+
+                state_dict_to_populate_orig = original_model.state_dict()
+                dist_load_state_dict(
+                    state_dict=state_dict_to_populate_orig,
+                    storage_reader=FileSystemReader(original_checkpoint_path),
+                    no_dist=True,
+                )
+                original_model.load_state_dict(state_dict_to_populate_orig)
+            elif original_checkpoint_path.endswith(".safetensors"):
+                state_dict_orig = load_safetensors_file(original_checkpoint_path, device=device.type)
+                original_model.load_state_dict(state_dict_orig)
+            else:
+                original_model.load_state_dict(torch.load(original_checkpoint_path, map_location=device))
+
+            original_model.eval()
+            logger.info("Original model loaded successfully for L0 target calculation.")
+        except Exception as e:
+            logger.error(f"Error loading original model for L0 calibration: {e}. Skipping calibration.")
+            return  # Or skip calibration
+
+        # 2. Prepare calibration data (using a small subset of the activation data)
+        calib_batch_size = (
+            args.l0_calibration_batch_size_tokens
+            or args.l0_check_batch_size_tokens
+            or args.estimation_batch_size_tokens
+        )
+        logger.info(
+            f"Preparing {args.l0_calibration_batches} batch(es) for L0 calibration with batch size {calib_batch_size} tokens."
+        )
+
+        calibration_inputs_collected: Dict[int, List[torch.Tensor]] = {
+            i: [] for i in range(original_model.config.num_layers)
+        }
+        try:
+            activation_store_for_calib = LocalActivationStore(
+                dataset_path=args.activation_data_path,  # Use the same main data path
+                train_batch_size_tokens=calib_batch_size,
+                device=device,
+                dtype=args.activation_dtype or original_clt_config.expected_input_dtype or "float32",
+                rank=0,
+                world=1,
+                seed=args.seed + 2,  # Use a different seed
+                sampling_strategy="sequential",
+                normalization_method="auto",  # Let it normalize if needed, though L0 is on post-activation
+            )
+            data_iterator_for_calib = iter(activation_store_for_calib)
+            for _ in range(args.l0_calibration_batches):
+                cal_inputs_b, _ = next(data_iterator_for_calib)
+                for layer_idx_cal, tensor_data_cal in cal_inputs_b.items():
+                    if layer_idx_cal in calibration_inputs_collected:
+                        if tensor_data_cal.dim() == 3:
+                            num_tokens_cal = tensor_data_cal.shape[0] * tensor_data_cal.shape[1]
+                            calibration_inputs_collected[layer_idx_cal].append(
+                                tensor_data_cal.reshape(num_tokens_cal, original_model.config.d_model)
+                            )
+                        elif tensor_data_cal.dim() == 2:
+                            calibration_inputs_collected[layer_idx_cal].append(tensor_data_cal)
+
+            if hasattr(activation_store_for_calib, "close") and callable(getattr(activation_store_for_calib, "close")):
+                activation_store_for_calib.close()
+
+            final_calibration_inputs: Dict[int, torch.Tensor] = {}
+            for layer_idx_cal, tensor_list_cal in calibration_inputs_collected.items():
+                if tensor_list_cal:
+                    final_calibration_inputs[layer_idx_cal] = torch.cat(tensor_list_cal, dim=0)
+                else:
+                    logger.warning(f"Layer {layer_idx_cal}: No calibration input tokens collected.")
+                    final_calibration_inputs[layer_idx_cal] = torch.empty(
+                        (0, original_model.config.d_model), device=device, dtype=original_model.dtype
+                    )
+
+            if not any(v.numel() > 0 for v in final_calibration_inputs.values()):
+                logger.error("No data collected for L0 calibration. Skipping calibration step.")
+                return  # Or skip calibration
+
+        except Exception as e_cal_fetch:
+            logger.error(f"Error fetching data for L0 calibration: {e_cal_fetch}. Skipping calibration.")
+            return  # Or skip calibration
+
+        # 3. Get Target L0s from the original model
+        logger.info("Calculating target L0s from the original model...")
+        target_l0s = run_quick_l0_checks_script(
+            original_model,
+            final_calibration_inputs,
+            args.num_tokens_for_l0_check_script,  # Use same num_tokens for consistency in how L0 is measured
+        )
+        logger.info(f"Target L0s per layer from original model: {target_l0s}")
+
+        # 4. Calibrate the converted JumpReLU model (model_for_l0_check is the one already converted)
+        calibrate_layerwise_theta_for_l0_matching(
+            model_to_calibrate=model_for_l0_check,
+            calibration_inputs=final_calibration_inputs,
+            target_l0s_per_layer=target_l0s,
+            num_tokens_for_l0_check=args.num_tokens_for_l0_check_script,
+            min_scale=args.l0_calibration_search_min_scale,
+            max_scale=args.l0_calibration_search_max_scale,
+            tolerance=args.l0_calibration_tolerance,
+            max_iters=args.l0_calibration_max_iters,
+            device=device,
+        )
+
+        # 5. Log final L0s of the calibrated model
+        logger.info("--- L0s after Layer-wise Calibration ---")
+        calibrated_l0s_per_layer = run_quick_l0_checks_script(
+            model_for_l0_check, final_calibration_inputs, args.num_tokens_for_l0_check_script
+        )
+        total_calibrated_l0 = 0.0
+        for l_idx, l0_val in calibrated_l0s_per_layer.items():
+            logger.info(f"  Layer {l_idx}: {l0_val:.2f} (Target: {target_l0s.get(l_idx, float('nan')):.2f})")
+            if not (isinstance(l0_val, float) and math.isnan(l0_val)):
+                total_calibrated_l0 += l0_val
+        logger.info(f"Total Empirical L0 across all layers (Calibrated): {total_calibrated_l0:.2f}")
+
+        # 6. Re-save the calibrated model
+        logger.info(f"Re-saving calibrated JumpReLU model state to: {args.output_model_path}")
+        torch.save(model_for_l0_check.state_dict(), args.output_model_path)
+        # Config remains the same (JumpReLU), only log_thresholds changed.
+        logger.info("--- Layer-wise L0 Calibration Step Finished ---")
+
+        # --- Re-evaluate NMSE/EV after L0 calibration ---
+        logger.info("--- NMSE/EV after Layer-wise Calibration ---")
+        if (
+            not inputs_for_nmse_metric  # This was defined before the calibration block
+            or not targets_for_nmse_metric
+            or not any(v.numel() > 0 for v in inputs_for_nmse_metric.values())
+            or not any(v.numel() > 0 for v in targets_for_nmse_metric.values())
+        ):
+            logger.warning(
+                "Insufficient data for NMSE re-evaluation after calibration (empty inputs or targets for common layers). Skipping."
+            )
+        else:
+            # Ensure the evaluator uses the potentially updated model_for_l0_check (calibrated model)
+            # If evaluator was initialized with model, and model_for_l0_check is the same instance that was modified, this is fine.
+            # If not, evaluator might need to be updated or re-initialized with the calibrated model.
+            # Assuming model_for_l0_check is the same instance that evaluator holds or that CLTEvaluator uses the model passed at evaluation time.
+            # CLTEvaluator constructor takes a model, but its _compute_reconstruction_metrics does not, it uses self.model.
+            # So, we need to ensure the evaluator has the *calibrated* model.
+            evaluator_after_calib = CLTEvaluator(
+                model=model_for_l0_check, device=device, mean_tg=mean_tg_for_eval, std_tg=std_tg_for_eval
+            )
+            with torch.no_grad():
+                reconstructions_after_calib = model_for_l0_check(inputs_for_nmse_metric)
+
+            metrics_after_calib = evaluator_after_calib._compute_reconstruction_metrics(
+                targets=targets_for_nmse_metric, reconstructions=reconstructions_after_calib
+            )
+            nmse_after_calib = metrics_after_calib.get(
+                "reconstruction/normalized_mean_reconstruction_error", float("nan")
+            )
+            ev_after_calib = metrics_after_calib.get("reconstruction/explained_variance", float("nan"))
+            logger.info(f"NMSE (post-L0-calibration): {nmse_after_calib:.4f}")
+            logger.info(f"EV (post-L0-calibration): {ev_after_calib:.4f}")
+
     logger.info("Conversion script finished successfully.")
+
+
+def calibrate_layerwise_theta_for_l0_matching(
+    model_to_calibrate: CrossLayerTranscoder,
+    calibration_inputs: Dict[int, torch.Tensor],
+    target_l0s_per_layer: Dict[int, float],
+    num_tokens_for_l0_check: int,
+    min_scale: float,
+    max_scale: float,
+    tolerance: float,
+    max_iters: int,
+    device: torch.device,
+) -> None:
+    """Calibrates model.log_threshold layer by layer to match target L0s."""
+    logger.info("Starting layer-wise L0 calibration...")
+    model_to_calibrate.eval()  # Ensure model is in eval mode
+
+    # Detach original log_thresholds to use as base for scaling, to avoid them changing with each layer's calibration
+    original_log_thetas_exp = model_to_calibrate.log_threshold.exp().detach().clone()
+
+    for layer_idx in range(model_to_calibrate.config.num_layers):
+        if layer_idx not in target_l0s_per_layer or math.isnan(target_l0s_per_layer[layer_idx]):
+            logger.warning(f"Layer {layer_idx}: No valid target L0. Skipping calibration for this layer.")
+            continue
+
+        target_l0 = target_l0s_per_layer[layer_idx]
+        if target_l0 < 0:  # Should not happen if target_l0s come from run_quick_l0_checks_script
+            logger.warning(f"Layer {layer_idx}: Target L0 ({target_l0:.2f}) is negative. Skipping calibration.")
+            continue
+
+        logger.info(f"Layer {layer_idx}: Calibrating to target L0 = {target_l0:.2f}")
+
+        # Get the base theta for this layer (vector of per-feature thetas)
+        base_theta_layer = original_log_thetas_exp[layer_idx].to(device)
+
+        low_s = min_scale
+        high_s = max_scale
+        current_best_scale = 1.0  # Start with no scale change
+        current_best_diff = float("inf")
+
+        for iter_num in range(max_iters):
+            mid_s = (low_s + high_s) / 2.0
+            if mid_s == low_s or mid_s == high_s:  # Avoid getting stuck
+                logger.debug(
+                    f"Layer {layer_idx} Iter {iter_num + 1}: Scale search converged or stuck at mid_s={mid_s:.3f}. Breaking."
+                )
+                break
+
+            # Apply current scale to the base theta for this layer
+            # The log_threshold parameter is a tensor of shape [num_layers, num_features]
+            # We are calibrating one layer at a time. When checking layer_idx,
+            # we modify only model.log_threshold.data[layer_idx].
+            current_scaled_theta_layer = base_theta_layer * mid_s
+            model_to_calibrate.log_threshold.data[layer_idx] = torch.log(current_scaled_theta_layer.clamp_min(1e-9))
+
+            # Check L0 with this new theta for the current layer
+            # run_quick_l0_checks_script returns a dict {layer_idx: l0_val}
+            # We only care about the L0 of the current layer_idx
+            empirical_l0s_current_iter = run_quick_l0_checks_script(
+                model_to_calibrate, calibration_inputs, num_tokens_for_l0_check
+            )
+            empirical_l0_this_layer = empirical_l0s_current_iter.get(layer_idx, float("nan"))
+
+            if math.isnan(empirical_l0_this_layer):
+                logger.warning(
+                    f"Layer {layer_idx} Iter {iter_num + 1}: Empirical L0 is NaN with scale {mid_s:.3f}. Trying to increase scale (reduce L0)."
+                )
+                # If L0 is NaN (e.g. no inputs for layer), it often means too many things fired leading to instability or empty selections somewhere.
+                # Pushing scale higher (reducing L0) might help recover.
+                low_s = mid_s
+                continue
+
+            diff = empirical_l0_this_layer - target_l0  # Signed difference
+
+            if abs(diff) < abs(current_best_diff):
+                current_best_diff = diff
+                current_best_scale = mid_s
+            elif abs(diff) == abs(current_best_diff) and mid_s < current_best_scale:  # Prefer smaller scale on ties
+                current_best_scale = mid_s
+
+            logger.debug(
+                f"Layer {layer_idx} Iter {iter_num + 1}: Scale={mid_s:.3f}, EmpL0={empirical_l0_this_layer:.2f}, TargetL0={target_l0:.2f}, Diff={diff:.2f}"
+            )
+
+            if abs(diff) <= tolerance:
+                logger.info(
+                    f"Layer {layer_idx}: Converged at scale {mid_s:.3f} (EmpL0={empirical_l0_this_layer:.2f}, Diff={diff:.2f}) within tolerance {tolerance}."
+                )
+                break
+
+            if diff > 0:  # Empirical L0 is too high, need to increase theta (increase scale)
+                low_s = mid_s
+            else:  # Empirical L0 is too low, need to decrease theta (decrease scale)
+                high_s = mid_s
+        else:  # Loop finished without break (max_iters reached)
+            logger.info(
+                f"Layer {layer_idx}: Max iterations ({max_iters}) reached. Best scale {current_best_scale:.3f} (EmpL0 diff {current_best_diff:.2f})."
+            )
+
+        # Set the layer's log_threshold to the one corresponding to the best scale found
+        final_scaled_theta_layer = base_theta_layer * current_best_scale
+        model_to_calibrate.log_threshold.data[layer_idx] = torch.log(final_scaled_theta_layer.clamp_min(1e-9))
+        logger.info(f"Layer {layer_idx}: Set final scale {current_best_scale:.3f}. Log_threshold updated.")
+
+    logger.info("Layer-wise L0 calibration finished.")
 
 
 def run_quick_l0_checks_script(
@@ -474,67 +627,105 @@ def run_quick_l0_checks_script(
     """Helper function for L0 checks within the script.
     Returns a dictionary of empirical L0 per layer."""
     model.eval()  # Ensure model is in eval mode
-
     empirical_l0s_per_layer: Dict[int, float] = {}
-    # std_normal_dist = torch.distributions.normal.Normal(0, 1) # Removed: No longer needed for expected L0
 
-    for layer_idx in range(model.config.num_layers):
-        avg_empirical_l0_this_layer = float("nan")
-        if (
-            not sample_batch_inputs
-            or layer_idx not in sample_batch_inputs
-            or sample_batch_inputs[layer_idx].numel() == 0
-        ):
+    # If the model is batchtopk or topk, we need to get activations via get_feature_activations
+    # to correctly account for global K selection before calculating L0.
+    # For JumpReLU (during calibration), model.encode() per layer is fine.
+    if model.config.activation_fn in ["batchtopk", "topk"]:
+        # Ensure inputs are on the correct device for the model
+        inputs_on_device = {
+            k: v.to(device=model.device, dtype=model.dtype) for k, v in sample_batch_inputs.items() if v.numel() > 0
+        }
+        if not inputs_on_device:
             logger.warning(
-                f"run_quick_l0_checks_script received empty or invalid sample_batch_inputs for layer {layer_idx}. Empirical L0 for this layer will be NaN."
+                f"run_quick_l0_checks_script (for {model.config.activation_fn}): No valid input tensors after device transfer. Returning empty L0s."
             )
-        else:
-            layer_inputs_all_tokens = sample_batch_inputs[layer_idx].to(device=model.device, dtype=model.dtype)
+            for layer_idx in range(model.config.num_layers):
+                empirical_l0s_per_layer[layer_idx] = float("nan")
+            return empirical_l0s_per_layer
 
-            if layer_inputs_all_tokens.dim() == 3:  # B, S, D
-                num_tokens_in_batch = layer_inputs_all_tokens.shape[0] * layer_inputs_all_tokens.shape[1]
-                layer_inputs_flat = layer_inputs_all_tokens.reshape(num_tokens_in_batch, model.config.d_model)
-            elif layer_inputs_all_tokens.dim() == 2:  # Already [num_tokens, d_model]
-                num_tokens_in_batch = layer_inputs_all_tokens.shape[0]
-                layer_inputs_flat = layer_inputs_all_tokens
+        # We no longer attempt to infer the original (B, S) dimensions, as it provided little
+        # benefit and introduced several edge-cases.  L0 will be computed directly on the flat
+        # `[total_tokens, num_features]` representation returned by `get_feature_activations`.
+
+        feature_activations = model.get_feature_activations(inputs_on_device)
+
+        for layer_idx in range(model.config.num_layers):
+            if layer_idx in feature_activations and feature_activations[layer_idx].numel() > 0:
+                acts_layer = feature_activations[layer_idx]  # Shape: [total_tokens_processed, num_features]
+                total_tokens_processed = acts_layer.shape[0]
+
+                # --- Simplified L0 computation --- #
+                # We directly compute the number of active features (>1e-6) **per token** and then
+                # take the average over all tokens.  This avoids the brittle logic of trying to
+                # reconstruct the original (B, S) dimensions, which often led to an under-estimate
+                # of the true sparsity.
+
+                if total_tokens_processed == 0:
+                    avg_empirical_l0_this_layer = float("nan")
+                else:
+                    # Count **non-zero** activations regardless of sign – BatchTopK can select negative
+                    # pre-activations.  We therefore look at the absolute value to decide if a feature
+                    # is active.
+                    l0_per_token = (acts_layer.abs() > 1e-8).sum(dim=1).float()
+                    avg_empirical_l0_this_layer = l0_per_token.mean().item()
+
+                empirical_l0s_per_layer[layer_idx] = avg_empirical_l0_this_layer
             else:
                 logger.warning(
-                    f"run_quick_l0_checks_script received unexpected input shape {layer_inputs_all_tokens.shape} for layer {layer_idx}. Empirical L0 for this layer will be NaN."
+                    f"run_quick_l0_checks_script (for {model.config.activation_fn}): No activations found for layer {layer_idx}. L0 will be NaN."
                 )
-                layer_inputs_flat = None
+                empirical_l0s_per_layer[layer_idx] = float("nan")
+    else:  # For JumpReLU or other per-layer activation models (like during calibration)
+        for layer_idx in range(model.config.num_layers):
+            avg_empirical_l0_this_layer = float("nan")
+            if (
+                not sample_batch_inputs
+                or layer_idx not in sample_batch_inputs
+                or sample_batch_inputs[layer_idx].numel() == 0
+            ):
+                logger.warning(
+                    f"run_quick_l0_checks_script (for {model.config.activation_fn}) received empty/invalid sample_batch_inputs for layer {layer_idx}. Empirical L0 for this layer will be NaN."
+                )
+            else:
+                layer_inputs_all_tokens = sample_batch_inputs[layer_idx].to(device=model.device, dtype=model.dtype)
 
-            if layer_inputs_flat is not None and num_tokens_in_batch > 0:
-                num_to_sample = min(num_tokens_to_check, num_tokens_in_batch)
-                indices = torch.randperm(num_tokens_in_batch, device=model.device)[:num_to_sample]
-                selected_tokens_for_l0 = layer_inputs_flat[indices]
-
-                if selected_tokens_for_l0.numel() > 0:
-                    acts_layer_selected = model.encode(selected_tokens_for_l0, layer_idx=layer_idx)
-                    l0_per_token_selected = (acts_layer_selected > 1e-6).sum(dim=1).float()
-                    avg_empirical_l0_this_layer = l0_per_token_selected.mean().item()
+                if layer_inputs_all_tokens.dim() == 3:  # B, S, D
+                    num_tokens_in_batch = layer_inputs_all_tokens.shape[0] * layer_inputs_all_tokens.shape[1]
+                    layer_inputs_flat = layer_inputs_all_tokens.reshape(num_tokens_in_batch, model.config.d_model)
+                elif layer_inputs_all_tokens.dim() == 2:  # Already [num_tokens, d_model]
+                    num_tokens_in_batch = layer_inputs_all_tokens.shape[0]
+                    layer_inputs_flat = layer_inputs_all_tokens
                 else:
                     logger.warning(
-                        f"No tokens selected for empirical L0 check for layer {layer_idx} after sampling. Empirical L0 for this layer will be NaN."
+                        f"run_quick_l0_checks_script (for {model.config.activation_fn}) received unexpected input shape {layer_inputs_all_tokens.shape} for layer {layer_idx}. Empirical L0 for this layer will be NaN."
                     )
-            elif layer_inputs_flat is None:
-                pass  # Warning already issued
-            else:  # num_tokens_in_batch == 0
-                logger.warning(
-                    f"Batch for L0 check contains no tokens for layer {layer_idx}. Empirical L0 for this layer will be NaN."
-                )
+                    layer_inputs_flat = None
 
-        empirical_l0s_per_layer[layer_idx] = avg_empirical_l0_this_layer
+                if layer_inputs_flat is not None and num_tokens_in_batch > 0:
+                    num_to_sample = min(num_tokens_to_check, num_tokens_in_batch)
+                    indices = torch.randperm(num_tokens_in_batch, device=model.device)[:num_to_sample]
+                    selected_tokens_for_l0 = layer_inputs_flat[indices]
 
-    # Expected L0 calculation removed
-    # expected_l0_total = float("nan")
-    # if hasattr(model, "log_threshold") and model.log_threshold is not None:
-    #     theta = model.log_threshold.exp().cpu()
-    #     p_fire = 1.0 - std_normal_dist.cdf(theta.float())
-    #     expected_l0_total = p_fire.sum().item()
-    # else:
-    #     logger.warning("Model does not have log_threshold. Cannot compute expected_l0.") # Removed
+                    if selected_tokens_for_l0.numel() > 0:
+                        # model.encode() is appropriate here for JumpReLU as it's per-layer
+                        acts_layer_selected = model.encode(selected_tokens_for_l0, layer_idx=layer_idx)
+                        l0_per_token_selected = (acts_layer_selected.abs() > 1e-8).sum(dim=1).float()
+                        avg_empirical_l0_this_layer = l0_per_token_selected.mean().item()
+                    else:
+                        logger.warning(
+                            f"No tokens selected for empirical L0 check (for {model.config.activation_fn}) for layer {layer_idx} after sampling. Empirical L0 for this layer will be NaN."
+                        )
+                elif layer_inputs_flat is None:
+                    pass  # Warning already issued
+                else:  # num_tokens_in_batch == 0
+                    logger.warning(
+                        f"Batch for L0 check (for {model.config.activation_fn}) contains no tokens for layer {layer_idx}. Empirical L0 for this layer will be NaN."
+                    )
+            empirical_l0s_per_layer[layer_idx] = avg_empirical_l0_this_layer
 
-    return empirical_l0s_per_layer  # Removed expected_l0_total from return
+    return empirical_l0s_per_layer
 
 
 if __name__ == "__main__":
@@ -586,9 +777,6 @@ if __name__ == "__main__":
         help="Number of tokens per batch for theta estimation.",
     )
     parser.add_argument(
-        "--scale_factor", type=float, default=1.0, help="Scaling factor to apply to estimated theta values."
-    )
-    parser.add_argument(
         "--default_theta_value", type=float, default=1e6, help="Default theta value for features that never activated."
     )
 
@@ -622,18 +810,62 @@ if __name__ == "__main__":
         default=None,  # Default to None, will use estimation_batch_size_tokens if not set
         help="Number of tokens per batch for fetching data for the L0 check. Defaults to estimation_batch_size_tokens if not specified.",
     )
+
+    # Args for Layer-wise L0 Calibration
     parser.add_argument(
-        "--scale_search_min",
-        type=float,
-        default=None,
-        help="If set together with --scale_search_max, the script will perform a binary search between these bounds (inclusive) to find a scale factor that best matches empirical and expected L0. Precision 0.1.",
+        "--l0_layerwise_calibrate",
+        action="store_true",
+        help="If set, perform an additional calibration step to match layer-wise L0s from the original model.",
     )
     parser.add_argument(
-        "--scale_search_max",
-        type=float,
-        default=None,
-        help="Upper bound for scale search. See --scale_search_min.",
+        "--l0_calibration_batches",
+        type=int,
+        default=1,
+        help="Number of batches from activation_data_path to use for L0 calibration step.",
     )
+    parser.add_argument(
+        "--l0_calibration_batch_size_tokens",
+        type=int,
+        default=None,
+        help="Batch size in tokens for L0 calibration. Defaults to l0_check_batch_size_tokens or estimation_batch_size_tokens.",
+    )
+    parser.add_argument(
+        "--l0_target_model_config_path",
+        type=str,
+        default=None,
+        help="Path to the original model's config JSON for L0 target calculation. Defaults to --config_path.",
+    )
+    parser.add_argument(
+        "--l0_target_model_checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to the original model's checkpoint for L0 target calculation. Defaults to --batchtopk_checkpoint_path.",
+    )
+    parser.add_argument(
+        "--l0_calibration_tolerance",
+        type=float,
+        default=0.5,
+        help="Tolerance (in number of active features) for matching target L0 during layer-wise calibration.",
+    )
+    parser.add_argument(
+        "--l0_calibration_search_min_scale",
+        type=float,
+        default=0.1,
+        help="Minimum scale factor for layer-wise L0 calibration search.",
+    )
+    parser.add_argument(
+        "--l0_calibration_search_max_scale",
+        type=float,
+        default=10.0,
+        help="Maximum scale factor for layer-wise L0 calibration search.",
+    )
+    parser.add_argument(
+        "--l0_calibration_max_iters",
+        type=int,
+        default=15,
+        help="Maximum iterations for binary search per layer during L0 calibration.",
+    )
+
     # Note: clt_dtype for the model will be taken from the loaded config_dict_batchtopk initially.
 
     args = parser.parse_args()
@@ -647,5 +879,6 @@ if __name__ == "__main__":
 #   --output_model_path clt_training_logs/clt_pythia_batchtopk_train_XYZ/final_jumprelu_sf1.5/clt_model_jumprelu.pt \\
 #   --output_config_path clt_training_logs/clt_pythia_batchtopk_train_XYZ/final_jumprelu_sf1.5/cfg_jumprelu.json \\
 #   --num_batches_for_theta_estimation 50 \\
-#   --scale_factor 1.5 \\
 #   --device cuda
+#   --l0_layerwise_calibrate \
+#   --l0_calibration_tolerance 0.2
