@@ -222,6 +222,43 @@ torchrun --nproc_per_node=4 scripts/train_clt.py \
 *   Ensure the activation data specified in the original `cli_args.json` (or provided in the resume command if `cli_args.json` is missing) is still accessible at the same path.
 *   If you modify critical architectural parameters (e.g., `--num-features`, `--model-name` leading to different `d_model` or `num_layers`) when resuming, it will likely lead to errors when loading the model weights.
 
+### Using Half-Precision (fp16/bf16)
+
+Using half-precision (like float16 or bfloat16) can significantly reduce memory footprint and potentially speed up both activation generation and model training, especially on compatible hardware.
+
+**1. For Activation Generation:**
+
+When generating activation datasets with `scripts/generate_activations.py`:
+*   Use the `--activation_dtype` argument to specify the precision for *storing* the activations. Options include `float16`, `bfloat16`, or `float32` (default).
+    ```bash
+    python scripts/generate_activations.py \
+        # ... other arguments ... \
+        --activation_dtype float16 # or bfloat16
+    ```
+*   **Benefit**: Storing activations in `float16` or `bfloat16` reduces disk space by roughly half compared to `float32`.
+
+**2. For CLT Model Training:**
+
+When training a CLT model with `scripts/train_clt.py`:
+*   Use the `--precision` argument to enable Automatic Mixed Precision (AMP) during training. Options are:
+    *   `fp16`: Uses float16 for many operations. Requires a GPU with good fp16 support (e.g., NVIDIA Turing architecture or newer).
+    *   `bf16`: Uses bfloat16. Generally more stable than fp16 for training and often preferred on newer GPUs that support it well (e.g., NVIDIA Ampere A100, Hopper H100).
+    *   `fp32`: Standard float32 training (default).
+    ```bash
+    # Example for bf16 training
+    torchrun --nproc_per_node=<num_gpus> scripts/train_clt.py \
+        # ... other arguments ... \
+        --precision bf16
+
+    # Example for fp16 training
+    torchrun --nproc_per_node=<num_gpus> scripts/train_clt.py \
+        # ... other arguments ... \
+        --precision fp16
+    ```
+*   **Benefit**: Reduces GPU memory usage significantly, allowing for larger models, more features, or bigger batch sizes. Can also lead to faster training on compatible hardware.
+*   **`--fp16-convert-weights`**: If you use `--precision fp16`, you can also add the `--fp16-convert-weights` flag. This will convert the model's actual weight parameters to `float16` in addition to using AMP. By default (`--fp16-convert-weights` not set), the master weights are kept in `float32` when using AMP with `fp16`. Converting weights further reduces memory but might slightly impact precision or training stability for some models.
+*   **`--clt-dtype`**: You can also specify the data type for the CLT model's parameters directly using `--clt-dtype` (e.g., `float16`, `bfloat16`). If using `--precision fp16` with `--fp16-convert-weights`, the model weights effectively become fp16. If using `--precision bf16`, the model weights also effectively become bf16. Setting `--clt-dtype` explicitly might be useful in specific scenarios or if not using the trainer's precision handling, but typically `--precision` is the primary way to control training precision.
+
 ## Converting BatchTopK/TopK Models to JumpReLU with L0 Calibration
 We strongly recommend using `batchtopk` (or `topk`) as the activation function (`--activation-fn batchtopk`). This allows the model to learn sparse features by dynamically selecting the top 'K' features globally (BatchTopK) or per-token (TopK).
 
