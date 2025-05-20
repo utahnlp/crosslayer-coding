@@ -73,7 +73,7 @@ d_model = 512
 expansion_factor = 32
 clt_num_features = d_model * expansion_factor
 
-topk_k_val = 100  # Can be a float for fraction or int for count
+topk_k_val = 200  # Can be a float for fraction or int for count
 
 clt_config = CLTConfig(
     num_features=clt_num_features,
@@ -181,7 +181,7 @@ training_config = TrainingConfig(
     dead_feature_window=200,
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-tutorial",
+    wandb_project="clt-hp-sweeps-pythia-70m",
     wandb_run_name=wdb_run_name,
 )
 print("\nTraining Configuration (TopK):")

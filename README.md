@@ -1,12 +1,22 @@
 # Cross-Layer Coding
 
-This library is intended for the training and analysis of cross-layer sparse coding models, including the Cross-Layer Transcoder as described in "[Circuit Tracing: Revealing Computational Graphs in Language Models](https://transformer-circuits.pub/2025/attribution-graphs/methods.html)"
+This library is intended for the training and analysis of cross-layer sparse coding models, including the Cross-Layer Transcoder as described in "[Circuit Tracing: Revealing Computational Graphs in Language Models](https://transformer-circuits.pub/2025/attribution-graphs/methods.html)". Currently, that is the only type of architecture supported, but in the future this will support other related models. The primary (and recommended) training strategy for this library is `BatchTopK`, converting this to a `JumpReLU` model afterwards. However, I've also included support for `JumpReLU`-native training, as well as `ReLU` and `TopK`, largely for the purpose of experimentation. 
 
-Currently, that is the only type of architecture supported, but in the future this will support skip-transcoders and other variants.
+**Key features:**
+- Fully tensor-parallel (expands across GPUs via the feature dimension)
+- Can train from locally-saved activations, activations saved on the included server and streamed to the training machines, or (soon) from streaming activations
+- Key activation functions and variants implemented
 
-## Overview
+## Overview and Workflow
 
 A Cross-Layer Transcoder (CLT) is a multi-layer dictionary learning model designed to extract sparse, interpretable features from transformers, using an encoder for each layer and a decoder for each (source layer, destination layer) pair (e.g., 12 encoders and 78 decoders for `gpt2-small`). This implementation focuses on the core functionality needed to train and use CLTs, leveraging `nnsight` for model introspection and `datasets` for data handling.
+
+Training a CLT involves the following steps:
+1.  Pre-generate activations with `scripts/generate_activations` (though an implementation of `StreamingActivationStore` is on the way).
+2.  Train a CLT (start with an expansion factor of at least `32`) using this data. Metrics can be logged to WandB. NMSE should get below `0.25`, or ideally even below `0.10`. As mentioned above, I recommend `BatchTopK` training, and suggest keeping `K` low--`200` is a good place to start.
+3.  Convert the model to a `JumpReLU` model using `convert_batch_topk_to_jumprelu.py`. This will estimate a threshold using the formula from the BatchTopK paper. However, this script also implements an additional layerwise calibration step that in practice often performs model performance even beyond what it was at the end of training.
+
+The model will be saved as a `safetensors` object that can be used for other steps, like dashboard generation with `SAEDashboard` or attribution graph computation with a forthcoming library soon to be linked here.
 
 ## Installation
 
@@ -212,30 +222,43 @@ torchrun --nproc_per_node=4 scripts/train_clt.py \
 *   Ensure the activation data specified in the original `cli_args.json` (or provided in the resume command if `cli_args.json` is missing) is still accessible at the same path.
 *   If you modify critical architectural parameters (e.g., `--num-features`, `--model-name` leading to different `d_model` or `num_layers`) when resuming, it will likely lead to errors when loading the model weights.
 
-## Converting BatchTopK Models to JumpReLU
-If you train a CLT model using `batchtopk` as the activation function (`--activation-fn batchtopk`), the learned thresholds are implicit. The `scripts/convert_batchtopk_to_jumprelu.py` script allows you to perform a post-hoc estimation of these thresholds from a dataset of activations and convert the model to use an explicit `jumprelu` activation function with these learned per-feature thresholds.
+## Converting BatchTopK/TopK Models to JumpReLU with L0 Calibration
+We strongly recommend using `batchtopk` (or `topk`) as the activation function (`--activation-fn batchtopk`). This allows the model to learn sparse features by dynamically selecting the top 'K' features globally (BatchTopK) or per-token (TopK).
+
+After training, these implicit thresholds can be converted to explicit, fixed per-feature thresholds for a `jumprelu` activation function. This conversion is performed by the `scripts/convert_batchtopk_to_jumprelu.py` script. The process involves:
+1. **Initial Theta Estimation**: The script first estimates initial per-feature thresholds by analyzing the minimum selected pre-activation values of features from the original model over a dataset.
+2. **Layer-wise L0 Calibration (Crucial Step)**: Since the initial conversion might not perfectly replicate the layer-wise L0 sparsity of the original model, an optional but highly recommended calibration step is performed if `--l0_layerwise_calibrate` is set. This step:
+    - Determines the target L0 norm (average number of active features per token) for each layer from the original BatchTopK/TopK model.
+    - Adjusts the per-feature JumpReLU thresholds in the converted model, layer by layer, to match these target L0s. This is done by finding a scaling factor for each layer's thresholds via binary search.
+This calibration helps ensure the converted JumpReLU model closely mimics the sparsity characteristics of the original, better preserving its performance.
 
 **Key Arguments for `scripts/convert_batchtopk_to_jumprelu.py`:**
 *   `--batchtopk-checkpoint-path`: Path to the saved BatchTopK model checkpoint directory (e.g., containing `clt.pt` and `cfg.json`).
 *   `--config-path`: Path to the JSON config file of the BatchTopK model (usually within the checkpoint dir).
-*   `--activation-data-path`: Path to an activation dataset (manifest directory) for theta estimation.
+*   `--activation-data-path`: Path to an activation dataset (manifest directory) for theta estimation and calibration.
 *   `--output-model-path`: Path to save the converted JumpReLU model's state_dict.
 *   `--output-config-path`: Path to save the converted JumpReLU model's config.
-*   `--num-batches-for-theta-estimation`: Number of batches to use for estimation.
-*   `--scale-factor`, `--default-theta-value`: Parameters for theta estimation.
+*   `--num-batches-for-theta-estimation`: Number of batches to use for initial theta estimation.
+*   `--default-theta_value`: Default threshold for features that never activated during estimation.
+*   `--l0_layerwise_calibrate`: Flag to enable the layer-wise L0 calibration (recommended).
+*   `--l0_calibration_batches`, `--l0_calibration_batch_size_tokens`: Parameters for data used during L0 calibration.
+*   `--l0_target_model_config_path`, `--l0_target_model_checkpoint_path`: Paths to the original model if different from the main input, for deriving L0 targets.
+*   `--l0_calibration_tolerance`, `--l0_calibration_search_min_scale`, `--l0_calibration_search_max_scale`, `--l0_calibration_max_iters`: Control parameters for the layer-wise calibration search.
 
 Run `python scripts/convert_batchtopk_to_jumprelu.py --help` for details.
 
 **Example Command:**
 ```bash
 python scripts/convert_batchtopk_to_jumprelu.py \\
-  --batchtopk-checkpoint-path /path/to/your/batchtopk_model_dir/final \\
-  --config-path /path/to/your/batchtopk_model_dir/cfg.json \\
-  --activation-data-path /path/to/your/activation_dataset \\
-  --output-model-path /path/to/your/batchtopk_model_dir/final_jumprelu/clt_model_jumprelu.pt \\
-  --output-config-path /path/to/your/batchtopk_model_dir/final_jumprelu/cfg_jumprelu.json \\
-  --num-batches-for-theta-estimation 100 \\
-  --scale-factor 1.0
+  --batchtopk_checkpoint_path /path/to/your/batchtopk_model_checkpoint_dir \\
+  --config_path /path/to/your/batchtopk_model_config.json \\
+  --activation_data_path /path/to/your/activation_dataset_for_estimation_and_calibration \\
+  --output_model_path /path/to/converted_jumprelu_model.pt \\
+  --output_config_path /path/to/converted_jumprelu_config.json \\
+  --num_batches_for_theta_estimation 100 \\
+  --l0_layerwise_calibrate \\
+  --l0_calibration_batches 10 \\
+  --l0_calibration_tolerance 0.5 # Adjust as needed
 ```
 
 ## Training with a Remote Activation Server
