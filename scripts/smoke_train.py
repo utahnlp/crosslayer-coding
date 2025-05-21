@@ -165,8 +165,9 @@ def main():
         remote_config=remote_config_dict_for_config,
         activation_dtype=consistent_activation_dtype_tc,
         normalization_method="auto",
-        sparsity_lambda=1e-4,  # For BatchTopK, ensure apply_sparsity_penalty_to_batchtopk is False if this is not desired
+        sparsity_lambda=0,  # For BatchTopK, ensure apply_sparsity_penalty_to_batchtopk is False if this is not desired
         apply_sparsity_penalty_to_batchtopk=False,  # Typically False if AuxK or other sparsity mechanism used with BatchTopK
+        aux_loss_factor=1 / 32,
         log_interval=5,
         eval_interval=10,
         checkpoint_interval=20,
