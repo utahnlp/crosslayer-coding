@@ -104,18 +104,38 @@ class CLTTrainer:
             # world_size is 1 if not distributed, rank is 0 (already initialized)
 
         # --- Mixed Precision Setup ---
-        self.mixed_precision = self.training_config.precision.lower()
-        self.use_cuda_amp = torch.cuda.is_available() and self.mixed_precision in {"fp16", "bf16"}
-        self.autocast_dtype = (
-            torch.float16
-            if self.mixed_precision == "fp16"
-            else torch.bfloat16 if self.mixed_precision == "bf16" else torch.float32
-        )
+        self.mixed_precision = self.training_config.precision.lower()  # fp32, fp16, bf16
+
+        self.autocast_enabled = False
+        self.autocast_dtype = torch.float32  # Default for fp32
+
+        if self.mixed_precision == "fp16":
+            if torch.cuda.is_available():
+                self.autocast_enabled = True
+                self.autocast_dtype = torch.float16
+                logger.info(f"Rank {self.rank}: Enabling CUDA autocast with float16.")
+            elif self.device.type == "mps":
+                self.autocast_enabled = True
+                self.autocast_dtype = torch.float16  # MPS supports float16
+                logger.info(f"Rank {self.rank}: Enabling MPS autocast with float16.")
+        elif self.mixed_precision == "bf16":
+            if torch.cuda.is_available():
+                self.autocast_enabled = True
+                self.autocast_dtype = torch.bfloat16
+                logger.info(f"Rank {self.rank}: Enabling CUDA autocast with bfloat16.")
+            elif self.device.type == "mps":
+                self.autocast_enabled = True
+                self.autocast_dtype = torch.bfloat16  # MPS supports bfloat16
+                logger.info(f"Rank {self.rank}: Enabling MPS autocast with bfloat16.")
+        # If self.mixed_precision is "fp32", autocast_enabled remains False, autocast_dtype remains float32
+
         # Initialize GradScaler (enabled only for fp16 on CUDA)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.mixed_precision == "fp16" and self.use_cuda_amp))
+        # MPS doesn't use GradScaler in the same way, typically.
+        # The warning is about autocast itself, not scaler.
+        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.mixed_precision == "fp16" and torch.cuda.is_available()))
 
         logger.info(
-            f"Rank {self.rank}: Mixed precision mode: {self.mixed_precision}, use_cuda_amp: {self.use_cuda_amp}, autocast_dtype: {self.autocast_dtype}"
+            f"Rank {self.rank}: Mixed precision mode: {self.mixed_precision}, autocast_enabled: {self.autocast_enabled}, autocast_dtype: {self.autocast_dtype}"
         )
         logger.info(f"Rank {self.rank}: GradScaler enabled: {self.scaler.is_enabled()}")
 
@@ -611,7 +631,9 @@ class CLTTrainer:
                 # --- Forward pass and compute loss --- (All ranks)
                 self.optimizer.zero_grad(set_to_none=True)
 
-                with torch.autocast(device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp):
+                with torch.autocast(
+                    device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled
+                ):
                     feature_activations_batch = self.model.get_feature_activations(inputs)
                     loss, loss_dict = self.loss_manager.compute_total_loss(
                         self.model,
@@ -760,7 +782,7 @@ class CLTTrainer:
                     # Compute evaluation metrics on all ranks to keep collective ops aligned
                     # Wrap the evaluation logic in autocast
                     with torch.autocast(
-                        device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.use_cuda_amp
+                        device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled
                     ):
                         current_dead_mask = self.dead_neurons_mask.detach().clone()
                         eval_metrics = self.evaluator.compute_metrics(
