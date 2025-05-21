@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from typing import Dict, Optional, Union, Tuple, cast, List
 import logging  # Import logging
 import torch.distributed as dist
@@ -15,6 +14,9 @@ from clt.models.encoding import get_preactivations as _get_preactivations_helper
 from clt.models.encoding import _encode_all_layers as _encode_all_layers_helper
 from clt.models.encoding import _apply_batch_topk_helper
 from clt.models.encoding import _apply_token_topk_helper
+
+# Import the activation registry
+from clt.activations.registry import get_activation_fn
 
 from torch.distributed import ProcessGroup
 
@@ -359,44 +361,24 @@ class CrossLayerTranscoder(BaseTranscoder):
             fallback_shape = (preact.shape[0], self.config.num_features)  # Try to keep batch dim
             fallback_tensor = torch.zeros(fallback_shape, device=self.device, dtype=self.dtype)
         else:
-            # Apply activation function to the full preactivation tensor
-            if self.config.activation_fn == "jumprelu":
-                activated = self.jumprelu(preact, layer_idx)
-            elif self.config.activation_fn == "relu":  # "relu"
-                activated = F.relu(preact)
-            elif self.config.activation_fn == "batchtopk":
-                # This 'encode' method should ideally not be called directly for batchtopk if
-                # get_feature_activations is used as the main entry point for it.
-                # However, if it is, we apply BatchTopK to this single layer's preactivations.
-                # This might not be the intended global behavior but handles the case.
-                logger.warning(
-                    f"Rank {self.rank}: 'encode' called for BatchTopK on layer {layer_idx}. This applies TopK per-layer, not globally. Use 'get_feature_activations' for global BatchTopK."
+            # Apply activation function to the full preactivation tensor using the registry
+            try:
+                activation_fn_callable = get_activation_fn(self.config.activation_fn)
+                activated = activation_fn_callable(self, preact, layer_idx)
+            except ValueError as e:  # Catch if activation function is not in registry
+                logger.error(
+                    f"Rank {self.rank}: Error getting activation function '{self.config.activation_fn}' for layer {layer_idx}: {e}"
                 )
-                k_val_local_int: int
-                if self.config.batchtopk_k is not None:
-                    k_val_local_int = int(self.config.batchtopk_k)
-                else:
-                    k_val_local_int = preact.size(1)
-
-                activated = BatchTopK.apply(preact, float(k_val_local_int), self.config.batchtopk_straight_through)
-
-            elif self.config.activation_fn == "topk":  # Added handling for 'topk'
-                logger.warning(
-                    f"Rank {self.rank}: 'encode' called for TopK on layer {layer_idx}. This applies TopK per-layer, not globally. Use 'get_feature_activations' for global TopK."
+                # Fallback to a zero tensor of the correct shape if activation function is invalid
+                fallback_shape = (preact.shape[0], self.config.num_features)
+                fallback_tensor = torch.zeros(fallback_shape, device=self.device, dtype=self.dtype)
+            except Exception as e:  # Catch any other unexpected errors during activation fn call
+                logger.error(
+                    f"Rank {self.rank}: Unexpected error during activation function '{self.config.activation_fn}' for layer {layer_idx}: {e}"
                 )
-                k_val_local_float: float
-                if hasattr(self.config, "topk_k") and self.config.topk_k is not None:
-                    k_val_local_float = float(self.config.topk_k)
-                else:  # Default to keeping all features for this layer if topk_k not set
-                    k_val_local_float = float(preact.size(1))
-
-                # Get topk_straight_through from config, default to True
-                straight_through_local = getattr(self.config, "topk_straight_through", True)
-                # TokenTopK.apply takes the original preactivation, k, straight_through, and optional ranking tensor
-                # For per-layer application, we don't have a separate normalized ranking tensor readily available here,
-                # so we pass preact itself for ranking. Normalization would ideally happen inside TokenTopK if needed
-                # or be handled if this path were to be seriously supported (it's a fallback/warning path).
-                activated = TokenTopK.apply(preact, k_val_local_float, straight_through_local, preact)
+                # Fallback to a zero tensor of the correct shape
+                fallback_shape = (preact.shape[0], self.config.num_features)
+                fallback_tensor = torch.zeros(fallback_shape, device=self.device, dtype=self.dtype)
 
         # Return activated tensor or fallback
         if activated is not None:
