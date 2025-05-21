@@ -202,8 +202,8 @@ server_data/
 tutorials/old/
 clt_remote_runs/
 *tutorial_activations*/
-
-
+vis/
+clt_test_pythia_70m_jumprelu/
 
 # models
 *.pt
