@@ -714,7 +714,6 @@ class CLTTrainer:
                         sys.stdout.flush()
 
                 # --- Log metrics --- (Rank 0 logs to WandB/file)
-                # self._log_metrics(step, loss_dict) # Old call
                 current_lr_for_log = self.scheduler.get_last_lr()[0] if self.scheduler else None
                 current_lambda_for_log = self.loss_manager.get_current_sparsity_lambda()
                 self.metric_logger.log_training_step(
@@ -798,14 +797,12 @@ class CLTTrainer:
                             sparsity_diag_metrics = compute_sparsity_diagnostics(
                                 model=self.model,
                                 training_config=self.training_config,
-                                feature_activations=feature_activations_batch,  # This uses activations from training step
+                                feature_activations=feature_activations_batch,
                             )
                             # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
                             if (not self.distributed) or (self.rank == 0):
                                 if sparsity_diag_metrics:
                                     eval_metrics.update(sparsity_diag_metrics)
-                                    # Logging of eval_metrics including sparsity_diag happens later by MetricLogger
-                                    # self.wandb_logger.log_evaluation(step, eval_metrics) # This was an old direct call
 
                     # --- END of autocast block for evaluation ---
 
@@ -926,21 +923,6 @@ class CLTTrainer:
             print(f"Saving CLT configuration (as trained) to {config_save_path}...")
             try:
                 config_dict_as_trained = asdict(self.clt_config)
-                # Remove accesses to attributes no longer in TrainingConfig
-                # model_name = None
-                # if (
-                #     hasattr(self.training_config, "generation_config")
-                #     and self.training_config.generation_config is not None
-                #     and "model_name" in self.training_config.generation_config
-                # ):
-                #     model_name = self.training_config.generation_config["model_name"]
-                #     config_dict_as_trained["model_name"] = model_name
-                # elif (
-                #     hasattr(self.training_config, "activation_config")
-                #     and hasattr(self.training_config.activation_config, "model_name")
-                #     and self.training_config.activation_config.model_name is not None
-                # ):
-                #     config_dict_as_trained["model_name"] = self.training_config.activation_config.model_name
 
                 # Attempt to add model_name if available in clt_config itself
                 if hasattr(self.clt_config, "model_name") and self.clt_config.model_name:

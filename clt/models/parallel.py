@@ -33,7 +33,7 @@ class _ParallelLinear(nn.Module):
         if process_group is None or not dist.is_initialized():
             self.world_size = 1
             self.rank = 0
-            self.process_group = None  # Ensure it's None if not initialized
+            self.process_group = None
         else:
             self.world_size = dist.get_world_size(process_group)
             self.rank = dist.get_rank(process_group)
@@ -52,37 +52,32 @@ class _ParallelLinear(nn.Module):
             self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
             if bias:
                 self.bias_param = nn.Parameter(torch.empty(self.local_out_features, device=device))
-                # DO NOT mark_replicated here, ColumnParallel bias is sharded
         elif partition_dim == 1:  # Row Parallelism (Input features sharded)
             # Calculate padded size for uniform distribution
             self.local_in_features = math.ceil(in_features / self.world_size)
             self.local_out_features = out_features
             self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
             if bias:
-                # Bias is added *after* the all-reduce, so it's not sharded (globally, but replicated on each rank)
                 self.bias_param = nn.Parameter(torch.empty(out_features, device=device))
-                mark_replicated(self.bias_param)  # Mark as replicated
+                mark_replicated(self.bias_param)
         else:
             raise ValueError("partition_dim must be 0 or 1")
 
         # Initialize weights (ensure consistency across ranks if needed)
         # Default init methods often depend on full shapes. We might need custom init.
         # Simplified init for CLT (matching original CLT init logic)
-        if partition_dim == 0:  # Encoder-like
-            # Bound depends on *full* output dimension
-            bound = 1.0 / math.sqrt(self.full_out_features)  # Use full dim
+        if partition_dim == 0:
+            bound = 1.0 / math.sqrt(self.full_out_features)
             nn.init.uniform_(self.weight, -bound, bound)
             if bias:
                 nn.init.zeros_(self.bias_param)
-        elif partition_dim == 1:  # Decoder-like
-            # Use passed d_model and num_layers for initialization bound
+        elif partition_dim == 1:
             if d_model_for_init is None or num_layers_for_init is None:
                 raise ValueError("d_model_for_init and num_layers_for_init must be provided for RowParallelLinear init")
-            # Bound depends on full input dimension (num_features) and model config
             bound = 1.0 / math.sqrt(num_layers_for_init * d_model_for_init)
             nn.init.uniform_(self.weight, -bound, bound)
             if bias:
-                nn.init.zeros_(self.bias_param)  # Initialize full bias on all ranks, will be reduced
+                nn.init.zeros_(self.bias_param)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         raise NotImplementedError
@@ -224,8 +219,7 @@ def _reduce(input_, process_group):
     input_ = input_.contiguous()
 
     # Perform the all-reduce with **SUM** operation (the correct aggregation for TP)
-    # return input_ # Old implementation
-    return _Reduce.apply(input_, process_group)  # Use autograd function
+    return _Reduce.apply(input_, process_group)
 
 
 def _split(input_, process_group, dim=-1):
@@ -290,7 +284,6 @@ class ColumnParallelLinear(_ParallelLinear):
             init_method=init_method,
             input_is_parallel=False,  # Input is full
             keep_master_weight=keep_master_weight,
-            # Pass None for row parallel init args
             d_model_for_init=None,
             num_layers_for_init=None,
             device=device,
@@ -342,7 +335,6 @@ class RowParallelLinear(_ParallelLinear):
             init_method=init_method,
             input_is_parallel=input_is_parallel,
             keep_master_weight=keep_master_weight,
-            # Pass specific init args
             d_model_for_init=d_model_for_init,
             num_layers_for_init=num_layers_for_init,
             device=device,
