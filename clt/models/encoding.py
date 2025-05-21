@@ -27,6 +27,7 @@ def get_preactivations(
     """Get pre-activation values (full tensor) for features at the specified layer."""
     result: Optional[torch.Tensor] = None
     fallback_shape: Optional[Tuple[int, int]] = None
+    input_for_linear: Optional[torch.Tensor] = None  # Initialize to handle cases where it might not be set before use
 
     try:
         # 1. Check input shape and reshape if necessary
@@ -41,35 +42,69 @@ def get_preactivations(
                 input_for_linear = x.reshape(-1, d_model)
         else:
             logger.warning(f"Rank {rank}: Cannot handle input shape {x.shape} for preactivations layer {layer_idx}")
-            fallback_shape = (0, config.num_features)
+            # Attempt to determine a batch dimension for fallback, even if it's just the first dim
+            fallback_batch_dim = x.shape[0] if x.dim() > 0 else 0
+            fallback_shape = (fallback_batch_dim, config.num_features)
 
-        # 2. Check d_model match if not already done
-        if fallback_shape is None and input_for_linear.shape[1] != config.d_model:
-            logger.warning(
-                f"Rank {rank}: Input d_model {input_for_linear.shape[1]} != config {config.d_model} layer {layer_idx}"
+        # 2. Check d_model match if not already done and input_for_linear was set
+        if fallback_shape is None and input_for_linear is not None:
+            if input_for_linear.shape[1] != config.d_model:
+                logger.warning(
+                    f"Rank {rank}: Input d_model {input_for_linear.shape[1]} != config {config.d_model} layer {layer_idx}"
+                )
+                fallback_shape = (input_for_linear.shape[0], config.num_features)
+        elif fallback_shape is None and input_for_linear is None:
+            # This case implies x.dim() was not 2 or 3, or x.dim()==3 but d_model mismatch led to fallback_shape already
+            # If fallback_shape is still None here, it means the initial x.dim() check didn't set it,
+            # and input_for_linear is also None. This is an unexpected state if we expect a tensor out.
+            logger.error(
+                f"Rank {rank}: Could not determine input for linear layer {layer_idx} and no fallback shape set. Input x.shape: {x.shape}"
             )
-            fallback_shape = (input_for_linear.shape[0], config.num_features)
+            # Ensure fallback_shape is set to something reasonable
+            fallback_batch_dim = x.shape[0] if x.dim() > 0 else 0
+            fallback_shape = (fallback_batch_dim, config.num_features)
 
-        # 3. Proceed if no errors so far
-        if fallback_shape is None:
+        # 3. Proceed if no errors so far (i.e. fallback_shape is still None)
+        if fallback_shape is None and input_for_linear is not None:
             # Explicitly cast the output of the parallel linear layer
             result = cast(torch.Tensor, encoders[layer_idx](input_for_linear))
+        elif fallback_shape is None and input_for_linear is None:
+            # This condition should ideally be caught by the checks above.
+            # If we reach here, it implies an unhandled case or logic error.
+            logger.error(
+                f"Rank {rank}: Critical logic error in get_preactivations for layer {layer_idx}. input_for_linear is None and fallback_shape is None. Input x.shape: {x.shape}"
+            )
+            # Force a fallback_shape to prevent returning None from the function, though this indicates a problem.
+            fallback_batch_dim = x.shape[0] if x.dim() > 0 else 0  # Default batch dim
+            fallback_shape = (fallback_batch_dim, config.num_features)
 
-    except IndexError:
-        logger.error(f"Rank {rank}: Invalid layer index {layer_idx} requested for encoder.")
-        fallback_batch_dim = x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1] if x.dim() == 3 else 0
+    except IndexError:  # Specific exception for out-of-bounds access to encoders list
+        logger.error(
+            f"Rank {rank}: Invalid layer index {layer_idx} requested for encoder. Max index is {len(encoders) - 1}."
+        )
+        # Determine fallback batch dimension more robustly
+        if x.dim() == 2:
+            fallback_batch_dim = x.shape[0]
+        elif x.dim() == 3:
+            fallback_batch_dim = x.shape[0] * x.shape[1]
+        elif x.dim() > 0:  # Handle other dimensionalities if they occur
+            fallback_batch_dim = x.shape[0]
+        else:  # 0-dim tensor or other unexpected case
+            fallback_batch_dim = 0
         fallback_shape = (fallback_batch_dim, config.num_features)
-    except Exception as e:
-        logger.error(f"Rank {rank}: Error during get_preactivations layer {layer_idx}: {e}", exc_info=True)
-        fallback_batch_dim = x.shape[0] if x.dim() == 2 else x.shape[0] * x.shape[1] if x.dim() == 3 else 0
-        fallback_shape = (fallback_batch_dim, config.num_features)
+    # Removed broad `except Exception as e`
 
     # 4. Return result or fallback tensor
     if result is not None:
         return result
     else:
         if fallback_shape is None:
-            logger.error(f"Rank {rank}: Fallback shape not determined for layer {layer_idx}, returning empty tensor.")
+            # This state should ideally not be reached if logic above is correct.
+            # It means no result was computed, and no fallback_shape was determined.
+            logger.error(
+                f"Rank {rank}: Fallback shape not determined for layer {layer_idx}, and no result. Input x.shape: {x.shape}. Returning empty tensor."
+            )
+            # Default to a completely empty tensor if all else fails
             fallback_shape = (0, config.num_features)
         return torch.zeros(fallback_shape, device=model_device, dtype=model_dtype)
 

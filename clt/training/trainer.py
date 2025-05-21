@@ -42,6 +42,8 @@ class CLTTrainer:
     activation_store: BaseActivationStore
     # Model type hint
     model: CrossLayerTranscoder
+    # WandB logger can be real or dummy
+    wandb_logger: Union[WandBLogger, DummyWandBLogger]
 
     def __init__(
         self,
@@ -568,13 +570,6 @@ class CLTTrainer:
                     if self.distributed:
                         dist.barrier()  # Ensure all ranks see this
                     break  # Exit training loop if data runs out
-                except Exception as e:
-                    # Rank 0 prints message
-                    if not self.distributed or self.rank == 0:
-                        print(f"\nRank {self.rank}: Error getting batch at step {step}: {e}. Skipping step.")
-                    # Maybe barrier here too? If one rank fails, others might hang?
-                    # Let's continue for now, assuming store handles internal errors.
-                    continue
 
                 # --- Check for empty batch --- (Optional but good practice)
                 # This check should ideally happen *before* moving data potentially
