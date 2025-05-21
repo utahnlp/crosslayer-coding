@@ -27,92 +27,90 @@ logger = logging.getLogger(__name__)
 class CrossLayerTranscoder(BaseTranscoder):
     """Implementation of a Cross-Layer Transcoder (CLT) with tensor parallelism."""
 
-    # --- Cache --- #
     _cached_decoder_norms: Optional[torch.Tensor] = None
     _min_selected_preact: Optional[torch.Tensor]
+    _sum_min_selected_preact: Optional[torch.Tensor]
+    _count_min_selected_preact: Optional[torch.Tensor]
+    _avg_layer_means: Optional[torch.Tensor]
+    _avg_layer_stds: Optional[torch.Tensor]
+    _processed_batches_for_stats: Optional[torch.Tensor]
 
     def __init__(
         self,
         config: CLTConfig,
-        process_group: Optional["ProcessGroup"],  # Allow None for non-distributed
+        process_group: Optional["ProcessGroup"],
         device: Optional[torch.device] = None,
     ):
         """Initialize the Cross-Layer Transcoder.
 
+        The encoder matrices use ColumnParallelLinear, sharding output features.
+        The decoder matrices use RowParallelLinear, sharding input features (i.e., the CLT features).
+        The `log_threshold` for JumpReLU is a per-layer, per-feature parameter, marked as replicated.
+        Buffers `_sum_min_selected_preact` and `_count_min_selected_preact` are used for
+        on-the-fly theta estimation if converting from BatchTopK/TokenTopK to JumpReLU.
+
         Args:
-            config: Configuration for the transcoder
-            process_group: The process group for tensor parallelism (or None)
-            device: Optional device to initialize the model parameters on.
+            config: Configuration for the transcoder.
+            process_group: The process group for tensor parallelism. If None, the model operates
+                in a non-distributed manner.
+            device: Optional device to initialize the model parameters on. If None, behavior depends
+                on subsequent calls or available hardware.
         """
         super().__init__(config)
 
         self.process_group = process_group
-        # Handle non-distributed case for rank/world_size
         if process_group is None or not dist.is_initialized():
             self.world_size = 1
             self.rank = 0
-            self.process_group = None  # Ensure it's None
+            self.process_group = None
         else:
             self.world_size = dist.get_world_size(process_group)
             self.rank = dist.get_rank(process_group)
 
-        self.device = device  # Store device if provided
+        self.device = device
         self.dtype = self._resolve_dtype(config.clt_dtype)
 
-        # Create encoder matrices for each layer using ColumnParallelLinear
         self.encoders = nn.ModuleList(
             [
                 ColumnParallelLinear(
                     in_features=config.d_model,
                     out_features=config.num_features,
                     bias=True,
-                    process_group=self.process_group,  # Pass potentially None group
-                    device=self.device,  # Pass device
+                    process_group=self.process_group,
+                    device=self.device,
                 )
                 for _ in range(config.num_layers)
             ]
         )
 
-        # Create decoder matrices for each layer pair using RowParallelLinear
         self.decoders = nn.ModuleDict(
             {
                 f"{src_layer}->{tgt_layer}": RowParallelLinear(
-                    in_features=config.num_features,  # Full feature dim
+                    in_features=config.num_features,
                     out_features=config.d_model,
                     bias=True,
-                    process_group=self.process_group,  # Pass potentially None group
-                    input_is_parallel=False,  # Decoder receives full activation, splits internally
-                    # Pass model dims needed for init
+                    process_group=self.process_group,
+                    input_is_parallel=False,
                     d_model_for_init=config.d_model,
                     num_layers_for_init=config.num_layers,
-                    device=self.device,  # Pass device
+                    device=self.device,
                 )
                 for src_layer in range(config.num_layers)
                 for tgt_layer in range(src_layer, config.num_layers)
             }
         )
 
-        # Initialize log_threshold parameter - should be replicated on all ranks
-        # Gradients will be implicitly averaged by the autograd engine during backward
-        # across data parallel replicas, but for TP, we might need manual handling if issues arise.
-        # For now, keep as standard parameter.
         if self.config.activation_fn == "jumprelu":
-            # Initialize per-layer thresholds
-            initial_threshold_val = torch.ones(
-                config.num_layers, config.num_features  # Shape: [num_layers, num_features]
-            ) * torch.log(torch.tensor(config.jumprelu_threshold))
+            initial_threshold_val = torch.ones(config.num_layers, config.num_features) * torch.log(
+                torch.tensor(config.jumprelu_threshold)
+            )
             self.log_threshold = nn.Parameter(initial_threshold_val.to(device=self.device, dtype=self.dtype))
-            mark_replicated(self.log_threshold)  # Mark as replicated
+            mark_replicated(self.log_threshold)
 
-        self.bandwidth = 1.0  # Bandwidth parameter for straight-through estimator
+        self.bandwidth = 1.0
 
-        # Buffers for on-the-fly theta estimation (BatchTopK → JumpReLU)
-        # Create the attributes for type consistency, will be populated by estimate_theta_posthoc if needed
         self.register_buffer("_sum_min_selected_preact", None, persistent=False)
         self.register_buffer("_count_min_selected_preact", None, persistent=False)
-
-        # No need to call _init_parameters separately, it's handled in ParallelLinear init
-        # self._init_parameters() # Remove this call
 
         if self.device:
             logger.info(f"CLT TP model initialized on rank {self.rank} device {self.device} with dtype {self.dtype}")
@@ -250,6 +248,7 @@ class CrossLayerTranscoder(BaseTranscoder):
         if (
             not hasattr(self, "_sum_min_selected_preact")
             or self._sum_min_selected_preact is None
+            or not hasattr(self, "_count_min_selected_preact")
             or self._count_min_selected_preact is None
         ):
             if self.config.activation_fn == "batchtopk":
@@ -655,8 +654,31 @@ class CrossLayerTranscoder(BaseTranscoder):
     def get_decoder_norms(self) -> torch.Tensor:
         """Get L2 norms of all decoder matrices for each feature (gathered across ranks).
 
+        The decoders are of type `RowParallelLinear`. Their weights are sharded across the
+        input feature dimension (CLT features). Each feature's decoder weight vector
+        (across all target layers) resides on a single rank.
+
+        The computation proceeds as follows:
+        1. For each source CLT layer (`src_layer`):
+           a. Initialize a local accumulator for squared norms (`local_norms_sq_accum`)
+              for all features, matching the model's device and float32 for precision.
+           b. For each target model layer (`tgt_layer`) that this `src_layer` decodes to:
+              i. Get the corresponding `RowParallelLinear` decoder module.
+              ii. Access its local weight shard (`decoder.weight`, shape [d_model, local_num_features]).
+              iii. Compute L2 norm squared for each column (feature) in this local shard.
+              iv. Determine the global indices for the features this rank owns.
+              v. Add these squared norms to the corresponding global slice in `local_norms_sq_accum`.
+           c. All-reduce `local_norms_sq_accum` across all ranks using SUM operation.
+              This sums the squared norm contributions for each feature from the rank that owns it.
+           d. Take the square root of the summed squared norms and cast to the model's dtype.
+              Store this in the `full_decoder_norms` tensor for the current `src_layer`.
+        2. Cache and return `full_decoder_norms`.
+
+        The norms are cached in `self._cached_decoder_norms` to avoid recomputation.
+
         Returns:
-            Tensor of shape [num_layers, num_features] containing decoder norms
+            Tensor of shape [num_layers, num_features] containing L2 norms of decoder
+            weights for each feature, applicable for sparsity calculations.
         """
         if self._cached_decoder_norms is not None:
             return self._cached_decoder_norms
@@ -765,7 +787,6 @@ class CrossLayerTranscoder(BaseTranscoder):
         if target_device != original_device:
             self.to(target_device)
 
-        # Initialize buffers for summing normalized preactivations and counts
         if not hasattr(self, "_sum_min_selected_preact") or self._sum_min_selected_preact is None:
             self.register_buffer(
                 "_sum_min_selected_preact",
@@ -777,7 +798,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 persistent=False,
             )
         else:
-            # Ensure it's on the correct device and zeroed out
+            assert isinstance(self._sum_min_selected_preact, torch.Tensor)
             self._sum_min_selected_preact = self._sum_min_selected_preact.to(target_device)
             self._sum_min_selected_preact.data.zero_()
 
@@ -792,16 +813,17 @@ class CrossLayerTranscoder(BaseTranscoder):
                 persistent=False,
             )
         else:
+            assert isinstance(self._count_min_selected_preact, torch.Tensor)
             self._count_min_selected_preact = self._count_min_selected_preact.to(target_device)
             self._count_min_selected_preact.data.zero_()
 
-        # Initialize buffers for averaging layer-wise normalization statistics (mu and sigma)
         buffer_shape = (self.config.num_layers, self.config.num_features)
         if not hasattr(self, "_avg_layer_means") or self._avg_layer_means is None:
             self.register_buffer(
                 "_avg_layer_means", torch.zeros(buffer_shape, dtype=self.dtype, device=target_device), persistent=False
             )
         else:
+            assert isinstance(self._avg_layer_means, torch.Tensor)
             self._avg_layer_means = self._avg_layer_means.to(target_device)
             self._avg_layer_means.data.zero_()
 
@@ -810,6 +832,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 "_avg_layer_stds", torch.zeros(buffer_shape, dtype=self.dtype, device=target_device), persistent=False
             )
         else:
+            assert isinstance(self._avg_layer_stds, torch.Tensor)
             self._avg_layer_stds = self._avg_layer_stds.to(target_device)
             self._avg_layer_stds.data.zero_()
 
@@ -820,6 +843,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 persistent=False,
             )
         else:
+            assert isinstance(self._processed_batches_for_stats, torch.Tensor)
             self._processed_batches_for_stats = self._processed_batches_for_stats.to(target_device)
             self._processed_batches_for_stats.data.zero_()
 
@@ -1014,10 +1038,10 @@ class CrossLayerTranscoder(BaseTranscoder):
             and hasattr(self, "_avg_layer_stds")
             and self._avg_layer_stds is not None
         ):
-
-            active_stat_batches = self._processed_batches_for_stats.data.unsqueeze(-1).clamp_min(
-                1.0
-            )  # ensure broadcasting
+            assert isinstance(self._processed_batches_for_stats, torch.Tensor)
+            active_stat_batches = self._processed_batches_for_stats.data.unsqueeze(-1).clamp_min(1.0)
+            assert isinstance(self._avg_layer_means, torch.Tensor)
+            assert isinstance(self._avg_layer_stds, torch.Tensor)
             self._avg_layer_means.data /= active_stat_batches
             self._avg_layer_stds.data /= active_stat_batches
             logger.info(f"Rank {self.rank}: Averaged layer-wise normalization stats computed.")

@@ -50,6 +50,18 @@ class ChunkRowSampler(Sampler):
 
     Strides by GPU rank so there is no overlap (if shard_data=True).
     Yields (batch, 2) numpy arrays containing [chunk_id, row_id].
+
+    Args:
+        chunk_sizes: Dictionary mapping chunk_id to size or a NumPy array of sizes.
+        num_chunks: Total number of chunks.
+        batch: Batch size.
+        seed: Base seed for the run.
+        epoch: Current epoch number.
+        rank: Rank of the current process.
+        world: Total number of processes.
+        sampling_strategy: 'sequential' or 'random_chunk'.
+        shard_data: If True, data is sharded across ranks.
+        initial_sampler_state: Optional dictionary to restore sampler state.
     """
 
     def __init__(
@@ -61,22 +73,20 @@ class ChunkRowSampler(Sampler):
         epoch: int,
         rank: int,
         world: int,
-        sampling_strategy: str = "sequential",  # Added sampling strategy
-        shard_data: bool = True,  # ---> ADDED PARAMETER <---
-        initial_sampler_state: Optional[Dict[str, Any]] = None,  # For restoring state
+        sampling_strategy: str = "sequential",
+        shard_data: bool = True,
+        initial_sampler_state: Optional[Dict[str, Any]] = None,
     ):
-        # Handle chunk_sizes as either a dict mapping chunk_id → size or an array of sizes
         if isinstance(chunk_sizes, dict):
             self.chunk_sizes = chunk_sizes
         else:
-            # Create dict from array (index → size)
             self.chunk_sizes = {i: int(size) for i, size in enumerate(chunk_sizes) if size > 0}
 
         self.batch = batch
         self.rank = rank
         self.world = world
         self.num_chunks = num_chunks
-        self.seed = seed  # Base seed for the run
+        self.seed = seed
         self.epoch = epoch
         self.shard_data = shard_data
 
@@ -324,27 +334,40 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
     Subclasses must implement fetching mechanisms for metadata, manifest,
     norm stats, and the core `_fetch_slice` method.
+
+    Args:
+        train_batch_size_tokens: Target number of tokens per training batch.
+        device: PyTorch device for tensor operations.
+        dtype: PyTorch dtype for activation tensors. Defaults to 'bfloat16'.
+        rank: Rank of the current process in distributed training.
+        world: Total number of processes in distributed training.
+        seed: Base random seed for reproducibility.
+        sampling_strategy: Strategy for `ChunkRowSampler` ('sequential' or 'random_chunk').
+        normalization_method: Method for normalizing activations ('none' or others).
+        prefetch_batches: Number of batches to prefetch asynchronously (1 means no prefetching).
+        shard_data: If True, data is sharded across ranks by the `ChunkRowSampler`.
+        initial_store_state: Optional dictionary to restore store and sampler state for resumption.
     """
 
     def __init__(
         self,
         train_batch_size_tokens: int = 4096,
         device: torch.device | str | None = None,
-        dtype: torch.dtype | str = "bfloat16",  # Default to bf16 as per new generator standard
+        dtype: torch.dtype | str = "bfloat16",
         rank: int = 0,
         world: int = 1,
         seed: int = 42,
-        sampling_strategy: str = "sequential",  # Added sampling strategy
-        normalization_method: str = "none",  # Added normalization method
-        prefetch_batches: int = 1,  # Number of batches to prefetch (1 means no prefetching)
-        shard_data: bool = True,  # ---> ADDED PARAMETER <---
-        initial_store_state: Optional[Dict[str, Any]] = None,  # For restoring store + sampler state
+        sampling_strategy: str = "sequential",
+        normalization_method: str = "none",
+        prefetch_batches: int = 1,
+        shard_data: bool = True,
+        initial_store_state: Optional[Dict[str, Any]] = None,
     ):
-        self.train_batch_size_tokens = train_batch_size_tokens  # From Base
+        self.train_batch_size_tokens = train_batch_size_tokens
         self.rank = rank
         self.world = world
-        self.seed = seed  # Base seed for the run
-        self.epoch = 0  # Initial epoch, will be overridden by initial_store_state if provided
+        self.seed = seed
+        self.epoch = 0
         self.prefetch_batches = max(1, prefetch_batches)
         self.sampling_strategy = sampling_strategy
         self.shard_data = shard_data
