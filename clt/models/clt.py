@@ -165,10 +165,16 @@ class CrossLayerTranscoder(BaseTranscoder):
     def jumprelu(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Apply JumpReLU activation function for a specific layer."""
         # Select the threshold for the given layer
-        if not hasattr(self, "log_threshold") or self.log_threshold is None:
-            # This should ideally not happen if config.activation_fn == "jumprelu"
-            logger.error(f"Rank {self.rank}: log_threshold not initialized for JumpReLU. Returning input.")
+        if not hasattr(self, "log_threshold"):  # Parameter might not exist if not jumprelu
+            logger.error(f"Rank {self.rank}: log_threshold attribute not initialized for JumpReLU. Returning input.")
             return x
+        if (
+            self.log_threshold is None
+        ):  # Parameter exists but is None (e.g. if activation was BatchTopK and conversion hasn't happened)
+            raise RuntimeError(
+                f"Rank {self.rank}: log_threshold is None. JumpReLU cannot be applied. "
+                "Ensure model is configured for JumpReLU or conversion from another activation type has been performed."
+            )
         if layer_idx >= self.log_threshold.shape[0]:
             logger.error(
                 f"Rank {self.rank}: Invalid layer_idx {layer_idx} for log_threshold with shape {self.log_threshold.shape}. Returning input."
@@ -1253,7 +1259,7 @@ class CrossLayerTranscoder(BaseTranscoder):
 
             except ImportError:
                 logger.info("WandB not installed, skipping raw theta distribution logging.")
-            except Exception as e:
+            except (RuntimeError, ValueError) as e:  # More specific exceptions for tensor/logging issues
                 logger.error(f"Rank {self.rank}: Error logging raw theta distributions to WandB: {e}")
 
         # Clamp final raw thetas before log to ensure they are positive for torch.log

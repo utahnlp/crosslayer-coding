@@ -60,7 +60,7 @@ def get_preactivations(
             logger.error(
                 f"Rank {rank}: Could not determine input for linear layer {layer_idx} and no fallback shape set. Input x.shape: {x.shape}"
             )
-            # Ensure fallback_shape is set to something reasonable
+            # Ensure fallback_shape is set to something reasonable (e.g. using x.shape[0] if available)
             fallback_batch_dim = x.shape[0] if x.dim() > 0 else 0
             fallback_shape = (fallback_batch_dim, config.num_features)
 
