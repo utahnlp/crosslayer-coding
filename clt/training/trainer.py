@@ -42,6 +42,8 @@ class CLTTrainer:
     activation_store: BaseActivationStore
     # Model type hint
     model: CrossLayerTranscoder
+    # WandB logger can be real or dummy
+    wandb_logger: Union[WandBLogger, DummyWandBLogger]
 
     def __init__(
         self,
@@ -568,13 +570,6 @@ class CLTTrainer:
                     if self.distributed:
                         dist.barrier()  # Ensure all ranks see this
                     break  # Exit training loop if data runs out
-                except Exception as e:
-                    # Rank 0 prints message
-                    if not self.distributed or self.rank == 0:
-                        print(f"\nRank {self.rank}: Error getting batch at step {step}: {e}. Skipping step.")
-                    # Maybe barrier here too? If one rank fails, others might hang?
-                    # Let's continue for now, assuming store handles internal errors.
-                    continue
 
                 # --- Check for empty batch --- (Optional but good practice)
                 # This check should ideally happen *before* moving data potentially
@@ -630,7 +625,7 @@ class CLTTrainer:
 
                 # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
                 # We need *full* feature activations *after* non-linearity
-                if hasattr(self, "n_forward_passes_since_fired"):
+                if hasattr(self, "n_forward_passes_since_fired") and self.n_forward_passes_since_fired is not None:
                     with torch.no_grad():
                         for layer_idx, layer_acts in feature_activations_batch.items():
                             # Ensure layer index is within bounds of the counter tensor
@@ -644,20 +639,38 @@ class CLTTrainer:
                                         self.n_forward_passes_since_fired[layer_idx] += 1
                                         self.n_forward_passes_since_fired[layer_idx][fired_features_this_layer] = 0
                                     else:
-                                        if not self.distributed or self.rank == 0:  # Only rank 0 logs warning
-                                            print(
-                                                f"Rank {self.rank}: Warning: Shape mismatch for dead neuron update at layer {layer_idx}. "
+                                        # Log warning only on rank 0 to avoid flooding logs
+                                        if not self.distributed or self.rank == 0:
+                                            logger.warning(
+                                                f"Rank {self.rank}: Shape mismatch for dead neuron update at layer {layer_idx}. "
                                                 f"Acts shape: {layer_acts.shape}, Fired mask: {fired_features_this_layer.shape}, "
                                                 f"Counter: {self.n_forward_passes_since_fired.shape}"
                                             )
+                                else:  # layer_acts.numel() == 0
+                                    if not self.distributed or self.rank == 0:
+                                        logger.debug(
+                                            f"Rank {self.rank}: Layer {layer_idx} has empty activations, skipping dead neuron update for this layer."
+                                        )
+                            else:  # layer_idx out of bounds
+                                if not self.distributed or self.rank == 0:
+                                    logger.warning(
+                                        f"Rank {self.rank}: layer_idx {layer_idx} out of bounds for n_forward_passes_since_fired (shape {self.n_forward_passes_since_fired.shape}). Skipping dead neuron update."
+                                    )
+                else:  # n_forward_passes_since_fired does not exist or is None
+                    if not self.distributed or self.rank == 0:
+                        logger.warning(
+                            f"Rank {self.rank}: n_forward_passes_since_fired not available. Skipping dead neuron update."
+                        )
 
                 # --- Backward pass --- (All ranks, handles communication implicitly)
                 if torch.isnan(loss):
                     if not self.distributed or self.rank == 0:
-                        print(
+                        logger.warning(
                             f"\nRank {self.rank}: Warning: NaN loss encountered at step {step}. "
                             f"Skipping backward pass and optimizer step."
                         )
+                        # Log detailed loss_dict for NaN debugging
+                        logger.warning(f"Rank {self.rank}: NaN Loss - Detailed loss_dict at step {step}: {loss_dict}")
                 else:
                     # ---- Back-prop with gradient scaling ----
                     self.scaler.scale(loss).backward()
@@ -716,6 +729,7 @@ class CLTTrainer:
                 # --- Log metrics --- (Rank 0 logs to WandB/file)
                 current_lr_for_log = self.scheduler.get_last_lr()[0] if self.scheduler else None
                 current_lambda_for_log = self.loss_manager.get_current_sparsity_lambda()
+                # Removed broad try-except around metric_logger.log_training_step
                 self.metric_logger.log_training_step(
                     step, loss_dict, current_lr=current_lr_for_log, current_sparsity_lambda=current_lambda_for_log
                 )
@@ -831,6 +845,9 @@ class CLTTrainer:
 
                 # --- Checkpointing (All ranks participate) ---
                 if save_checkpoint_flag:
+                    # Removed broad try-except around checkpoint saving in the loop
+                    # Specific IOErrors can be caught by self.checkpoint_manager._save_checkpoint if needed internally
+                    # or training can halt if checkpointing is critical and fails.
                     current_trainer_state_for_checkpoint = {
                         "step": step,
                         "optimizer_state_dict": self.optimizer.state_dict(),
@@ -899,8 +916,10 @@ class CLTTrainer:
                 step=step,  # Save at the actual last completed step
                 trainer_state_to_save=final_trainer_state_for_checkpoint,
             )
-        except Exception as e:
-            print(f"Rank {self.rank}: Warning: Failed to save final distributed model state: {e}")
+        except IOError as e:  # More specific: catch IOError for checkpoint saving
+            print(f"Rank {self.rank}: Warning: Failed to save final distributed model state due to IOError: {e}")
+        except Exception as e:  # Catch other potential errors during final save but log them as more critical
+            print(f"Rank {self.rank}: CRITICAL: Unexpected error during final model state save: {e}")
 
         # Rank 0 saves store, metrics, logs artifact
         if not self.distributed or self.rank == 0:
@@ -910,11 +929,19 @@ class CLTTrainer:
                 # Check if the store has a close method before calling (for compatibility)
                 if hasattr(self.activation_store, "close") and callable(getattr(self.activation_store, "close")):
                     self.activation_store.close()
-            except Exception as e:
-                print(f"Rank 0: Warning: Failed to close activation store: {e}")
+            except IOError as e:  # More specific: catch IOError for store closing
+                print(f"Rank 0: Warning: Failed to close activation store due to IOError: {e}")
+            except Exception as e:  # Catch other potential errors during store close
+                print(f"Rank 0: Warning: Unexpected error closing activation store: {e}")
 
             print("Saving final metrics...")
-            self.metric_logger._save_metrics_to_disk()  # Final save
+            # self.metric_logger._save_metrics_to_disk() # Final save - this should be robust
+            try:
+                self.metric_logger._save_metrics_to_disk()
+            except IOError as e:
+                print(f"Rank 0: Warning: Failed to save final metrics to disk due to IOError: {e}")
+            except Exception as e:
+                print(f"Rank 0: Warning: Unexpected error saving final metrics: {e}")
 
             # --- Save CLT Config to JSON ---
             # The config saved here will now reflect the configuration *during training* (e.g. BatchTopK)
@@ -947,8 +974,10 @@ class CLTTrainer:
                         "NOTE: Model was trained with BatchTopK. Run estimate_theta_posthoc() on the saved model to convert to JumpReLU and finalize theta values."
                     )
 
-            except Exception as e:
-                print(f"Rank 0: Warning: Failed to save CLT configuration to JSON: {e}")
+            except IOError as e:  # More specific: catch IOError for config saving
+                print(f"Rank 0: Warning: Failed to save CLT configuration to JSON due to IOError: {e}")
+            except Exception as e:  # Catch other potential errors during config saving
+                print(f"Rank 0: Warning: Unexpected error saving CLT configuration to JSON: {e}")
             # --- End Save CLT Config ---
 
             # Log final checkpoint directory as artifact
