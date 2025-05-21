@@ -67,7 +67,9 @@ def get_preactivations(
         # 3. Proceed if no errors so far (i.e. fallback_shape is still None)
         if fallback_shape is None and input_for_linear is not None:
             # Explicitly cast the output of the parallel linear layer
-            result = cast(torch.Tensor, encoders[layer_idx](input_for_linear))
+            result = cast(
+                torch.Tensor, encoders[layer_idx](input_for_linear.to(device=model_device, dtype=model_dtype))
+            )
         elif fallback_shape is None and input_for_linear is None:
             # This condition should ideally be caught by the checks above.
             # If we reach here, it implies an unhandled case or logic error.
@@ -189,7 +191,7 @@ def _apply_batch_topk_helper(
         if layer_idx in preactivations_dict:
             preact_orig = preactivations_dict[layer_idx]
             # Ensure preact_orig is on the correct device/dtype already
-            # preact_orig = preact_orig.to(device=device, dtype=dtype)
+            preact_orig = preact_orig.to(device=device, dtype=dtype)
 
             current_num_features = preact_orig.shape[1] if preact_orig.numel() > 0 else config.num_features
 
@@ -337,7 +339,8 @@ def _apply_token_topk_helper(
     for layer_idx in range(config.num_layers):
         if layer_idx in preactivations_dict:
             preact_orig = preactivations_dict[layer_idx]
-            # preact_orig = preact_orig.to(device=device, dtype=dtype) # Assume already correct
+            # Ensure preact_orig is on the correct device/dtype already
+            preact_orig = preact_orig.to(device=device, dtype=dtype)
 
             current_num_features = preact_orig.shape[1] if preact_orig.numel() > 0 else config.num_features
 

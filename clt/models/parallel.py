@@ -12,6 +12,8 @@ from . import mark_replicated
 class _ParallelLinear(nn.Module):
     """Base class for parallel linear layers."""
 
+    bias_param: Optional[nn.Parameter]
+
     def __init__(
         self,
         in_features: int,
@@ -25,6 +27,7 @@ class _ParallelLinear(nn.Module):
         d_model_for_init: Optional[int] = None,  # Add d_model for row parallel init
         num_layers_for_init: Optional[int] = None,  # Add num_layers for row parallel init
         device: Optional[torch.device] = None,  # Add device argument
+        dtype: Optional[torch.dtype] = None,  # Add dtype argument
     ):
         super().__init__()
         self.process_group = process_group
@@ -43,23 +46,32 @@ class _ParallelLinear(nn.Module):
         self.bias = bias
         self.full_in_features = in_features
         self.full_out_features = out_features
+        self.dtype = dtype if dtype is not None else torch.float32
 
         # Calculate local dimensions with uniform padding for divisibility
         if partition_dim == 0:  # Column Parallelism (Output features sharded)
             # Calculate padded size for uniform distribution
             self.local_out_features = math.ceil(out_features / self.world_size)
             self.local_in_features = in_features
-            self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
+            self.weight = nn.Parameter(
+                torch.empty(self.local_out_features, self.local_in_features, device=device, dtype=self.dtype)
+            )
             if bias:
-                self.bias_param = nn.Parameter(torch.empty(self.local_out_features, device=device))
+                self.bias_param = nn.Parameter(torch.empty(self.local_out_features, device=device, dtype=self.dtype))
+            else:
+                self.bias_param = None  # Explicitly set to None
         elif partition_dim == 1:  # Row Parallelism (Input features sharded)
             # Calculate padded size for uniform distribution
             self.local_in_features = math.ceil(in_features / self.world_size)
             self.local_out_features = out_features
-            self.weight = nn.Parameter(torch.empty(self.local_out_features, self.local_in_features, device=device))
+            self.weight = nn.Parameter(
+                torch.empty(self.local_out_features, self.local_in_features, device=device, dtype=self.dtype)
+            )
             if bias:
-                self.bias_param = nn.Parameter(torch.empty(out_features, device=device))
+                self.bias_param = nn.Parameter(torch.empty(out_features, device=device, dtype=self.dtype))
                 mark_replicated(self.bias_param)
+            else:
+                self.bias_param = None  # Explicitly set to None
         else:
             raise ValueError("partition_dim must be 0 or 1")
 
@@ -69,14 +81,14 @@ class _ParallelLinear(nn.Module):
         if partition_dim == 0:
             bound = 1.0 / math.sqrt(self.full_out_features)
             nn.init.uniform_(self.weight, -bound, bound)
-            if bias:
+            if bias and self.bias_param is not None:
                 nn.init.zeros_(self.bias_param)
         elif partition_dim == 1:
             if d_model_for_init is None or num_layers_for_init is None:
                 raise ValueError("d_model_for_init and num_layers_for_init must be provided for RowParallelLinear init")
             bound = 1.0 / math.sqrt(num_layers_for_init * d_model_for_init)
             nn.init.uniform_(self.weight, -bound, bound)
-            if bias:
+            if bias and self.bias_param is not None:
                 nn.init.zeros_(self.bias_param)
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
@@ -183,7 +195,7 @@ class _Reduce(torch.autograd.Function):
         return input_contig
 
     @staticmethod
-    def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], None]:
+    def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Non-distributed: gradient flows straight through.
         if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
             # Match the number of forward inputs in return for consistency
@@ -274,6 +286,7 @@ class ColumnParallelLinear(_ParallelLinear):
         init_method: Callable = nn.init.xavier_uniform_,
         keep_master_weight: bool = False,
         device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(
             in_features=in_features,
@@ -287,6 +300,7 @@ class ColumnParallelLinear(_ParallelLinear):
             d_model_for_init=None,
             num_layers_for_init=None,
             device=device,
+            dtype=dtype,
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
@@ -325,6 +339,7 @@ class RowParallelLinear(_ParallelLinear):
         d_model_for_init: int,
         num_layers_for_init: int,
         device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
     ):
         super().__init__(
             in_features=in_features,
@@ -338,6 +353,7 @@ class RowParallelLinear(_ParallelLinear):
             d_model_for_init=d_model_for_init,
             num_layers_for_init=num_layers_for_init,
             device=device,
+            dtype=dtype,
         )
 
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
@@ -385,11 +401,11 @@ class RowParallelLinear(_ParallelLinear):
         reduced_output = _reduce(local_output, self.process_group)
 
         # Add bias *after* reduction
-        if self.bias:
-            # Ensure bias_param is correctly shaped [out_features]
-            reduced_output = reduced_output + self.bias_param
+        if self.bias and self.bias_param is not None:
+            # Cast bias_param for type checker; runtime None already guarded.
+            reduced_output = reduced_output + cast(torch.Tensor, self.bias_param)
 
-        return reduced_output
+        return cast(torch.Tensor, reduced_output)  # Cast to ensure Tensor type
 
 
 # --------------------------- Public helper --------------------------- #
