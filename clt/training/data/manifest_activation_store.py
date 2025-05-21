@@ -50,6 +50,18 @@ class ChunkRowSampler(Sampler):
 
     Strides by GPU rank so there is no overlap (if shard_data=True).
     Yields (batch, 2) numpy arrays containing [chunk_id, row_id].
+
+    Args:
+        chunk_sizes: Dictionary mapping chunk_id to size or a NumPy array of sizes.
+        num_chunks: Total number of chunks.
+        batch: Batch size.
+        seed: Base seed for the run.
+        epoch: Current epoch number.
+        rank: Rank of the current process.
+        world: Total number of processes.
+        sampling_strategy: 'sequential' or 'random_chunk'.
+        shard_data: If True, data is sharded across ranks.
+        initial_sampler_state: Optional dictionary to restore sampler state.
     """
 
     def __init__(
@@ -61,22 +73,20 @@ class ChunkRowSampler(Sampler):
         epoch: int,
         rank: int,
         world: int,
-        sampling_strategy: str = "sequential",  # Added sampling strategy
-        shard_data: bool = True,  # ---> ADDED PARAMETER <---
-        initial_sampler_state: Optional[Dict[str, Any]] = None,  # For restoring state
+        sampling_strategy: str = "sequential",
+        shard_data: bool = True,
+        initial_sampler_state: Optional[Dict[str, Any]] = None,
     ):
-        # Handle chunk_sizes as either a dict mapping chunk_id → size or an array of sizes
         if isinstance(chunk_sizes, dict):
             self.chunk_sizes = chunk_sizes
         else:
-            # Create dict from array (index → size)
             self.chunk_sizes = {i: int(size) for i, size in enumerate(chunk_sizes) if size > 0}
 
         self.batch = batch
         self.rank = rank
         self.world = world
         self.num_chunks = num_chunks
-        self.seed = seed  # Base seed for the run
+        self.seed = seed
         self.epoch = epoch
         self.shard_data = shard_data
 
@@ -311,7 +321,7 @@ class ChunkRowSampler(Sampler):
     def set_epoch(self, epoch: int):
         """Sets the epoch for this sampler, resetting the RNG and internal state."""
         self.epoch = epoch
-        self._reset_generator()
+        self._reset_generator_internal_state()
 
 
 # ---------------------------------------------------------------------------
@@ -324,27 +334,40 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
     Subclasses must implement fetching mechanisms for metadata, manifest,
     norm stats, and the core `_fetch_slice` method.
+
+    Args:
+        train_batch_size_tokens: Target number of tokens per training batch.
+        device: PyTorch device for tensor operations.
+        dtype: PyTorch dtype for activation tensors. Defaults to 'bfloat16'.
+        rank: Rank of the current process in distributed training.
+        world: Total number of processes in distributed training.
+        seed: Base random seed for reproducibility.
+        sampling_strategy: Strategy for `ChunkRowSampler` ('sequential' or 'random_chunk').
+        normalization_method: Method for normalizing activations ('none' or others).
+        prefetch_batches: Number of batches to prefetch asynchronously (1 means no prefetching).
+        shard_data: If True, data is sharded across ranks by the `ChunkRowSampler`.
+        initial_store_state: Optional dictionary to restore store and sampler state for resumption.
     """
 
     def __init__(
         self,
         train_batch_size_tokens: int = 4096,
         device: torch.device | str | None = None,
-        dtype: torch.dtype | str = "bfloat16",  # Default to bf16 as per new generator standard
+        dtype: torch.dtype | str = "bfloat16",
         rank: int = 0,
         world: int = 1,
         seed: int = 42,
-        sampling_strategy: str = "sequential",  # Added sampling strategy
-        normalization_method: str = "none",  # Added normalization method
-        prefetch_batches: int = 1,  # Number of batches to prefetch (1 means no prefetching)
-        shard_data: bool = True,  # ---> ADDED PARAMETER <---
-        initial_store_state: Optional[Dict[str, Any]] = None,  # For restoring store + sampler state
+        sampling_strategy: str = "sequential",
+        normalization_method: str = "none",
+        prefetch_batches: int = 1,
+        shard_data: bool = True,
+        initial_store_state: Optional[Dict[str, Any]] = None,
     ):
-        self.train_batch_size_tokens = train_batch_size_tokens  # From Base
+        self.train_batch_size_tokens = train_batch_size_tokens
         self.rank = rank
         self.world = world
-        self.seed = seed  # Base seed for the run
-        self.epoch = 0  # Initial epoch, will be overridden by initial_store_state if provided
+        self.seed = seed
+        self.epoch = 0
         self.prefetch_batches = max(1, prefetch_batches)
         self.sampling_strategy = sampling_strategy
         self.shard_data = shard_data
@@ -459,42 +482,28 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
         # --- Load Normalization Stats (optional, subclass responsibility) ---
         self.norm_stats_data = self._load_norm_stats()
-        # # Log the loaded data immediately for debugging
-        # if self.norm_stats_data is None:
-        #     logger.debug("Loaded norm_stats_data is None.")
-        # else:
-        #     logger.debug(f"Loaded norm_stats_data type: {type(self.norm_stats_data)}, Is empty? {not bool(self.norm_stats_data)}")
-        #     # Optionally log the keys if it's a dict and not empty, to verify content further
-        #     if isinstance(self.norm_stats_data, dict) and self.norm_stats_data:
-        #         logger.debug(f"Loaded norm_stats_data keys: {list(self.norm_stats_data.keys())}")
 
         self.apply_normalization = False
         if normalization_method == "none":
             self.apply_normalization = False
         else:
             self.apply_normalization = bool(self.norm_stats_data)
-        # logger.debug(f"Post-decision self.apply_normalization = {self.apply_normalization}") # Log the result
 
         if self.apply_normalization:
-            # logger.debug("Entering block to call _prep_norm...") # Log entry to IF block
-            # logger.info(f"Preparing normalization stats. Expecting layers: {self.layer_indices}") # Keep this?
             self._prep_norm()
         else:
-            # logger.debug("Skipping _prep_norm because self.apply_normalization is False.") # Log entry to ELSE block
-            # Initialize empty dicts with types for linter
             self.mean_in: Dict[int, torch.Tensor] = {}
             self.std_in: Dict[int, torch.Tensor] = {}
             self.mean_tg: Dict[int, torch.Tensor] = {}
             self.std_tg: Dict[int, torch.Tensor] = {}
 
         # --- Setup Sampler ---
-        # Pass the sampling_strategy to the sampler
         self.sampler = ChunkRowSampler(
             chunk_sizes=self.chunk_sizes,
             num_chunks=self.num_chunks,
             batch=self.train_batch_size_tokens,
-            seed=self.seed,  # Pass base seed
-            epoch=self.epoch,  # Initial epoch
+            seed=self.seed,
+            epoch=self.epoch,
             rank=self.rank,
             world=self.world,
             sampling_strategy=self.sampling_strategy,
@@ -506,8 +515,6 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         # --- Precompute byte offsets based on dtype and d_model ---
         self.bytes_per_element = torch.finfo(self.dtype).bits // 8
         self.bytes_per_row = self.d_model * self.bytes_per_element
-        # bytes_per_tensor = slice_tok * bytes_per_row (depends on batch size)
-        # per_layer_bytes = bytes_per_tensor * 2 (input + target)
 
         # --- Setup Prefetching (if enabled) ---
         self.prefetch_queue: Optional[queue.Queue] = None
@@ -609,9 +616,8 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                         missing_keys_in.append("'inputs.mean'")
                     elif "std" not in stats["inputs"]:
                         missing_keys_in.append("'inputs.std'")
-                    # logger.warning(f"Missing structure ({', '.join(missing_keys_in)}) for layer {layer_idx} inputs in norm stats. Disabling normalization.")
-                    self.apply_normalization = False  # Disable if structure is wrong
-                    break  # Exit loop
+                    self.apply_normalization = False
+                    break
 
                 # Targets
                 if "targets" in stats and "mean" in stats["targets"] and "std" in stats["targets"]:
@@ -654,47 +660,29 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                         missing_keys_tg.append("'targets.mean'")
                     elif "std" not in stats["targets"]:
                         missing_keys_tg.append("'targets.std'")
-                    # logger.warning(f"Missing structure ({', '.join(missing_keys_tg)}) for layer {layer_idx} targets in norm stats. Disabling normalization.")
-                    self.apply_normalization = False  # Disable if structure is wrong
-                    break  # Exit loop
+                    self.apply_normalization = False
+                    break
 
-            # Log state of missing_layers *after* the loop
-            # logger.debug(f"_prep_norm loop finished. Final missing_layers: {missing_layers}")
-
-            if not self.apply_normalization:  # Check if loop was broken
+            if not self.apply_normalization:
                 # Clear out potentially partially filled stats if we broke early
                 self.mean_in, self.std_in, self.mean_tg, self.std_tg = {}, {}, {}, {}
-            elif missing_layers:  # Check if loop completed but layers were missing
-                # Add specific logging here
+            elif missing_layers:
                 logger.warning(
                     f"Normalization stats missing for layers: {sorted(list(missing_layers))}. Disabling normalization."
                 )
-                self.apply_normalization = False  # Explicitly disable if layers are missing
+                self.apply_normalization = False
 
-            # Only log success and set True if NO errors occurred AND no layers were missing
-            if self.apply_normalization:  # Check if it hasn't been set to False above
+            if self.apply_normalization:
                 logger.info("Normalization statistics prepared successfully.")
-                # Optional: Add shape logging only on success
-                # log_msg = "Example shapes: "
-                # example_layer = self.layer_indices[0]
-                # if example_layer in self.mean_in:
-                #     log_msg += f"mean_in[{example_layer}]: {self.mean_in[example_layer].shape}, "
-                # if example_layer in self.std_in:
-                #     log_msg += f"std_in[{example_layer}]: {self.std_in[example_layer].shape}"
-                # logger.info(log_msg)
-            # else: # Already logged the reason for failure above (missing layers or exception)
-            #    logger.warning("Normalization statistics FAILED to load or were incomplete. Normalization disabled.")
 
         except (KeyError, ValueError, TypeError) as e:
-            # Add specific logging here
             logger.error(
                 f"Error processing normalization stats (e.g., invalid format, wrong keys): {e}. Disabling normalization.",
-                exc_info=True,  # Include traceback for debugging
+                exc_info=True,
             )
             self.apply_normalization = False
             self.mean_in, self.std_in, self.mean_tg, self.std_tg = {}, {}, {}, {}
 
-        # Add final log statement regardless of path taken
         logger.debug(f"_prep_norm finished. Final self.apply_normalization = {self.apply_normalization}")
 
     def _initialize_prefetching(self):
@@ -777,7 +765,6 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         # --- Existing Fetch/Parse Logic from get_batch ---
         fetch_start_time = time.monotonic()
         unique_chunks, inverse_indices = np.unique(idxs[:, 0], return_inverse=True)
-        # ---> ADDED: Retry config moved here <---
         max_fetch_retries = 3
         fetch_initial_backoff = 0.5
         fetch_max_backoff = 10.0
@@ -788,7 +775,6 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         raw_bytes_by_chunk: Dict[int, bytes] = {}
         fetch_errors = []
         for chunk_id, row_indices_for_chunk in rows_by_chunk.items():
-            # --> ADDED: Retry Loop for _fetch_slice <--
             chunk_fetch_success = False
             for attempt in range(max_fetch_retries):
                 try:
@@ -845,14 +831,11 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
         # If any chunk failed permanently after retries, raise an error for the whole batch
         if fetch_errors:
-            # ---> MODIFIED: Raise RuntimeError again <---
             failed_chunks_str = ", ".join(map(str, sorted(fetch_errors)))
             logger.error(
                 f"Permanently failed to fetch data for chunk(s): {failed_chunks_str} after {max_fetch_retries} retries."
             )
-            # Raise runtime error to be caught by __next__
             raise RuntimeError(f"Failed to fetch data for chunk(s): {sorted(fetch_errors)} after retries.")
-            # ---> END MODIFIED <---
 
         fetch_duration = time.monotonic() - fetch_start_time
         parse_start_time = time.monotonic()
@@ -1017,33 +1000,30 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         return self
 
     def __next__(self):
-        # --> MODIFIED: Implement skip logic <--
         try:
             # If prefetching, get from queue, else call get_batch()
             if self.prefetch_queue is not None:
                 # Block until an item is available from the prefetch thread
                 item = self.prefetch_queue.get(block=True)
-                if isinstance(item, Exception):  # Check if thread sent an error
+                if isinstance(item, Exception):
                     logger.error(f"Rank {self.rank}: Error received from prefetch thread: {item}")
-                    raise item  # Re-raise the error from the thread
-                elif item is None:  # Check for end-of-data sentinel
+                    raise item
+                elif item is None:
                     raise StopIteration("Prefetch thread signalled end of data.")
                 else:
-                    logger.debug(f"Rank {self.rank}: Retrieved batch from prefetch queue (previous qsize approx: {self.prefetch_queue.qsize() + 1})")  # type: ignore[union-attr]
-                    return item  # Return the prefetched batch
+                    logger.debug(
+                        f"Rank {self.rank}: Retrieved batch from prefetch queue (previous qsize approx: {self.prefetch_queue.qsize() + 1})"
+                    )
+                    return item
             else:
                 # Get indices and call fetch/parse directly
                 idxs = next(self.sampler_iter)
                 return self._fetch_and_parse_batch(idxs)
         except RuntimeError as e:
-            # This exception is raised by get_batch() if fetching fails permanently
             logger.warning(f"Batch fetch failed ({e}), attempting to skip and fetch the next one...")
-            # Skip logic needs adjustment for prefetching - how to tell prefetch thread to skip?
-            # For now, let's keep the skip logic simpler and assume it works mostly for non-prefetch
-            # or handles errors raised *after* getting from the queue.
             try:
                 # Try getting the *subsequent* batch
-                idxs = next(self.sampler_iter)  # Need to get new indices
+                idxs = next(self.sampler_iter)
                 next_batch = self._fetch_and_parse_batch(idxs)
                 logger.info("Successfully fetched subsequent batch after skipping failed one.")
                 return next_batch
@@ -1051,11 +1031,9 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                 logger.error(f"Failed to fetch subsequent batch after skip ({e2}). Stopping iteration.")
                 raise StopIteration("Consecutive batch fetches failed.") from e2
             except StopIteration:
-                # If the store was exhausted when trying to get the next batch
                 logger.info("Store exhausted while trying to fetch subsequent batch after skip.")
-                raise  # Re-raise StopIteration
+                raise
         # Note: StopIteration from the initial self.get_batch() call propagates normally
-        # --> END MODIFIED <--
 
     def close(self):
         """Shuts down the prefetch thread if it's running."""

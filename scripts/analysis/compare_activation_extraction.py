@@ -31,7 +31,7 @@ NNSIGHT_MLP_MODULE_PATH_TEMPLATE = "gpt_neox.layers.{}.mlp.input"
 
 # TransformerLens hook point for MLP input.
 # For gpt2: blocks.{layer_num}.hook_mlp_in
-TL_MLP_HOOK_NAME_TEMPLATE = "blocks.{}.hook_mlp_in"
+TL_MLP_HOOK_NAME_TEMPLATE = "blocks.{}.ln2.hook_normalized"
 # --- End Configuration ---
 
 # Determine device
@@ -152,8 +152,10 @@ print("\n--- TransformerLens Activation Extraction ---")
 if "tl_model_for_tokenizer" in locals() and str(tl_model_for_tokenizer.cfg.device) == str(DEVICE):
     tl_model = tl_model_for_tokenizer
 else:
-    tl_model = HookedTransformer.from_pretrained(MODEL_NAME, device=DEVICE, logging_level=logging.WARNING)
+    tl_model = HookedTransformer.from_pretrained_no_processing(MODEL_NAME, device=DEVICE)
 
+
+tl_model.set_use_hook_mlp_in(True)
 
 # Hook name for MLP input
 tl_hook_name = TL_MLP_HOOK_NAME_TEMPLATE.format(LAYER_NUM)
@@ -162,8 +164,11 @@ print(f"TransformerLens hook name: {tl_hook_name}")
 with torch.no_grad():
     # Run the model and cache activations
     # prepend_bos=True matches typical GPT-2 behavior and our nnsight tokenization
-    _, cache = tl_model.run_with_cache(tl_token_ids, prepend_bos=False)  # BOS is already in tl_token_ids
+    _, cache = tl_model.run_with_cache(tl_token_ids, prepend_bos=False)
 
+# %%
+print(cache.keys)
+# %%
 # Extract activations
 # Shape is typically [batch_size, sequence_length, d_model]
 activations_tl = cache[tl_hook_name]
@@ -232,3 +237,55 @@ else:
     print("Comparison skipped because one or both activation sets could not be retrieved.")
 
 print("\nScript finished.")
+
+# %%
+for key in cache.keys():
+    # print the name and the shape
+    print(f"{key}: {cache[key].shape}")
+
+# %%
+# for each key, if the dimensionality matches that of the nnsight activations, compare the key metrics. otherwise ignore
+# finally, print the key with the lowest MSE
+lowest_mse_key = None
+lowest_mse = float("inf")
+for key in cache.keys():
+    if cache[key].squeeze(0).shape == activations_nnsight.shape:
+        # Convert cache value to tensor if needed
+        cache_tensor = torch.as_tensor(cache[key])
+        activations_tensor = torch.as_tensor(activations_nnsight)
+
+        # Calculate differences
+        abs_diff = torch.abs(cache_tensor - activations_tensor)
+        squared_diff = (cache_tensor - activations_tensor) ** 2
+
+        # Calculate metrics
+        mean_abs_diff = torch.mean(abs_diff).item()
+        max_abs_diff = torch.max(abs_diff).item()
+        mse = torch.mean(squared_diff).item()
+
+        # Track lowest MSE
+        if mse < lowest_mse:
+            lowest_mse = mse
+            lowest_mse_key = key
+
+        # Print results
+        print(f"\nResults for {key}:")
+        print(f"Shape: {cache[key].shape}")
+        print(f"Mean Absolute Difference: {mean_abs_diff:.6e}")
+        print(f"Max Absolute Difference: {max_abs_diff:.6e}")
+        print(f"Mean Squared Error: {mse:.6e}")
+
+        # Print sample values for best matching key
+        if mse == lowest_mse:
+            print("\nSample values (first token, first 5 features):")
+            print(f"  Cache:    {cache_tensor[0, :5].tolist()}")
+            print(f"  NNsight:  {activations_tensor[0, :5].tolist()}")
+    else:
+        print(f"\nSkipping {key} - shape mismatch:")
+        print(f"  Cache shape: {cache[key].squeeze(0).shape}")
+        print(f"  Target shape: {activations_nnsight.shape}")
+
+print(f"\nLowest MSE key: {lowest_mse_key}")
+print(f"Lowest MSE value: {lowest_mse:.6e}")
+
+# %%
