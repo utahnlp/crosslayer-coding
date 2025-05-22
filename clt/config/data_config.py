@@ -55,6 +55,9 @@ class ActivationConfig:
     nnsight_tracer_kwargs: Dict[str, Any] = field(default_factory=dict)
     nnsight_invoker_args: Dict[str, Any] = field(default_factory=dict)
 
+    # --- Profiling Control (during generation) ---
+    enable_profiling: bool = False  # Whether to enable detailed performance profiling during generation
+
     # --- Device Parameter ---
     # While generation happens on a device, this config is more about the data itself.
     # The device used for generation can be passed separately to the generator instance.

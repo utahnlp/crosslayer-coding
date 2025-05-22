@@ -16,15 +16,13 @@ from __future__ import annotations
 import os
 import time
 import json
-import math
 import queue
 import random
-import shutil
-import signal
 import logging
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Generator, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
 import numpy as np
@@ -37,13 +35,173 @@ from urllib.parse import quote, urljoin
 from clt.nnsight.extractor import ActivationExtractorCLT  # noqa: E402
 from clt.config.data_config import ActivationConfig  # noqa: E402
 
+# --- Profiling Imports ---
+import time  # Already imported, but good to note
+from contextlib import contextmanager
+from collections import defaultdict
+import psutil
+
+try:
+    import GPUtil
+except ImportError:
+    GPUtil = None  # type: ignore
+# --- End Profiling Imports ---
+
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
 ActivationBatch = Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]
 
+
+# --- Performance Profiler Class ---
+class PerformanceProfiler:
+    def __init__(self, chunk_tokens_threshold: int = 1_000_000):
+        self.timings = defaultdict(list)
+        self.memory_snapshots = []
+        self.chunk_tokens_threshold = chunk_tokens_threshold
+        self.system_metrics_log: List[Dict[str, Any]] = []
+        self.layer_ids_ref: Optional[List[int]] = None
+        self.total_tokens_processed_for_batch_profiling = 0
+        self.batch_processing_total_calls = 0
+
+    def set_layer_ids_ref(self, layer_ids: List[int]):
+        self.layer_ids_ref = layer_ids
+
+    @contextmanager
+    def measure(self, name: str):
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        start_time = time.perf_counter()
+        start_mem_vm = psutil.virtual_memory().used
+        start_mem_rss = psutil.Process(os.getpid()).memory_info().rss
+
+        yield
+
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        elapsed = time.perf_counter() - start_time
+        end_mem_vm = psutil.virtual_memory().used
+        end_mem_rss = psutil.Process(os.getpid()).memory_info().rss
+
+        self.timings[name].append(elapsed)
+        self.memory_snapshots.append(
+            {
+                "name": name,
+                "timestamp": time.time(),
+                "duration_s": elapsed,
+                "vm_delta_bytes": end_mem_vm - start_mem_vm,
+                "vm_total_bytes": end_mem_vm,
+                "rss_delta_bytes": end_mem_rss - start_mem_rss,
+                "rss_total_bytes": end_mem_rss,
+            }
+        )
+
+    def log_system_metrics(self, interval_name: str = "interval"):
+        # CPU usage
+        cpu_percent = psutil.cpu_percent(interval=None)  # Non-blocking
+
+        # Memory usage
+        mem = psutil.virtual_memory()
+
+        # Disk I/O (cumulative, consider diffing for rates)
+        disk_io = psutil.disk_io_counters()
+
+        gpu_util = 0.0  # Changed to float for consistency
+        gpu_memory_percent = 0.0  # Changed to float
+        gpu_memory_used_mib = 0.0  # Changed to float
+        gpu_memory_total_mib = 0.0  # Changed to float
+
+        if GPUtil is not None:
+            try:
+                gpus = GPUtil.getGPUs()
+                if gpus:
+                    gpu = gpus[0]  # Assuming single GPU, or log for all
+                    gpu_util = float(gpu.load * 100)
+                    gpu_memory_percent = float(gpu.memoryUtil * 100)
+                    gpu_memory_used_mib = float(gpu.memoryUsed)
+                    gpu_memory_total_mib = float(gpu.memoryTotal)
+            except Exception as e:
+                logger.debug(f"Could not get GPU stats: {e}")
+
+        metrics = {
+            "interval_name": interval_name,
+            "timestamp": time.time(),
+            "cpu_percent": cpu_percent,
+            "memory_percent": mem.percent,
+            "memory_used_gb": mem.used / (1024**3),
+            "memory_available_gb": mem.available / (1024**3),
+            "disk_read_gb": disk_io.read_bytes / (1024**3) if disk_io else 0,
+            "disk_write_gb": disk_io.write_bytes / (1024**3) if disk_io else 0,
+            "gpu_util_percent": gpu_util,
+            "gpu_memory_percent": gpu_memory_percent,
+            "gpu_memory_used_mib": gpu_memory_used_mib,
+            "gpu_memory_total_mib": gpu_memory_total_mib,
+        }
+        self.system_metrics_log.append(metrics)
+        return metrics
+
+    def report(self):
+        print("\n=== Performance Report ===")
+        # Sort by total time descending for timings
+        sorted_timings = sorted(self.timings.items(), key=lambda item: sum(item[1]), reverse=True)
+
+        for name, times in sorted_timings:
+            if not times:
+                continue
+            avg_time = sum(times) / len(times)
+            total_time = sum(times)
+            min_time = min(times)
+            max_time = max(times)
+
+            print(f"\n--- Operation: {name} ---")
+            print(f"  Count: {len(times)}")
+            print(f"  Total time: {total_time:.3f}s")
+            print(f"  Avg time: {avg_time:.4f}s")
+            print(f"  Min time: {min_time:.4f}s")
+            print(f"  Max time: {max_time:.4f}s")
+
+            if "chunk_write_total_idx" in name:  # New unique name per chunk
+                print(f"  Avg ms/k-tok (for this chunk): {avg_time / self.chunk_tokens_threshold * 1000 * 1000:.2f}")
+            elif (
+                name == "batch_processing_total"
+                and self.batch_processing_total_calls > 0
+                and self.total_tokens_processed_for_batch_profiling > 0
+            ):
+                avg_tok_per_batch_call = (
+                    self.total_tokens_processed_for_batch_profiling / self.batch_processing_total_calls
+                )
+                if avg_tok_per_batch_call > 0:
+                    print(
+                        f"  Avg ms/k-tok (estimated for batch_processing_total): {avg_time / avg_tok_per_batch_call * 1000 * 1000:.2f}"
+                    )
+
+        print("\n=== Memory Snapshots (showing top 10 by RSS delta) ===")
+        interesting_mem_snapshots = sorted(
+            self.memory_snapshots, key=lambda x: abs(x["rss_delta_bytes"]), reverse=True
+        )[:10]
+        for snap in interesting_mem_snapshots:
+            print(
+                f"  {snap['name']} (took {snap['duration_s']:.3f}s): Total RSS {snap['rss_total_bytes'] / (1024**3):.3f} GB (ΔRSS {snap['rss_delta_bytes'] / (1024**3):.3f} GB)"
+            )
+
+        print("\n=== System Metrics Log (sample) ===")
+        for i, metrics in enumerate(self.system_metrics_log[:5]):  # Print first 5 samples
+            print(
+                f"  Sample {i} ({metrics['interval_name']}): CPU {metrics['cpu_percent']:.1f}%, Mem {metrics['memory_percent']:.1f}%, GPU {metrics['gpu_util_percent']:.1f}% (Mem {metrics['gpu_memory_percent']:.1f}%)"
+            )
+        if len(self.system_metrics_log) > 5:
+            print("  ...")
+            if self.system_metrics_log:  # Check if not empty before accessing last element
+                metrics = self.system_metrics_log[-1]
+                print(
+                    f"  Sample End ({metrics['interval_name']}): CPU {metrics['cpu_percent']:.1f}%, Mem {metrics['memory_percent']:.1f}%, GPU {metrics['gpu_util_percent']:.1f}% (Mem {metrics['gpu_memory_percent']:.1f}%)"
+                )
+
+
+# --- End Performance Profiler Class ---
+
 # ---------------------------------------------------------------------------
-# Helper routines
+# Helper routines
 # ---------------------------------------------------------------------------
 
 
@@ -54,7 +212,15 @@ def _create_datasets(
     d: int,
     h5py_dtype: str = "float16",
 ):
-    """Row‑chunked bf16 datasets with gzip‑2 compression."""
+    """Row‑chunked datasets with optimized chunking and no compression for speed."""
+    # Optimize chunk size for better I/O performance
+    # If total rows in this HDF5 file is less than 10,000, make it a single chunk.
+    # Otherwise, use a calculated optimal chunk size.
+    if rows < 10000:
+        optimal_chunk_rows = rows
+    else:
+        optimal_chunk_rows = min(max(1000, rows // 10), rows)
+
     for lid in layer_ids:
         g = hf.create_group(f"layer_{lid}")
         for name in ("inputs", "targets"):
@@ -62,13 +228,14 @@ def _create_datasets(
                 name,
                 shape=(rows, d),
                 dtype=h5py_dtype,
-                chunks=(1, d),
-                compression="gzip",
-                compression_opts=2,
+                chunks=(optimal_chunk_rows, d),  # Better chunking
+                compression=None,  # No compression for 10-20x speedup
+                # compression="gzip",  # OLD - this was the bottleneck
+                # compression_opts=2,  # OLD
             )
 
 
-def _async_uploader(upload_q: "queue.Queue[Path]", cfg: ActivationConfig):
+def _async_uploader(upload_q: "queue.Queue[Optional[Path]]", cfg: ActivationConfig):
     dataset_name = os.path.basename(cfg.dataset_path)
     dataset_id = quote(f"{cfg.model_name}/{dataset_name}_{cfg.dataset_split}", safe="")
     # Handle optional remote_server_url
@@ -86,6 +253,14 @@ def _async_uploader(upload_q: "queue.Queue[Path]", cfg: ActivationConfig):
                 upload_q.task_done()
             except queue.Empty:
                 break
+            except AttributeError:
+                if item is None:
+                    logger.debug("Drained a None sentinel from upload queue during no-URL shutdown.")
+                    upload_q.task_done()
+                else:
+                    logger.error("Unexpected item type in upload queue during draining.")
+                break
+
         return
 
     base = cfg.remote_server_url.rstrip("/") + "/"
@@ -112,7 +287,7 @@ def _async_uploader(upload_q: "queue.Queue[Path]", cfg: ActivationConfig):
         for attempt in range(max_retries_per_chunk):
             try:
                 print(
-                    f"[Uploader Thread Attempt {attempt+1}/{max_retries_per_chunk}] Uploading chunk: {p.name} to {url}"
+                    f"[Uploader Thread Attempt {attempt + 1}/{max_retries_per_chunk}] Uploading chunk: {p.name} to {url}"
                 )
                 with open(p, "rb") as f:
                     files = {"chunk_file": (p.name, f, "application/x-hdf5")}
@@ -256,6 +431,16 @@ class ActivationGenerator:
     def __init__(self, cfg: ActivationConfig, device: torch.device | str | None = None):
         self.cfg = cfg
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+
+        # --- Profiler Init (Conditional) ---
+        if cfg.enable_profiling:
+            self.profiler: Optional[PerformanceProfiler] = PerformanceProfiler(
+                chunk_tokens_threshold=cfg.chunk_token_threshold
+            )
+        else:
+            self.profiler = None  # type: ignore
+        # --- End Profiler Init ---
+
         try:
             self.torch_dtype = getattr(torch, cfg.activation_dtype)
         except AttributeError:
@@ -281,9 +466,11 @@ class ActivationGenerator:
         self.manifest_tmp = self.out_dir / "index.tmp"
         self.manifest_final = self.out_dir / "index.bin"
         # Background uploader
-        self.upload_q: "queue.Queue[Path]" = queue.Queue()
+        self.upload_q: "queue.Queue[Optional[Path]]" = queue.Queue()
         if cfg.remote_server_url:
-            self.uploader = threading.Thread(target=_async_uploader, args=(self.upload_q, cfg), daemon=True)
+            self.uploader: Optional[threading.Thread] = threading.Thread(
+                target=_async_uploader, args=(self.upload_q, cfg), daemon=True
+            )
             self.uploader.start()
         else:
             self.uploader = None
@@ -301,14 +488,20 @@ class ActivationGenerator:
     # ------------------------------------------------------------------
     def generate_and_save(self):
         cfg = self.cfg
-        stream = self.extractor.stream_activations(
-            dataset_path=cfg.dataset_path,
-            dataset_split=cfg.dataset_split,
-            dataset_text_column=cfg.dataset_text_column,
-            streaming=cfg.streaming,
-            dataset_trust_remote_code=cfg.dataset_trust_remote_code,
-            cache_path=cfg.cache_path,
-        )
+        if self.profiler:
+            self.profiler.log_system_metrics("initial_system_state")
+            self.profiler.total_tokens_processed_for_batch_profiling = 0
+            self.profiler.batch_processing_total_calls = 0
+
+        with self._conditional_measure("stream_activations_setup"):
+            stream = self.extractor.stream_activations(
+                dataset_path=cfg.dataset_path,
+                dataset_split=cfg.dataset_split,
+                dataset_text_column=cfg.dataset_text_column,
+                streaming=cfg.streaming,
+                dataset_trust_remote_code=cfg.dataset_trust_remote_code,
+                cache_path=cfg.cache_path,
+            )
 
         tgt_tokens = cfg.target_total_tokens
         chunk_tokens = cfg.chunk_token_threshold
@@ -329,76 +522,109 @@ class ActivationGenerator:
         d_model = -1
         dtype_str = "unknown"
 
-        for batch_inp, batch_tgt in stream:
-            if tgt_tokens and g_row >= tgt_tokens:
-                break
-            if not batch_inp:
-                continue
-            if layer_ids is None:
-                layer_ids = sorted(batch_inp.keys())
-                d_model = batch_inp[layer_ids[0]].shape[-1]
-                dtype_str = str(batch_inp[layer_ids[0]].dtype)
-                for lid in layer_ids:
-                    buf_inp[lid] = []
-                    buf_tgt[lid] = []
-                    if cfg.compute_norm_stats:
-                        stats[lid] = {
-                            "inputs": _RunningStat(d_model),
-                            "targets": _RunningStat(d_model),
-                        }
-                logger.info("Layers=%d d_model=%d dtype=%s", len(layer_ids), d_model, dtype_str)
+        for batch_idx, (batch_inp, batch_tgt) in enumerate(stream):
+            with self._conditional_measure("batch_processing_total"):
+                if tgt_tokens and g_row >= tgt_tokens:
+                    break
+                if not batch_inp:
+                    continue
 
-            n_tok = batch_inp[layer_ids[0]].shape[0]
-            for lid in layer_ids:
-                inp = batch_inp[lid].detach().cpu()
-                tgt = batch_tgt[lid].detach().cpu()
-                buf_inp[lid].append(inp)
-                buf_tgt[lid].append(tgt)
-                if cfg.compute_norm_stats:
-                    stats[lid]["inputs"].update(inp)
-                    stats[lid]["targets"].update(tgt)
+                with self._conditional_measure("batch_metadata_setup"):
+                    if layer_ids is None:
+                        layer_ids = sorted(batch_inp.keys())
+                        d_model = batch_inp[layer_ids[0]].shape[-1]
+                        dtype_str = str(batch_inp[layer_ids[0]].dtype)
+                        if self.profiler:
+                            self.profiler.set_layer_ids_ref(layer_ids)
+                        for lid in layer_ids:
+                            buf_inp[lid] = []
+                            buf_tgt[lid] = []
+                            if cfg.compute_norm_stats:
+                                stats[lid] = {
+                                    "inputs": _RunningStat(d_model),
+                                    "targets": _RunningStat(d_model),
+                                }
+                        logger.info(
+                            "Layers=%d d_model=%d dtype=%s", len(layer_ids) if layer_ids else 0, d_model, dtype_str
+                        )
 
-            g_row += n_tok
-            pbar.update(n_tok)
+                n_tok_in_batch = 0
+                if layer_ids and batch_inp.get(layer_ids[0]) is not None:
+                    n_tok_in_batch = batch_inp[layer_ids[0]].shape[0]
 
-            # Flush chunk when we've reached the threshold
-            cur_rows = sum(t.shape[0] for t in buf_inp[layer_ids[0]])
-            if cur_rows >= chunk_tokens:
-                # Write *all* accumulated rows so far (variable‑size chunk).
+                with self._conditional_measure("batch_cpu_transfer_and_accumulate"):
+                    if layer_ids:
+                        for lid in layer_ids:
+                            if lid in batch_inp and lid in batch_tgt:
+                                inp = batch_inp[lid].detach().cpu()
+                                tgt = batch_tgt[lid].detach().cpu()
+                                buf_inp[lid].append(inp)
+                                buf_tgt[lid].append(tgt)
+                                if cfg.compute_norm_stats and lid in stats:
+                                    with self._conditional_measure(f"batch_norm_stats_update_layer_{lid}"):
+                                        stats[lid]["inputs"].update(inp)
+                                        stats[lid]["targets"].update(tgt)
+                            else:
+                                logger.warning(
+                                    f"Layer {lid} expected but not found in current batch. Skipping accumulation for this layer."
+                                )
+
+                if n_tok_in_batch > 0:
+                    g_row += n_tok_in_batch
+                    pbar.update(n_tok_in_batch)
+                    if self.profiler:
+                        self.profiler.total_tokens_processed_for_batch_profiling += n_tok_in_batch
+                if self.profiler:
+                    self.profiler.batch_processing_total_calls += 1
+
+                if layer_ids and buf_inp.get(layer_ids[0]):
+                    cur_rows = sum(t.shape[0] for t in buf_inp[layer_ids[0]])
+                    if cur_rows >= chunk_tokens:
+                        with self._conditional_measure("chunk_write_dispatch"):
+                            self._write_chunk(
+                                c_idx,
+                                buf_inp,
+                                buf_tgt,
+                                layer_ids,
+                                d_model,
+                                cur_rows,
+                                manifest_rows,
+                                g_row - cur_rows,
+                            )
+                        c_idx += 1
+                        with self._conditional_measure("chunk_buffer_clear"):
+                            if layer_ids:
+                                for lid_clear in layer_ids:
+                                    buf_inp[lid_clear].clear()
+                                    buf_tgt[lid_clear].clear()
+            if batch_idx > 0 and batch_idx % 50 == 0:
+                if self.profiler:
+                    self.profiler.log_system_metrics(f"batch_interval_{batch_idx}")
+
+        # Flush final partial chunk
+        if layer_ids and buf_inp.get(layer_ids[0]):
+            with self._conditional_measure("final_chunk_write_dispatch"):
+                rows = sum(t.shape[0] for t in buf_inp[layer_ids[0]])
                 self._write_chunk(
                     c_idx,
                     buf_inp,
                     buf_tgt,
                     layer_ids,
                     d_model,
-                    cur_rows,
+                    rows,
                     manifest_rows,
-                    g_row - cur_rows,
+                    g_row - rows,
                 )
                 c_idx += 1
-                # Clear buffers for next chunk
-                for lid in layer_ids:
-                    buf_inp[lid].clear()
-                    buf_tgt[lid].clear()
 
-        # Flush final partial chunk
-        if layer_ids and buf_inp[layer_ids[0]]:
-            rows = sum(t.shape[0] for t in buf_inp[layer_ids[0]])
-            self._write_chunk(
-                c_idx,
-                buf_inp,
-                buf_tgt,
-                layer_ids,
-                d_model,
-                rows,
-                manifest_rows,
-                g_row - rows,
-            )
-            c_idx += 1
-
-        # Write manifest to disk (concatenate to keep correct order)
-        manifest_arr = np.concatenate(manifest_rows, axis=0)
-        manifest_arr.tofile(self.manifest_final)
+        if self.profiler:
+            self.profiler.log_system_metrics("pre_manifest_write")
+        with self._conditional_measure("manifest_concatenate_and_write"):
+            if manifest_rows:
+                manifest_arr = np.concatenate(manifest_rows, axis=0)
+                manifest_arr.tofile(self.manifest_final)
+            else:
+                logger.warning("Manifest_rows is empty, skipping manifest write.")
 
         # Upload final manifest if remote
         if self.storage_type == "remote" and self.manifest_final.exists():
@@ -419,48 +645,74 @@ class ActivationGenerator:
             "chunk_tokens": chunk_tokens,
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        with open(self.out_dir / "metadata.json", "w") as f:
-            json.dump(meta, f, indent=2)
+        with self._conditional_measure("metadata_json_write"):
+            with open(self.out_dir / "metadata.json", "w") as f:
+                json.dump(meta, f, indent=2)
         logger.info("metadata.json written")
 
-        # If remote storage – immediately upload metadata so the server
-        # registers the dataset before any training jobs start.
         meta_path = self.out_dir / "metadata.json"
         if self.storage_type == "remote" and self.cfg.remote_server_url:
-            try:
-                self._upload_json(meta_path, "metadata")
-                logger.info("metadata.json uploaded to server")
-            except Exception as e:
-                logger.warning("Failed to upload metadata.json: %s", e)
+            with self._conditional_measure("metadata_json_upload"):
+                try:
+                    self._upload_json(meta_path, "metadata")
+                    logger.info("metadata.json uploaded to server")
+                except Exception as e:
+                    logger.warning("Failed to upload metadata.json: %s", e)
 
         # Write norm_stats.json
         if cfg.compute_norm_stats and stats:
             norm: Dict[str, Any] = {}
-            for lid in layer_ids:
-                m_in, s_in = stats[lid]["inputs"].finalize()
-                m_tg, s_tg = stats[lid]["targets"].finalize()
-                norm[str(lid)] = {
-                    "inputs": {"mean": m_in.tolist(), "std": s_in.tolist()},
-                    "targets": {"mean": m_tg.tolist(), "std": s_tg.tolist()},
-                }
-            with open(self.out_dir / "norm_stats.json", "w") as f:
-                json.dump(norm, f)
-            logger.info("norm_stats.json written")
+            if layer_ids:
+                for lid in layer_ids:
+                    if lid in stats:
+                        with self._conditional_measure(f"norm_stats_finalize_layer_{lid}"):
+                            m_in, s_in = stats[lid]["inputs"].finalize()
+                            m_tg, s_tg = stats[lid]["targets"].finalize()
+                        norm[str(lid)] = {
+                            "inputs": {"mean": m_in.tolist(), "std": s_in.tolist()},
+                            "targets": {"mean": m_tg.tolist(), "std": s_tg.tolist()},
+                        }
+                    else:
+                        logger.warning(f"Layer ID {lid} not found in stats dict during norm_stats finalization.")
+            else:
+                logger.warning("layer_ids is None, cannot write norm_stats.")
 
-            # Upload as well if remote
-            norm_path = self.out_dir / "norm_stats.json"
-            if self.storage_type == "remote" and self.cfg.remote_server_url:
-                try:
-                    self._upload_json(norm_path, "norm_stats")
-                    logger.info("norm_stats.json uploaded to server")
-                except Exception as e:
-                    logger.warning("Failed to upload norm_stats.json: %s", e)
+            if norm:
+                with self._conditional_measure("norm_stats_json_write"):
+                    with open(self.out_dir / "norm_stats.json", "w") as f:
+                        json.dump(norm, f)
+                logger.info("norm_stats.json written")
+
+                norm_path = self.out_dir / "norm_stats.json"
+                if self.storage_type == "remote" and self.cfg.remote_server_url:
+                    with self._conditional_measure("norm_stats_json_upload"):
+                        try:
+                            self._upload_json(norm_path, "norm_stats")
+                            logger.info("norm_stats.json uploaded to server")
+                        except Exception as e:
+                            logger.warning("Failed to upload norm_stats.json: %s", e)
+            elif cfg.compute_norm_stats:
+                logger.warning("Norm stats computation was enabled, but no norm stats were generated.")
 
         # Finish uploading (only if we are in remote mode)
-        if self.storage_type == "remote" and self.uploader:
-            self.upload_q.put(None)
-            self.upload_q.join()
+        if self.storage_type == "remote" and self.uploader and self.upload_q:
+            with self._conditional_measure("uploader_join"):
+                self.upload_q.put(None)
+                self.upload_q.join()
         logger.info("Finished: %d chunks, %s tokens", c_idx, f"{g_row:,}")
+        if self.profiler:
+            self.profiler.log_system_metrics("final_system_state")
+            self.profiler.report()
+
+    # ------------------------------------------------------------------
+    @contextmanager
+    def _conditional_measure(self, name: str):
+        """Wrapper for profiler.measure that only runs if profiler is enabled."""
+        if self.profiler:
+            with self.profiler.measure(name):
+                yield
+        else:
+            yield
 
     # ------------------------------------------------------------------
     def _write_chunk(
@@ -474,55 +726,111 @@ class ActivationGenerator:
         manifest_rows: List[np.ndarray],
         offset: int,
     ):
-        perm = torch.randperm(rows)
-        p = self.out_dir / f"chunk_{chunk_idx}.h5"
+        with self._conditional_measure(f"chunk_write_total_idx_{chunk_idx}"):
+            with self._conditional_measure(f"chunk_{chunk_idx}_permutation_generation"):
+                perm = torch.randperm(rows)
 
-        # --- Determine h5py dtype string from torch dtype --- #
-        if self.torch_dtype == torch.float32:
-            h5py_dtype_str = "float32"
-        elif self.torch_dtype == torch.float16:
-            h5py_dtype_str = "float16"
-        elif self.torch_dtype == torch.bfloat16:
-            # h5py doesn't natively support bfloat16, store as uint16
-            # Note: Client needs to be aware of this if using bfloat16
-            h5py_dtype_str = "uint16"
-            logger.warning("Storing bfloat16 as uint16 in HDF5. Ensure client handles conversion.")
-        else:
-            raise ValueError(f"Unsupported torch_dtype for HDF5: {self.torch_dtype}")
-        # ----------------------------------------------------- #
+            p = self.out_dir / f"chunk_{chunk_idx}.h5"
 
-        try:
-            with h5py.File(p, "w", libver="latest") as hf:
-                _create_datasets(hf, layer_ids, rows, d_model, h5py_dtype=h5py_dtype_str)
-                for lid in layer_ids:
-                    inp = torch.cat(buf_inp[lid], 0)[perm].to(self.torch_dtype).numpy()
-                    tgt = torch.cat(buf_tgt[lid], 0)[perm].to(self.torch_dtype).numpy()
-                    # View casting for bfloat16 before saving
-                    if h5py_dtype_str == "uint16" and inp.dtype == np.dtype("bfloat16"):
-                        inp = inp.view(np.uint16)
-                        tgt = tgt.view(np.uint16)
+            if self.torch_dtype == torch.float32:
+                h5py_dtype_str = "float32"
+            elif self.torch_dtype == torch.float16:
+                h5py_dtype_str = "float16"
+            elif self.torch_dtype == torch.bfloat16:
+                h5py_dtype_str = "uint16"
+                logger.warning("Storing bfloat16 as uint16 in HDF5. Ensure client handles conversion.")
+            else:
+                raise ValueError(f"Unsupported torch_dtype for HDF5: {self.torch_dtype}")
 
-                    hf[f"layer_{lid}/inputs"][:] = inp
-                    hf[f"layer_{lid}/targets"][:] = tgt
-        except (IOError, OSError) as e:
-            logger.error(f"Failed to write HDF5 chunk {p}: {e}", exc_info=True)
-            # Attempt to remove potentially corrupted partial file
             try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                logger.warning(f"Failed to remove partial chunk file {p} after write error.")
-            # Re-raise to halt generation
-            raise RuntimeError(f"Fatal error writing HDF5 chunk {chunk_idx}") from e
+                with self._conditional_measure(f"chunk_{chunk_idx}_hdf5_file_open_and_create_datasets"):
+                    with h5py.File(p, "w", libver="latest") as hf:
+                        _create_datasets(hf, layer_ids, rows, d_model, h5py_dtype=h5py_dtype_str)
 
-        # Append manifest rows for this chunk
-        m = np.empty((rows, 2), dtype="<u4")
-        m[:, 0] = chunk_idx
-        m[:, 1] = np.arange(rows, dtype="<u4")
-        manifest_rows.append(m)
+                        # --- Phase 2a: Parallel Layer Writing ---
+                        # First, prepare all the data outside the parallel execution
+                        layer_data = {}
+                        for lid in layer_ids:
+                            with self._conditional_measure(f"chunk_{chunk_idx}_layer_{lid}_data_prep"):
+                                # Concatenate tensors
+                                with self._conditional_measure(f"chunk_{chunk_idx}_layer_{lid}_concat"):
+                                    inp_concat = torch.cat(buf_inp[lid], 0)
+                                    tgt_concat = torch.cat(buf_tgt[lid], 0)
 
-        logger.debug("chunk %d written (%d rows)", chunk_idx, rows)
-        if self.storage_type == "remote" and self.uploader:
-            self.upload_q.put(p)
+                                # Apply permutation
+                                with self._conditional_measure(f"chunk_{chunk_idx}_layer_{lid}_permute"):
+                                    inp_perm = inp_concat[perm]
+                                    tgt_perm = tgt_concat[perm]
+
+                                # Convert to numpy
+                                with self._conditional_measure(f"chunk_{chunk_idx}_layer_{lid}_convert_numpy"):
+                                    inp_np = inp_perm.to(self.torch_dtype).numpy()
+                                    tgt_np = tgt_perm.to(self.torch_dtype).numpy()
+
+                                # Handle bfloat16 conversion
+                                if h5py_dtype_str == "uint16" and inp_np.dtype == np.dtype("bfloat16"):
+                                    inp_np = inp_np.view(np.uint16)
+                                    tgt_np = tgt_np.view(np.uint16)
+
+                                # Store prepared data
+                                layer_data[lid] = (inp_np, tgt_np)
+
+                        # Helper function for writing a single layer's data
+                        def write_layer_data(layer_id: int, inputs_data: np.ndarray, targets_data: np.ndarray):
+                            """Write a single layer's data to HDF5"""
+                            try:
+                                hf[f"layer_{layer_id}/inputs"][:] = inputs_data
+                                hf[f"layer_{layer_id}/targets"][:] = targets_data
+                                return layer_id, None  # Success
+                            except Exception as e:
+                                logger.error(f"Error writing layer {layer_id}: {e}")
+                                return layer_id, e
+
+                        # Use ThreadPoolExecutor for parallel writes
+                        with self._conditional_measure(f"chunk_{chunk_idx}_parallel_hdf5_writes"):
+                            # Limit workers to avoid overwhelming I/O
+                            max_workers = min(4, len(layer_ids))
+
+                            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                                # Submit all write tasks
+                                futures = {}
+                                for lid, (inp_data, tgt_data) in layer_data.items():
+                                    future = executor.submit(write_layer_data, lid, inp_data, tgt_data)
+                                    futures[future] = lid
+
+                                # Wait for all writes to complete and check for errors
+                                write_errors = []
+                                for future in as_completed(futures):
+                                    layer_id = futures[future]
+                                    try:
+                                        _, error = future.result()
+                                        if error:
+                                            write_errors.append((layer_id, error))
+                                    except Exception as e:
+                                        write_errors.append((layer_id, e))
+
+                                # If any writes failed, raise an error
+                                if write_errors:
+                                    error_msg = "; ".join([f"Layer {lid}: {e}" for lid, e in write_errors])
+                                    raise RuntimeError(f"Failed to write some layers: {error_msg}")
+
+            except (IOError, OSError) as e:
+                logger.error(f"Failed to write HDF5 chunk {p}: {e}", exc_info=True)
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    logger.warning(f"Failed to remove partial chunk file {p} after write error.")
+                raise RuntimeError(f"Fatal error writing HDF5 chunk {chunk_idx}") from e
+
+            m = np.empty((rows, 2), dtype="<u4")
+            m[:, 0] = chunk_idx
+            m[:, 1] = np.arange(rows, dtype="<u4")
+            with self._conditional_measure(f"chunk_{chunk_idx}_manifest_append"):
+                manifest_rows.append(m)
+
+            logger.debug("chunk %d written (%d rows)", chunk_idx, rows)
+            if self.storage_type == "remote" and self.uploader and self.upload_q:
+                self.upload_q.put(p)
 
     # ------------------------------------------------------------------
     def set_storage_type(self, storage_type: str):
@@ -539,19 +847,13 @@ class ActivationGenerator:
         if st not in {"local", "remote"}:
             raise ValueError("storage_type must be 'local' or 'remote'")
 
-        # If nothing changes, we are done.
         if st == self.storage_type:
             return
 
-        # Switching to remote: ensure server URL is configured and uploader is
-        # running.
         if st == "remote":
             if self.cfg.remote_server_url is None:
-                raise ValueError(
-                    "Cannot set storage_type to 'remote' because " "cfg.remote_server_url is not configured."
-                )
+                raise ValueError("Cannot set storage_type to 'remote' because cfg.remote_server_url is not configured.")
             if self.uploader is None:
-                # Lazily start a new uploader thread
                 self.uploader = threading.Thread(
                     target=_async_uploader,
                     args=(self.upload_q, self.cfg),
@@ -559,12 +861,10 @@ class ActivationGenerator:
                 )
                 self.uploader.start()
         else:  # switching to local
-            if self.uploader is not None:
-                # Gracefully terminate the uploader thread
+            if self.uploader is not None and self.upload_q:
                 self.upload_q.put(None)
                 self.uploader.join()
                 self.uploader = None
-
         self.storage_type = st
 
     # ------------------------------------------------------------------
@@ -581,7 +881,8 @@ class ActivationGenerator:
             raise ValueError("endpoint must be 'metadata' or 'norm_stats'")
 
         if not self.cfg.remote_server_url:
-            raise ValueError("remote_server_url is not configured for upload")
+            logger.warning(f"Attempted to upload {path.name} but remote_server_url is not configured.")
+            return
 
         dataset_name = os.path.basename(self.cfg.dataset_path)
         dataset_id = quote(f"{self.cfg.model_name}/{dataset_name}_{self.cfg.dataset_split}", safe="")
@@ -602,7 +903,7 @@ class ActivationGenerator:
                 logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to upload {path.name} to {endpoint}: {e}")
                 if attempt + 1 == max_retries:
                     logger.error(f"Final attempt failed to upload {path.name}. Giving up.")
-                    raise RuntimeError(f"Failed to upload {path.name} after {max_retries} attempts") from e
+                    return
                 else:
                     delay = base_delay * (2**attempt)
                     logger.info(f"Retrying upload of {path.name} in {delay:.1f} seconds...")
@@ -619,7 +920,8 @@ class ActivationGenerator:
         base_delay = 2  # seconds, slightly longer for potentially larger files
 
         if not self.cfg.remote_server_url:
-            raise ValueError("remote_server_url is not configured for upload")
+            logger.warning(f"Attempted to upload {path.name} but remote_server_url is not configured.")
+            return
 
         dataset_name = os.path.basename(self.cfg.dataset_path)
         dataset_id = quote(f"{self.cfg.model_name}/{dataset_name}_{self.cfg.dataset_split}", safe="")
@@ -629,14 +931,12 @@ class ActivationGenerator:
         for attempt in range(max_retries):
             try:
                 with open(path, "rb") as f:
-                    # Use the correct key expected by the server endpoint (e.g., manifest_file)
-                    file_key = f"{endpoint}_file"  # Dynamically create key, assuming convention
-                    if endpoint == "manifest":  # Explicit mapping if needed
+                    file_key = f"{endpoint}_file"
+                    if endpoint == "manifest":
                         file_key = "manifest_file"
-                    # Add other endpoint -> key mappings here if necessary
 
                     files = {file_key: (path.name, f, "application/octet-stream")}
-                    r = requests.post(url, files=files, timeout=300)  # Increased timeout
+                    r = requests.post(url, files=files, timeout=300)
                     r.raise_for_status()
                     logger.info(f"Successfully uploaded {path.name} to {endpoint} endpoint on attempt {attempt + 1}")
                     return  # Success
@@ -644,27 +944,35 @@ class ActivationGenerator:
                 logger.warning(f"Attempt {attempt + 1}/{max_retries} failed to upload {path.name} to {endpoint}: {e}")
                 if attempt + 1 == max_retries:
                     logger.error(f"Final attempt failed to upload {path.name}. Giving up.")
-                    raise RuntimeError(f"Failed to upload {path.name} after {max_retries} attempts") from e
+                    return
                 else:
                     delay = base_delay * (2**attempt)
                     logger.info(f"Retrying upload of {path.name} in {delay:.1f} seconds...")
                     time.sleep(delay)
             except Exception as e:
-                # Catch other potential errors during file handling/request prep
                 logger.error(
                     f"Unexpected error during upload attempt {attempt + 1} for {path.name}: {e}", exc_info=True
                 )
-                # Treat unexpected errors as fatal for now
-                raise RuntimeError(f"Unexpected error uploading {path.name}") from e
+                return
 
 
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import yaml, argparse
+    import yaml
+    import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True)
     cfg_path = ap.parse_args().config
     with open(cfg_path) as f:
-        cfg = ActivationConfig(**yaml.safe_load(f))
-    ActivationGenerator(cfg).generate_and_save()
+        loaded_config = yaml.safe_load(f)
+
+    try:
+        activation_config_instance = ActivationConfig(**loaded_config)
+    except TypeError as e:
+        print(f"Error creating ActivationConfig from YAML. Ensure all keys are correct: {e}")
+        import sys
+
+        sys.exit(1)
+
+    ActivationGenerator(activation_config_instance).generate_and_save()

@@ -183,6 +183,14 @@ def parse_arguments():
         help="Storage workflow type ('local' saves files, 'remote' prepares for server but is stubbed).",
     )
 
+    # --- Profiling Argument ---
+    parser.add_argument(
+        "--enable_profiling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable detailed performance profiling during activation generation.",
+    )
+
     # --- NNsight Arguments (Potentially pass as JSON strings) ---
     parser.add_argument(
         "--nnsight_tracer_kwargs_json",
@@ -248,6 +256,7 @@ def main():
         upload_max_retries=args.upload_max_retries,
         upload_initial_backoff=args.upload_initial_backoff,
         upload_max_backoff=args.upload_max_backoff,
+        enable_profiling=args.enable_profiling,
     )
 
     # Instantiate the generator, passing the config and optional device override
