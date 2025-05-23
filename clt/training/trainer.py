@@ -442,54 +442,54 @@ class CLTTrainer:
         """
         # Print startup message from rank 0 only
         if not self.distributed or self.rank == 0:
-            print(f"Starting CLT training on {self.device}...")
-            print(
+            logger.info(f"Starting CLT training on {self.device}...")
+            logger.info(
                 f"Model has {self.clt_config.num_features} features per layer "
                 f"and {self.clt_config.num_layers} layers"
             )
-            print(f"Training for {self.training_config.training_steps} steps.")
-            print(f"Logging to {self.log_dir}")
+            logger.info(f"Training for {self.training_config.training_steps} steps.")
+            logger.info(f"Logging to {self.log_dir}")
             if self.distributed:
-                print(f"Distributed training with {self.world_size} processes (Tensor Parallelism)")
+                logger.info(f"Distributed training with {self.world_size} processes (Tensor Parallelism)")
 
             # Check if using normalization and notify user
             if self.training_config.normalization_method == "estimated_mean_std":
-                print("\n>>> NORMALIZATION PHASE <<<")
-                print("Normalization statistics are being estimated from dataset activations.")
-                print("This may take some time, but happens only once before training begins.")
-                print(f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n")
+                logger.info("\n>>> NORMALIZATION PHASE <<<")
+                logger.info("Normalization statistics are being estimated from dataset activations.")
+                logger.info("This may take some time, but happens only once before training begins.")
+                logger.info(f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n")
 
             # Make sure we flush stdout to ensure prints appear immediately,
             # especially important in Jupyter/interactive environments
             sys.stdout.flush()
             # Wait for 1 second to ensure output is displayed before training starts
             time.sleep(1)
-            print("\n>>> TRAINING PHASE <<<")
+            logger.info("\n>>> TRAINING PHASE <<<")
             sys.stdout.flush()
 
         # After the existing startup messages
         if self.distributed:
-            print("\n!!! DIAGNOSTIC INFO !!!")
-            print(f"Rank {self.rank}: Process group type: {type(self.process_group)}")
-            print(f"Rank {self.rank}: RowParallelLinear _reduce does NOT divide by world_size")
-            print(f"Rank {self.rank}: Using weight regularization in sparsity penalty")
-            print(f"Rank {self.rank}: Averaging replicated parameter gradients")
+            logger.info("\n!!! DIAGNOSTIC INFO !!!")
+            logger.info(f"Rank {self.rank}: Process group type: {type(self.process_group)}")
+            logger.info(f"Rank {self.rank}: RowParallelLinear _reduce does NOT divide by world_size")
+            logger.info(f"Rank {self.rank}: Using weight regularization in sparsity penalty")
+            logger.info(f"Rank {self.rank}: Averaging replicated parameter gradients")
             # Check if activation store has rank/world attributes before accessing
             store_rank = getattr(self.activation_store, "rank", "N/A")
             store_world = getattr(self.activation_store, "world", "N/A")
-            print(f"Rank {self.rank}: Data sharding: rank={store_rank}, world={store_world}")
-            print(f"Rank {self.rank}: Batch size tokens: {self.training_config.train_batch_size_tokens}")
-            print(f"Rank {self.rank}: Sparsity lambda: {self.training_config.sparsity_lambda}")
+            logger.info(f"Rank {self.rank}: Data sharding: rank={store_rank}, world={store_world}")
+            logger.info(f"Rank {self.rank}: Batch size tokens: {self.training_config.train_batch_size_tokens}")
+            logger.info(f"Rank {self.rank}: Sparsity lambda: {self.training_config.sparsity_lambda}")
 
             # Check if activation store actually loaded correctly
             batch_avail = next(iter(self.activation_store), None)
-            print(f"Rank {self.rank}: First batch available: {batch_avail is not None}")
+            logger.info(f"Rank {self.rank}: First batch available: {batch_avail is not None}")
 
             # Force torch to compile/execute our code by running a tiny forward/backward pass
             dummy = torch.ones(1, device=self.device, requires_grad=True)
             dummy_out = dummy * 2
             dummy_out.backward()
-            print("!!! END DIAGNOSTIC !!!\n")
+            logger.info("!!! END DIAGNOSTIC !!!\n")
 
         # --- Enable Anomaly Detection (if configured) ---
         if self.training_config.debug_anomaly:
@@ -584,7 +584,7 @@ class CLTTrainer:
                 except StopIteration:
                     # Rank 0 prints message
                     if not self.distributed or self.rank == 0:
-                        print("Activation store exhausted. Training finished early.")
+                        logger.info("Activation store exhausted. Training finished early.")
                     if self.distributed:
                         dist.barrier()  # Ensure all ranks see this
                     break  # Exit training loop if data runs out
@@ -593,7 +593,7 @@ class CLTTrainer:
                 # This check should ideally happen *before* moving data potentially
                 if not inputs or not targets or not any(v.numel() > 0 for v in inputs.values()):
                     if not self.distributed or self.rank == 0:
-                        print(f"\nRank {self.rank}: Warning: Received empty batch at step {step}. Skipping.")
+                        logger.warning(f"Rank {self.rank}: Warning: Received empty batch at step {step}. Skipping.")
                     continue
 
                 # --- BEGIN: One-time Normalization Check ---
@@ -901,12 +901,12 @@ class CLTTrainer:
 
         except KeyboardInterrupt:
             if not self.distributed or self.rank == 0:
-                print("\nTraining interrupted by user.")
+                logger.info("\nTraining interrupted by user.")
         finally:
             if isinstance(pbar, tqdm):
                 pbar.close()
             if not self.distributed or self.rank == 0:
-                print(f"Training loop finished at step {step}.")
+                logger.info(f"Training loop finished at step {step}.")
 
         # Sync before final save attempt
         if self.distributed:
@@ -937,37 +937,39 @@ class CLTTrainer:
                 trainer_state_to_save=final_trainer_state_for_checkpoint,
             )
         except IOError as e:  # More specific: catch IOError for checkpoint saving
-            print(f"Rank {self.rank}: Warning: Failed to save final distributed model state due to IOError: {e}")
+            logger.warning(
+                f"Rank {self.rank}: Warning: Failed to save final distributed model state due to IOError: {e}"
+            )
         except Exception as e:  # Catch other potential errors during final save but log them as more critical
-            print(f"Rank {self.rank}: CRITICAL: Unexpected error during final model state save: {e}")
+            logger.critical(f"Rank {self.rank}: CRITICAL: Unexpected error during final model state save: {e}")
 
         # Rank 0 saves store, metrics, logs artifact
         if not self.distributed or self.rank == 0:
-            print(f"Saving final activation store state to {final_store_path}...")
+            logger.info(f"Saving final activation store state to {final_store_path}...")
             os.makedirs(final_checkpoint_dir, exist_ok=True)
             try:
                 # Check if the store has a close method before calling (for compatibility)
                 if hasattr(self.activation_store, "close") and callable(getattr(self.activation_store, "close")):
                     self.activation_store.close()
             except IOError as e:  # More specific: catch IOError for store closing
-                print(f"Rank 0: Warning: Failed to close activation store due to IOError: {e}")
+                logger.warning(f"Rank 0: Warning: Failed to close activation store due to IOError: {e}")
             except Exception as e:  # Catch other potential errors during store close
-                print(f"Rank 0: Warning: Unexpected error closing activation store: {e}")
+                logger.warning(f"Rank 0: Warning: Unexpected error closing activation store: {e}")
 
-            print("Saving final metrics...")
+            logger.info("Saving final metrics...")
             # self.metric_logger._save_metrics_to_disk() # Final save - this should be robust
             try:
                 self.metric_logger._save_metrics_to_disk()
             except IOError as e:
-                print(f"Rank 0: Warning: Failed to save final metrics to disk due to IOError: {e}")
+                logger.warning(f"Rank 0: Warning: Failed to save final metrics to disk due to IOError: {e}")
             except Exception as e:
-                print(f"Rank 0: Warning: Unexpected error saving final metrics: {e}")
+                logger.warning(f"Rank 0: Warning: Unexpected error saving final metrics: {e}")
 
             # --- Save CLT Config to JSON ---
             # The config saved here will now reflect the configuration *during training* (e.g. BatchTopK)
             # The user will need to run estimate_theta_posthoc and then save the converted JumpReLU model themselves.
             config_save_path = os.path.join(self.log_dir, "cfg.json")
-            print(f"Saving CLT configuration (as trained) to {config_save_path}...")
+            logger.info(f"Saving CLT configuration (as trained) to {config_save_path}...")
             try:
                 config_dict_as_trained = asdict(self.clt_config)
 
@@ -988,16 +990,16 @@ class CLTTrainer:
 
                 with open(config_save_path, "w") as f:
                     json.dump(config_dict_as_trained, f, indent=2)
-                print(f"Successfully saved training configuration to {config_save_path}")
+                logger.info(f"Successfully saved training configuration to {config_save_path}")
                 if self.clt_config.activation_fn == "batchtopk":
-                    print(
+                    logger.info(
                         "NOTE: Model was trained with BatchTopK. Run estimate_theta_posthoc() on the saved model to convert to JumpReLU and finalize theta values."
                     )
 
             except IOError as e:  # More specific: catch IOError for config saving
-                print(f"Rank 0: Warning: Failed to save CLT configuration to JSON due to IOError: {e}")
+                logger.warning(f"Rank 0: Warning: Failed to save CLT configuration to JSON due to IOError: {e}")
             except Exception as e:  # Catch other potential errors during config saving
-                print(f"Rank 0: Warning: Unexpected error saving CLT configuration to JSON: {e}")
+                logger.warning(f"Rank 0: Warning: Unexpected error saving CLT configuration to JSON: {e}")
             # --- End Save CLT Config ---
 
             # Log final checkpoint directory as artifact
@@ -1005,7 +1007,7 @@ class CLTTrainer:
 
             # Finish WandB logging
             self.wandb_logger.finish()
-            print(f"Training completed! Final checkpoint saved to {final_checkpoint_dir}")
+            logger.info(f"Training completed! Final checkpoint saved to {final_checkpoint_dir}")
 
         # --- Close the activation store (stops prefetch thread if applicable) --- #
         if hasattr(self.activation_store, "close") and callable(getattr(self.activation_store, "close")):

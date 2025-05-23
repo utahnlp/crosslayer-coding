@@ -6,6 +6,7 @@ import logging  # Import logging
 import time  # Import time
 import datetime  # Import datetime
 
+from clt.config import TrainingConfig, CLTConfig  # Ensure these are imported for type hints
 from clt.models.clt import CrossLayerTranscoder
 
 # Configure logging
@@ -50,6 +51,7 @@ class CLTEvaluator:
         # Store normalisation stats if provided
         self.mean_tg = mean_tg or {}
         self.std_tg = std_tg or {}
+        self.metrics_history: List[Dict[str, Any]] = []  # For storing metrics over time if needed
 
     @staticmethod
     def _log_density(density: torch.Tensor, eps: float = 1e-10) -> torch.Tensor:
@@ -185,13 +187,13 @@ class CLTEvaluator:
             Dictionary with L0 stats under 'sparsity/' and 'layerwise/l0/' keys.
         """
         if not activations or not any(v.numel() > 0 for v in activations.values()):
-            print("Warning: Received empty activations for sparsity computation. " "Returning zeros.")
-            num_layers = self.model.config.num_layers
+            if not self.model.world_size > 1 or self.model.rank == 0:
+                logger.warning("Warning: Received empty activations for sparsity computation. " "Returning zeros.")
             return {
                 "sparsity/total_l0": 0.0,
                 "sparsity/avg_l0": 0.0,
                 "sparsity/sparsity_fraction": 1.0,  # Renamed from 'sparsity'
-                "layerwise/l0": {f"layer_{i}": 0.0 for i in range(num_layers)},
+                "layerwise/l0": {f"layer_{i}": 0.0 for i in range(self.model.config.num_layers)},
             }
 
         per_layer_l0_dict = {}
@@ -401,7 +403,89 @@ class CLTEvaluator:
                     per_layer_dead_dict[f"layer_{layer_idx}"] = dead_neuron_mask[layer_idx].sum().item()
                 dead_neuron_metrics["layerwise/dead_features"] = per_layer_dead_dict
             else:
-                print(
-                    f"Warning: Received dead_neuron_mask with unexpected shape {dead_neuron_mask.shape}. Expected {expected_shape}. Skipping dead neuron eval metrics."
-                )
+                if not self.model.world_size > 1 or self.model.rank == 0:
+                    logger.warning(
+                        f"Warning: Received dead_neuron_mask with unexpected shape {dead_neuron_mask.shape}. Expected {expected_shape}. Skipping dead neuron eval metrics."
+                    )
         return dead_neuron_metrics
+
+    def print_evaluation_report(
+        self,
+        step: int,
+        metrics: Dict[str, Any],
+        detailed_metrics: Dict[str, Any],
+        current_training_config: Optional[TrainingConfig] = None,
+        current_clt_config: Optional[CLTConfig] = None,
+    ):
+        if not self.model.world_size > 1 or self.model.rank == 0:
+            logger.info(
+                "\n======================================================================="
+                "\n--- Model Evaluation Report ---"
+            )
+            logger.info(f"Evaluation at Step: {step}")
+            logger.info(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info("--- Overall Performance ---")
+            logger.info(f"  Total Reconstruction Loss: {metrics.get('reconstruction/total_loss', float('nan')):.4f}")
+            logger.info(f"  Total Sparsity Loss: {metrics.get('sparsity/total_loss', float('nan')):.4f}")
+            logger.info(
+                f"  Explained Variance (Avg): {metrics.get('reconstruction/explained_variance', float('nan')):.4f}"
+            )
+            logger.info(f"  NMSE (Avg): {metrics.get('reconstruction/nmse', float('nan')):.4f}")
+            logger.info(f"  L0 Norm (Avg per token): {metrics.get('sparsity/avg_l0', float('nan')):.2f}")
+            logger.info(f"  Sparsity Fraction: {metrics.get('sparsity/sparsity_fraction', float('nan')):.4f}")
+
+            # Layer-wise details
+            if metrics.get("layerwise/reconstruction_loss"):
+                logger.info("--- Layer-wise Reconstruction Loss ---")
+                for layer, loss in metrics["layerwise/reconstruction_loss"].items():
+                    logger.info(f"  {layer}: {loss:.4f}")
+
+            if metrics.get("layerwise/explained_variance"):
+                logger.info("--- Layer-wise Explained Variance ---")
+                for layer, ev in metrics["layerwise/explained_variance"].items():
+                    logger.info(f"  {layer}: {ev:.4f}")
+
+            if metrics.get("layerwise/nmse"):
+                logger.info("--- Layer-wise NMSE ---")
+                for layer, nmse_val in metrics["layerwise/nmse"].items():
+                    logger.info(f"  {layer}: {nmse_val:.4f}")
+
+            if metrics.get("layerwise/l0"):
+                logger.info("--- Layer-wise L0 Norm (Avg per token) ---")
+                for layer, l0 in metrics["layerwise/l0"].items():
+                    logger.info(f"  {layer}: {l0:.2f}")
+
+            # Feature density details
+            if detailed_metrics.get("feature_density_per_layer"):
+                logger.info("Feature Density Per Layer:")
+                for layer, density in detailed_metrics["feature_density_per_layer"].items():
+                    logger.info(f"  Layer {layer}: {density:.4f}")
+
+            # Dead features details
+            if detailed_metrics.get("dead_features_per_layer_eval"):
+                logger.info("Dead Features Per Layer (Evaluation Batch):")
+                for layer, count in detailed_metrics["dead_features_per_layer_eval"].items():
+                    logger.info(f"  Layer {layer}: {count}")
+
+            # Active features details
+            if detailed_metrics.get("active_features_per_layer_eval"):
+                logger.info("Active Features Per Layer (Evaluation Batch):")
+                for layer, count in detailed_metrics["active_features_per_layer_eval"].items():
+                    logger.info(f"  Layer {layer}: {count}")
+
+            # Overall dead/active features
+            logger.info(f"Total Dead Features (Eval Batch): {detailed_metrics.get('dead_features/total_eval', 0)}")
+            logger.info(f"Total Active Features (Eval Batch): {detailed_metrics.get('active_features/total_eval', 0)}")
+
+            if current_training_config:
+                logger.info("--- Training Configuration ---")
+                logger.info(f"  Learning Rate: {current_training_config.learning_rate}")
+                logger.info(f"  Sparsity Lambda: {current_training_config.sparsity_lambda}")
+                # Add other relevant training config details
+
+            if current_clt_config:
+                logger.info("--- CLT Model Configuration ---")
+                logger.info(f"  Activation Function: {current_clt_config.activation_fn}")
+                logger.info(f"  Number of Features: {current_clt_config.num_features}")
+                # Add other relevant CLT config details
+            logger.info("=======================================================================\n")
