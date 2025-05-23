@@ -197,12 +197,24 @@ class JumpReLU(torch.autograd.Function):
             grad_threshold_per_element = grad_output * local_grad_theta
 
             if grad_threshold_per_element.dim() > threshold.dim():
+                # Handles cases like input (B,F), threshold (F) or input (F), threshold (scalar)
                 dims_to_sum = tuple(range(grad_threshold_per_element.dim() - threshold.dim()))
                 grad_threshold = grad_threshold_per_element.sum(dim=dims_to_sum)
-                if threshold.shape != torch.Size([]):
+                # Ensure final shape matches threshold, especially if sum squeezed dimensions
+                if grad_threshold.shape != threshold.shape:
                     grad_threshold = grad_threshold.reshape(threshold.shape)
-            else:
+            elif grad_threshold_per_element.dim() == threshold.dim():
+                # Handles cases like input (F), threshold (F), or input [1], threshold [1]
+                grad_threshold = grad_threshold_per_element
+                # Defensive reshape, though shapes should ideally match here.
+                if grad_threshold.shape != threshold.shape:
+                    grad_threshold = grad_threshold.reshape(threshold.shape)
+            else:  # grad_threshold_per_element.dim() < threshold.dim()
+                # This case is less common (e.g. input scalar, threshold vector - not typical for this op).
+                # Defaulting to sum and reshape, primarily for scalar threshold case.
                 grad_threshold = grad_threshold_per_element.sum()
+                if grad_threshold.shape != threshold.shape:
+                    grad_threshold = grad_threshold.reshape(threshold.shape)
         return grad_input, grad_threshold, None
 
 

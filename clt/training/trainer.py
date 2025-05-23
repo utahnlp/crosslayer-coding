@@ -580,8 +580,6 @@ class CLTTrainer:
                         tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
                         gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
                         dist.all_gather(gathered, tok_cnt_t)
-                        if self.rank == 0:
-                            print("Batch token-count per rank:", [int(x.item()) for x in gathered])
 
                 except StopIteration:
                     # Rank 0 prints message
