@@ -580,8 +580,6 @@ class CLTTrainer:
                         tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
                         gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
                         dist.all_gather(gathered, tok_cnt_t)
-                        if self.rank == 0:
-                            print("Batch token-count per rank:", [int(x.item()) for x in gathered])
 
                 except StopIteration:
                     # Rank 0 prints message
@@ -794,7 +792,7 @@ class CLTTrainer:
                         # --- Log per-layer standard deviation of pre-activations ---
                         # This requires getting the pre-activations first.
                         # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
-                        preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
+                        preactivations_eval_dict, _ = self.model._encode_all_layers(inputs)
                         layerwise_preact_std_dev: Dict[str, float] = {}
                         if preactivations_eval_dict:
                             for layer_idx, preact_tensor in preactivations_eval_dict.items():
