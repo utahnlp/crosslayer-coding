@@ -6,14 +6,20 @@ import torch.distributed as dist
 
 from clt.config import CLTConfig
 from clt.models.base import BaseTranscoder
-from clt.models.parallel import ColumnParallelLinear, RowParallelLinear  # Import parallel layers
+from clt.models.parallel import RowParallelLinear  # Removed ColumnParallelLinear
 from clt.models.activations import BatchTopK, JumpReLU, TokenTopK  # Import BatchTopK, JumpReLU and TokenTopK
 
 # Import the new encoding helper functions
-from clt.models.encoding import get_preactivations as _get_preactivations_helper
-from clt.models.encoding import _encode_all_layers as _encode_all_layers_helper
-from clt.models.encoding import _apply_batch_topk_helper
+from clt.models.encoding import (
+    _apply_batch_topk_helper,
+)  # Removed _get_preactivations_helper, _encode_all_layers_helper
 from clt.models.encoding import _apply_token_topk_helper
+
+# Import the new Encoder module
+from clt.models.encoder import Encoder
+
+# Import the new Decoder module
+from clt.models.decoder import Decoder
 
 # Import the activation registry
 from clt.activations.registry import get_activation_fn
@@ -81,19 +87,11 @@ class CrossLayerTranscoder(BaseTranscoder):
 
         logger.info(f"CLT TP model initialized on rank {self.rank} with device {self.device} and dtype {self.dtype}")
 
-        self.encoders = nn.ModuleList(
-            [
-                ColumnParallelLinear(
-                    in_features=config.d_model,
-                    out_features=config.num_features,
-                    bias=True,
-                    process_group=self.process_group,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                for _ in range(config.num_layers)
-            ]
+        # Instantiate the new Encoder module
+        self.encoder_module = Encoder(
+            config=config, process_group=self.process_group, device=self.device, dtype=self.dtype
         )
+        # The old self.encoders = nn.ModuleList(...) is now removed.
 
         self.decoders = nn.ModuleDict(
             {
@@ -112,6 +110,19 @@ class CrossLayerTranscoder(BaseTranscoder):
                 for tgt_layer in range(src_layer, config.num_layers)
             }
         )
+
+        # Instantiate the new Decoder module
+        self.decoder_module = Decoder(
+            config=config, process_group=self.process_group, device=self.device, dtype=self.dtype
+        )
+        # Remove the old self.decoders and _cached_decoder_norms registration
+        del self.decoders
+        # Note: _cached_decoder_norms was registered in __init__ before,
+        # now it's handled within the Decoder module itself.
+        # If self._cached_decoder_norms = None was present, it should be removed too.
+        # Checking the original code, _cached_decoder_norms was an attribute, not registered with register_buffer initially for the main class.
+        # It was registered with register_buffer for the theta estimation buffers.
+        # The Decoder class now handles its own _cached_decoder_norms registration.
 
         if self.config.activation_fn == "jumprelu":
             initial_threshold_val = torch.ones(
@@ -168,40 +179,17 @@ class CrossLayerTranscoder(BaseTranscoder):
 
     def get_preactivations(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Get pre-activation values (full tensor) for features at the specified layer."""
-        # Ensure input is on the correct device and dtype before passing to helper
-        x_processed = x.to(device=self.device, dtype=self.dtype)
-
-        return _get_preactivations_helper(
-            x_processed,
-            layer_idx,
-            self.config,
-            self.encoders,
-            self.device,  # Pass self.device
-            self.dtype,  # Pass self.dtype
-            self.rank,
-        )
+        # Call the new encoder module's method directly
+        return self.encoder_module.get_preactivations(x, layer_idx)
 
     def _encode_all_layers(
         self, inputs: Dict[int, torch.Tensor]
-    ) -> Tuple[Dict[int, torch.Tensor], List[Tuple[int, int, int]], torch.device, torch.dtype]:
+    ) -> Tuple[Dict[int, torch.Tensor], List[Tuple[int, int, int]]]:  # Return type updated
         """Encodes inputs for all layers and returns pre-activations and original shape info."""
-        # self.device and self.dtype are guaranteed to be set from __init__
-
-        # Ensure all input tensors are on the determined effective device and dtype
-        processed_inputs: Dict[int, torch.Tensor] = {}
-        for layer_idx, x_orig in inputs.items():
-            processed_inputs[layer_idx] = x_orig.to(device=self.device, dtype=self.dtype)
-
-        # Call the helper function with processed inputs and determined device/dtype
-        # The helper returns the device and dtype it operated on, which should match self.device and self.dtype
-        preactivations_dict, original_shapes_info, returned_device, returned_dtype = _encode_all_layers_helper(
-            processed_inputs, self.config, self.encoders, self.device, self.dtype, self.rank
-        )
-        # The returned_device and returned_dtype from the helper reflect what was used.
-        # Assert they match self.device and self.dtype for sanity if needed
-        # assert returned_device == self.device, "Device mismatch in _encode_all_layers_helper"
-        # assert returned_dtype == self.dtype, "Dtype mismatch in _encode_all_layers_helper"
-        return preactivations_dict, original_shapes_info, self.device, self.dtype  # Return self.device, self.dtype
+        # Call the encoder module's method
+        # The encoder_module handles device and dtype internally for its operations.
+        # Inputs are processed within the encoder_module's methods.
+        return self.encoder_module.encode_all_layers(inputs)
 
     @torch.no_grad()
     def _update_min_selected_preactivations(
@@ -452,6 +440,8 @@ class CrossLayerTranscoder(BaseTranscoder):
                 decoded = decoder(activation_tensor)  # Removed try-except
                 reconstruction += decoded
         return reconstruction
+        # Call the new decoder module's method directly
+        return self.decoder_module.decode(a, layer_idx)
 
     def forward(self, inputs: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
         """Process inputs through the parallel transcoder model.
@@ -521,11 +511,9 @@ class CrossLayerTranscoder(BaseTranscoder):
             processed_inputs[layer_idx] = x_orig.to(device=self.device, dtype=self.dtype)
 
         if self.config.activation_fn == "batchtopk" or self.config.activation_fn == "topk":
-            # Note: _encode_all_layers_helper uses the device/dtype passed to it, which are self.device, self.dtype.
-            preactivations_dict, _, processed_device, processed_dtype = _encode_all_layers_helper(
-                processed_inputs, self.config, self.encoders, self.device, self.dtype, self.rank
-            )
-            # Assert processed_device == self.device and processed_dtype == self.dtype if needed
+            # _encode_all_layers now returns 2 values: preactivations_dict, original_shapes_info
+            # We only need preactivations_dict here.
+            preactivations_dict, _ = self._encode_all_layers(processed_inputs)
 
             if not preactivations_dict:  # Indicates helper returned empty, possibly due to all-empty inputs
                 activations = {}
@@ -678,6 +666,8 @@ class CrossLayerTranscoder(BaseTranscoder):
         self._cached_decoder_norms = full_decoder_norms
 
         return full_decoder_norms
+        # Call the new decoder module's method directly
+        return self.decoder_module.get_decoder_norms()
 
     @torch.no_grad()
     def estimate_theta_posthoc(
@@ -792,8 +782,7 @@ class CrossLayerTranscoder(BaseTranscoder):
             inputs_on_device = {k: v.to(device=target_device, dtype=self.dtype) for k, v in inputs_batch.items()}
             # _encode_all_layers uses self.device, self.dtype internally.
             # Since self.to(target_device) was called, self.device is now target_device.
-            preactivations_dict, _, current_op_dev, current_op_dtype = self._encode_all_layers(inputs_on_device)
-            # Assert current_op_dev == target_device and current_op_dtype == self.dtype if needed for strict checking
+            preactivations_dict, _ = self._encode_all_layers(inputs_on_device)
 
             if not preactivations_dict:
                 logger.warning(f"Rank {self.rank}: No preactivations. Skipping batch {processed_batches_total + 1}.")

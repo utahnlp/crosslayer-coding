@@ -794,7 +794,7 @@ class CLTTrainer:
                         # --- Log per-layer standard deviation of pre-activations ---
                         # This requires getting the pre-activations first.
                         # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
-                        preactivations_eval_dict, _, _, _ = self.model._encode_all_layers(inputs)
+                        preactivations_eval_dict, _ = self.model._encode_all_layers(inputs)
                         layerwise_preact_std_dev: Dict[str, float] = {}
                         if preactivations_eval_dict:
                             for layer_idx, preact_tensor in preactivations_eval_dict.items():
