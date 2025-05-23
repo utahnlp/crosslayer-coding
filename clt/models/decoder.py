@@ -2,11 +2,11 @@ import torch
 import torch.nn as nn
 from typing import Dict, Optional
 import logging
-import torch.distributed as dist
-from torch.distributed import ProcessGroup
 
 from clt.config import CLTConfig
 from clt.models.parallel import RowParallelLinear
+from clt.parallel import ops as dist_ops
+from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
 
@@ -31,12 +31,12 @@ class Decoder(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        if process_group is None or not dist.is_initialized():
+        if process_group is None or not dist_ops.is_dist_initialized_and_available():
             self.world_size = 1
             self.rank = 0
         else:
-            self.world_size = dist.get_world_size(process_group)
-            self.rank = dist.get_rank(process_group)
+            self.world_size = dist_ops.get_world_size(process_group)
+            self.rank = dist_ops.get_rank(process_group)
 
         self.decoders = nn.ModuleDict(
             {
@@ -175,8 +175,8 @@ class Decoder(nn.Module):
                             f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
                         )
 
-            if self.process_group is not None and dist.is_initialized():
-                dist.all_reduce(local_norms_sq_accum, op=dist.ReduceOp.SUM, group=self.process_group)
+            if self.process_group is not None and dist_ops.is_dist_initialized_and_available():
+                dist_ops.all_reduce(local_norms_sq_accum, op=dist_ops.SUM, group=self.process_group)
 
             full_decoder_norms[src_layer] = torch.sqrt(local_norms_sq_accum).to(self.dtype)
 

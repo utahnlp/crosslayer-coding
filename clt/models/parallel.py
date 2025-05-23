@@ -1,12 +1,12 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.distributed as dist
 from torch.distributed import ProcessGroup
 import math
 from typing import Callable, Optional, cast, Tuple
 
 from . import mark_replicated
+from clt.parallel import ops as dist_ops
 
 
 class _ParallelLinear(nn.Module):
@@ -32,14 +32,12 @@ class _ParallelLinear(nn.Module):
         super().__init__()
         self.process_group = process_group
 
-        # Handle non-distributed case
-        if process_group is None or not dist.is_initialized():
-            self.world_size = 1
-            self.rank = 0
+        # Handle non-distributed case using new utility functions
+        self.world_size = dist_ops.get_world_size(process_group)
+        self.rank = dist_ops.get_rank(process_group)
+        # If world_size is 1, process_group should effectively be None for logic below
+        if self.world_size == 1:
             self.process_group = None
-        else:
-            self.world_size = dist.get_world_size(process_group)
-            self.rank = dist.get_rank(process_group)
 
         self.partition_dim = partition_dim
         self.input_is_parallel = input_is_parallel
@@ -108,15 +106,16 @@ class _Gather(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_: torch.Tensor, process_group: ProcessGroup, dim: int, full_dim_size: Optional[int]):
-        if process_group is None or not dist.is_initialized() or dist.get_world_size(process_group) == 1:
+        # Use new utility functions
+        if not dist_ops.is_dist_initialized_and_available() or dist_ops.get_world_size(process_group) == 1:
             ctx.dim = dim
             ctx.local_dim = input_.size(dim)
             ctx.full_dim_size = full_dim_size or input_.size(dim)
             ctx.process_group = None  # Mark non-distributed case
             return input_
 
-        world_size = dist.get_world_size(process_group)
-        rank = dist.get_rank(process_group)
+        world_size = dist_ops.get_world_size(process_group)
+        rank = dist_ops.get_rank(process_group)
 
         ctx.dim = dim
         ctx.local_dim = input_.size(dim)
@@ -131,8 +130,8 @@ class _Gather(torch.autograd.Function):
         # can track the dependency (no copy!).
         gathered[rank] = input_contig
 
-        # Perform the collective.
-        dist.all_gather(gathered, input_contig, group=process_group)
+        # Perform the collective using new utility function wrapper
+        dist_ops.all_gather(gathered, input_contig, group=process_group)
 
         output = torch.cat(gathered, dim=dim)
 
@@ -150,10 +149,15 @@ class _Gather(torch.autograd.Function):
         grad_output = grad_outputs[0]
 
         # Non-distributed: gradient flows straight through.
-        if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
+        # Use new utility functions
+        if (
+            ctx.process_group is None
+            or not dist_ops.is_dist_initialized_and_available()
+            or dist_ops.get_world_size(ctx.process_group) == 1
+        ):
             return grad_output, None, None, None
 
-        rank = dist.get_rank(ctx.process_group)
+        rank = dist_ops.get_rank(ctx.process_group)
 
         # Compute start/end indices for this rank's slice along the gather dim.
         local_dim_padded = ctx.local_dim  # Already accounts for padding in weight shape.
@@ -179,25 +183,28 @@ class _Reduce(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, input_: torch.Tensor, process_group: Optional[ProcessGroup]):
-        if process_group is None or not dist.is_initialized() or dist.get_world_size(process_group) == 1:
+        # Use new utility functions
+        if not dist_ops.is_dist_initialized_and_available() or dist_ops.get_world_size(process_group) == 1:
             ctx.process_group = None  # Mark non-distributed case
             return input_
 
         ctx.process_group = process_group
         input_contig = input_.contiguous()  # Ensure contiguous before collective
 
-        # Perform the all-reduce with SUM operation.
-        # The operation is in-place on input_contig if it's the same object for all_reduce's output internally,
-        # or if all_reduce returns a new tensor, that's what we return.
-        # For clarity, let's assume all_reduce modifies input_contig or we assign its result.
-        dist.all_reduce(input_contig, op=dist.ReduceOp.SUM, group=process_group)
+        # Perform the all-reduce with SUM operation using new utility function wrapper.
+        dist_ops.all_reduce(input_contig, op=dist_ops.SUM, group=process_group)
         # The tensor input_contig now holds the sum.
         return input_contig
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         # Non-distributed: gradient flows straight through.
-        if ctx.process_group is None or not dist.is_initialized() or dist.get_world_size(ctx.process_group) == 1:
+        # Use new utility functions
+        if (
+            ctx.process_group is None
+            or not dist_ops.is_dist_initialized_and_available()
+            or dist_ops.get_world_size(ctx.process_group) == 1
+        ):
             # Match the number of forward inputs in return for consistency
             return grad_output.contiguous() if grad_output is not None else None, None
 
@@ -220,10 +227,11 @@ def _reduce(input_, process_group):
     and broken optimisation.  The caller can always divide afterwards if an average is
     truly desired, but for the core TP math we need the raw sum.
     """
-    if process_group is None or not dist.is_initialized():
+    # Use new utility functions
+    if not dist_ops.is_dist_initialized_and_available():
         return input_  # No-op if not distributed
 
-    world_size = dist.get_world_size(process_group)
+    world_size = dist_ops.get_world_size(process_group)
     if world_size == 1:
         return input_
 
@@ -239,14 +247,15 @@ def _split(input_, process_group, dim=-1):
     Assumes uniform padding, so each rank gets ceil(full_dim / world_size).
     Handles truncation for ranks that would exceed the original full dimension.
     """
-    if process_group is None or not dist.is_initialized():
+    # Use new utility functions
+    if not dist_ops.is_dist_initialized_and_available():
         return input_  # No-op if not distributed
 
-    world_size = dist.get_world_size(process_group)
+    world_size = dist_ops.get_world_size(process_group)
     if world_size == 1:
         return input_
 
-    rank = dist.get_rank(process_group)
+    rank = dist_ops.get_rank(process_group)
     full_dim_size = input_.size(dim)
 
     # Calculate the size of each slice (using ceil for uniform distribution)
@@ -402,10 +411,11 @@ class RowParallelLinear(_ParallelLinear):
 
         # Add bias *after* reduction
         if self.bias and self.bias_param is not None:
-            # Cast bias_param for type checker; runtime None already guarded.
+            # The runtime check `self.bias_param is not None` is the primary guard.
+            # Casting `self.bias_param` to `torch.Tensor` helps the type checker.
             reduced_output = reduced_output + cast(torch.Tensor, self.bias_param)
 
-        return cast(torch.Tensor, reduced_output)  # Cast to ensure Tensor type
+        return cast(torch.Tensor, reduced_output)
 
 
 # --------------------------- Public helper --------------------------- #

@@ -1,7 +1,6 @@
 import torch
 from typing import Dict, Optional, Union, Tuple, List
 import logging
-import torch.distributed as dist
 
 from clt.config import CLTConfig
 from clt.models.base import BaseTranscoder
@@ -12,6 +11,7 @@ from clt.models.decoder import Decoder
 from clt.models.theta import ThetaManager
 
 from clt.activations.registry import get_activation_fn
+from clt.parallel import ops as dist_ops
 
 from torch.distributed import ProcessGroup
 
@@ -34,13 +34,8 @@ class CrossLayerTranscoder(BaseTranscoder):
     ):
         super().__init__(config)
         self.process_group = process_group
-        if process_group is None or not dist.is_initialized():
-            self.world_size = 1
-            self.rank = 0
-            self.process_group = None
-        else:
-            self.world_size = dist.get_world_size(process_group)
-            self.rank = dist.get_rank(process_group)
+        self.world_size = dist_ops.get_world_size(process_group)
+        self.rank = dist_ops.get_rank(process_group)
 
         self.dtype = self._resolve_dtype(config.clt_dtype)
         if device is not None:
