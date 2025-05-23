@@ -2,10 +2,10 @@ import torch
 import torch.nn as nn
 from typing import Dict, List, Tuple, Optional
 import logging
-import torch.distributed as dist
 
 from clt.config import CLTConfig
 from clt.models.parallel import ColumnParallelLinear
+from clt.parallel import ops as dist_ops
 from torch.distributed import ProcessGroup
 
 logger = logging.getLogger(__name__)
@@ -31,12 +31,8 @@ class Encoder(nn.Module):
         self.device = device
         self.dtype = dtype
 
-        if process_group is None or not dist.is_initialized():
-            self.world_size = 1
-            self.rank = 0
-        else:
-            self.world_size = dist.get_world_size(process_group)
-            self.rank = dist.get_rank(process_group)
+        self.world_size = dist_ops.get_world_size(process_group)
+        self.rank = dist_ops.get_rank(process_group)
 
         self.encoders = nn.ModuleList(
             [

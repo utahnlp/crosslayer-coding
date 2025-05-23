@@ -1,9 +1,9 @@
 import torch
 from typing import Optional, Tuple, Dict, List
-import torch.distributed as dist
 import logging
 from clt.config import CLTConfig
 from torch.distributed import ProcessGroup
+from clt.parallel import ops as dist_ops
 
 
 class BatchTopK(torch.autograd.Function):
@@ -234,9 +234,7 @@ def _apply_batch_topk_helper(
 ) -> Dict[int, torch.Tensor]:
     """Helper to apply BatchTopK globally across concatenated layer pre-activations."""
 
-    world_size = 1
-    if process_group is not None and dist.is_initialized():
-        world_size = dist.get_world_size(process_group)
+    world_size = dist_ops.get_world_size(process_group)
 
     if not preactivations_dict:
         logger_helpers.warning(f"Rank {rank}: _apply_batch_topk_helper received empty preactivations_dict.")
@@ -310,9 +308,9 @@ def _apply_batch_topk_helper(
                 concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
             )
             mask.copy_(local_mask)
-            dist.broadcast(mask, src=0, group=process_group)
+            dist_ops.broadcast(mask, src=0, group=process_group)
         else:
-            dist.broadcast(mask, src=0, group=process_group)
+            dist_ops.broadcast(mask, src=0, group=process_group)
     else:
         mask = BatchTopK._compute_mask(
             concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
@@ -340,9 +338,7 @@ def _apply_token_topk_helper(
     process_group: Optional[ProcessGroup],
 ) -> Dict[int, torch.Tensor]:
     """Helper to apply TokenTopK globally across concatenated layer pre-activations."""
-    world_size = 1
-    if process_group is not None and dist.is_initialized():
-        world_size = dist.get_world_size(process_group)
+    world_size = dist_ops.get_world_size(process_group)
 
     if not preactivations_dict:
         logger_helpers.warning(f"Rank {rank}: _apply_token_topk_helper received empty preactivations_dict.")
@@ -418,9 +414,9 @@ def _apply_token_topk_helper(
                 concatenated_preactivations_normalized,
             )
             mask.copy_(local_mask)
-            dist.broadcast(mask, src=0, group=process_group)
+            dist_ops.broadcast(mask, src=0, group=process_group)
         else:
-            dist.broadcast(mask, src=0, group=process_group)
+            dist_ops.broadcast(mask, src=0, group=process_group)
     else:
         mask = TokenTopK._compute_mask(
             concatenated_preactivations_original, k_val_float, concatenated_preactivations_normalized

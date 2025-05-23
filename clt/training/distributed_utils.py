@@ -1,5 +1,5 @@
-import torch.distributed as dist
 from typing import TYPE_CHECKING
+from clt.parallel import ops as dist_ops
 
 if TYPE_CHECKING:
     from clt.models.clt import CrossLayerTranscoder  # For type hinting model parameters
@@ -30,5 +30,5 @@ def average_shared_parameter_grads(model: "CrossLayerTranscoder", world_size: in
         # Only average if explicitly marked as replicated.
         # The p.dim() == 1 heuristic was too broad and could incorrectly average sharded 1D parameters (e.g., encoder biases).
         if is_rep:
-            dist.all_reduce(p.grad, op=dist.ReduceOp.SUM)
+            dist_ops.all_reduce(p.grad, op=dist_ops.SUM)
             p.grad /= world_size
