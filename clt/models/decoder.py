@@ -18,8 +18,6 @@ class Decoder(nn.Module):
     feature activations and compute decoder norms.
     """
 
-    _cached_decoder_norms: Optional[torch.Tensor] = None
-
     def __init__(
         self,
         config: CLTConfig,

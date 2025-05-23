@@ -395,51 +395,6 @@ class CrossLayerTranscoder(BaseTranscoder):
         Returns:
             Reconstructed outputs [..., d_model]
         """
-        available_keys = sorted(a.keys())
-        if not available_keys:
-            logger.warning(f"Rank {self.rank}: No activation keys available in decode method for layer {layer_idx}")
-            # Determine a consistent device/dtype for the empty tensor, even if self.device/self.dtype is None initially
-            # op_dev, op_dtype = (
-            #     self._get_current_op_device_dtype()
-            # )  # Pass no sample, gets model defaults or system defaults
-            return torch.zeros((0, self.config.d_model), device=self.device, dtype=self.dtype)
-
-        first_key = available_keys[0]
-        example_tensor = a[first_key]
-        # Need batch dimension size for reconstruction tensor
-        # Handle cases where example_tensor might be empty (though filtered earlier)
-        batch_dim_size = example_tensor.shape[0] if example_tensor.numel() > 0 else 0
-        # If batch_dim_size is still 0, try finding a non-empty tensor
-        if batch_dim_size == 0:
-            for key in available_keys:
-                if a[key].numel() > 0:
-                    batch_dim_size = a[key].shape[0]
-                    example_tensor = a[key]  # Update example_tensor to one that has data for device/dtype
-                    break
-
-        reconstruction = torch.zeros((batch_dim_size, self.config.d_model), device=self.device, dtype=self.dtype)
-
-        # Sum contributions from features at all contributing layers
-        for src_layer in range(layer_idx + 1):
-            if src_layer in a:
-                # Decoder expects full activation tensor [..., num_features]
-                activation_tensor = a[src_layer].to(device=self.device, dtype=self.dtype)
-
-                # Check activation tensor shape
-                if activation_tensor.numel() == 0:
-                    continue  # Skip empty activations
-                if activation_tensor.shape[-1] != self.config.num_features:
-                    logger.warning(
-                        f"Rank {self.rank}: Activation tensor for layer {src_layer} has incorrect feature dimension {activation_tensor.shape[-1]}, expected {self.config.num_features}. Skipping decode contribution."
-                    )
-                    continue
-
-                decoder = self.decoders[f"{src_layer}->{layer_idx}"]
-                # RowParallelLinear takes full input (input_is_parallel=False),
-                # splits it internally, computes local result, and all-reduces.
-                decoded = decoder(activation_tensor)  # Removed try-except
-                reconstruction += decoded
-        return reconstruction
         # Call the new decoder module's method directly
         return self.decoder_module.decode(a, layer_idx)
 
@@ -590,82 +545,6 @@ class CrossLayerTranscoder(BaseTranscoder):
             Tensor of shape [num_layers, num_features] containing L2 norms of decoder
             weights for each feature, applicable for sparsity calculations.
         """
-        if self._cached_decoder_norms is not None:
-            return self._cached_decoder_norms
-
-        full_decoder_norms = torch.zeros(
-            self.config.num_layers, self.config.num_features, device=self.device, dtype=self.dtype
-        )
-
-        for src_layer in range(self.config.num_layers):
-            local_norms_sq_accum = torch.zeros(self.config.num_features, device=self.device, dtype=torch.float32)
-
-            for tgt_layer in range(src_layer, self.config.num_layers):
-                decoder_key = f"{src_layer}->{tgt_layer}"
-                decoder = self.decoders[decoder_key]
-                assert isinstance(decoder, RowParallelLinear), f"Decoder {decoder_key} is not RowParallelLinear"
-
-                # decoder.weight shape: [d_model, local_num_features (padded)]
-                # Calculate norms on local weight shard
-                current_norms_sq = torch.norm(decoder.weight, dim=0).pow(2).to(torch.float32)
-                # current_norms_sq shape: [local_num_features (padded)]
-
-                # Determine the slice of the *full* feature dimension this rank owns
-                full_dim = decoder.full_in_features  # Original number of features
-                local_dim_padded = decoder.local_in_features  # Padded local size
-
-                # Calculate start and end indices in the *full* dimension
-                # Correct calculation using integer division based on full dimension
-                features_per_rank = (full_dim + self.world_size - 1) // self.world_size
-                start_idx = self.rank * features_per_rank
-                end_idx = min(start_idx + features_per_rank, full_dim)
-                actual_local_dim = max(0, end_idx - start_idx)
-
-                # Check if local padded size matches expected local dimension
-                # This is a sanity check for RowParallelLinear's partitioning logic
-                if local_dim_padded != features_per_rank and self.rank == self.world_size - 1:
-                    # The last rank might have fewer features if full_dim is not divisible by world_size
-                    # RowParallelLinear pads its weight, so local_dim_padded might be larger than actual_local_dim
-                    pass  # Padding is expected here
-                elif local_dim_padded != actual_local_dim and local_dim_padded != features_per_rank:
-                    logger.warning(
-                        f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for {decoder_key}. This might indicate an issue with RowParallelLinear partitioning."
-                    )
-                    # Proceed cautiously, but log the potential discrepancy
-
-                # If this rank has valid features for this layer (based on correct calculation)
-                if actual_local_dim > 0:
-                    # The norms correspond to the first `actual_local_dim` columns of the weight
-                    # We slice the norms up to the *actual* number of features this rank owns, ignoring padding
-                    valid_norms_sq = current_norms_sq[:actual_local_dim]
-
-                    # Ensure shapes match before adding
-                    if valid_norms_sq.shape[0] == actual_local_dim:
-                        # Accumulate into the correct global slice determined by start_idx and end_idx
-                        global_slice = slice(start_idx, end_idx)
-                        local_norms_sq_accum[global_slice] += valid_norms_sq
-                    else:
-                        # This should not happen with the slicing logic above
-                        logger.warning(
-                            f"Rank {self.rank}: Shape mismatch in decoder norm calculation for {decoder_key}. "
-                            f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
-                        )
-
-            # Reduce the accumulated squared norms across all ranks
-            # Each feature's decoder weight vector lives entirely on a single rank
-            # (row-parallel sharding over the feature dimension).  To reconstruct the
-            # correct global ‖w‖₂ we must therefore **sum** the per-rank contributions,
-            # not average them – averaging would shrink every norm by `world_size` and
-            # drastically weaken the sparsity penalty.
-            if self.process_group is not None and dist.is_initialized():
-                dist.all_reduce(local_norms_sq_accum, op=dist.ReduceOp.SUM, group=self.process_group)
-
-            # Now take the square root and store in the final tensor (cast back to model dtype)
-            full_decoder_norms[src_layer] = torch.sqrt(local_norms_sq_accum).to(self.dtype)
-
-        self._cached_decoder_norms = full_decoder_norms
-
-        return full_decoder_norms
         # Call the new decoder module's method directly
         return self.decoder_module.get_decoder_norms()
 
