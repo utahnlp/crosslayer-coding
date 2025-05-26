@@ -275,3 +275,30 @@ class CrossLayerTranscoder(BaseTranscoder):
         logger.info(
             f"Rank {self.rank}: CLT model config updated by ThetaManager. New activation_fn='{self.config.activation_fn}'."
         )
+
+    # --- Back-compat: expose ThetaManager.log_threshold at model level ---
+    @property
+    def log_threshold(self) -> Optional[torch.nn.Parameter]:
+        """Proxy to ``theta_manager.log_threshold`` for backward compatibility.
+
+        Older training scripts, conversion utilities and tests referenced
+        ``model.log_threshold`` directly.  After the Step-5 refactor the
+        parameter migrated into the dedicated ``ThetaManager`` module.  We
+        now expose a read-only view that always returns the *current* parameter
+        held by ``self.theta_manager``.  Modifying the returned tensor (e.g.
+        in-place updates to ``.data``) therefore continues to work as before.
+        Assigning a brand-new ``nn.Parameter`` to ``model.log_threshold`` will
+        forward the assignment to ``theta_manager`` to preserve the linkage.
+        """
+        if hasattr(self, "theta_manager") and self.theta_manager is not None:
+            return self.theta_manager.log_threshold
+        return None
+
+    @log_threshold.setter
+    def log_threshold(self, new_param: Optional[torch.nn.Parameter]) -> None:
+        # Keep property writable so callers that used to assign a fresh
+        # parameter (rare) do not break.  We delegate the storage to
+        # ``ThetaManager`` so there is a single source of truth.
+        if not hasattr(self, "theta_manager") or self.theta_manager is None:
+            raise AttributeError("ThetaManager is not initialised; cannot set log_threshold.")
+        self.theta_manager.log_threshold = new_param

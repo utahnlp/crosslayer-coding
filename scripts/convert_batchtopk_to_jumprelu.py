@@ -30,6 +30,37 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def _remap_checkpoint_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    """Remaps old state_dict keys to the new format with module prefixes."""
+    new_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith("encoders."):
+            new_key = "encoder_module." + key
+        elif key.startswith("decoders."):
+            new_key = "decoder_module." + key
+        else:
+            new_key = key
+        new_state_dict[new_key] = value
+    if not any(k.startswith("encoder_module.") or k.startswith("decoder_module.") for k in new_state_dict.keys()):
+        if any(k.startswith("encoders.") or k.startswith("decoders.") for k in state_dict.keys()):
+            logger.warning(
+                "Key remapping applied, but no keys were actually changed. "
+                "This might indicate the checkpoint is already in the new format or the remapping logic is flawed."
+            )
+        else:
+            # Neither old nor new prefixes found, probably a different kind of checkpoint or already remapped.
+            pass  # Don't log a warning if it seems like it's already fine.
+
+    # Check if we missed any expected old keys
+    remapped_old_keys = any(k.startswith("encoders.") or k.startswith("decoders.") for k in new_state_dict.keys())
+    if remapped_old_keys:
+        logger.error("CRITICAL: Key remapping failed to remove all old-style keys. Check remapping logic.")
+        # This state is problematic, so we might choose to raise an error or return the original dict.
+        # For now, returning the partially remapped dict and letting load_state_dict fail might be more informative.
+
+    return new_state_dict
+
+
 def main(args):
     if args.device:
         device = torch.device(args.device)
@@ -94,10 +125,13 @@ def main(args):
             if args.batchtopk_checkpoint_path.endswith(".safetensors"):
                 logger.info(f"Loading BatchTopK model state from safetensors file: {args.batchtopk_checkpoint_path}")
                 state_dict = load_safetensors_file(args.batchtopk_checkpoint_path, device=device.type)
+                state_dict = _remap_checkpoint_keys(state_dict)  # Remap keys
                 model.load_state_dict(state_dict)
             else:
                 logger.info(f"Loading BatchTopK model state from .pt file: {args.batchtopk_checkpoint_path}")
-                model.load_state_dict(torch.load(args.batchtopk_checkpoint_path, map_location=device))
+                state_dict = torch.load(args.batchtopk_checkpoint_path, map_location=device)
+                state_dict = _remap_checkpoint_keys(state_dict)  # Remap keys
+                model.load_state_dict(state_dict)
 
         model.eval()
         logger.info("BatchTopK model loaded and set to eval mode.")
@@ -367,12 +401,16 @@ def main(args):
                     storage_reader=FileSystemReader(original_checkpoint_path),
                     no_dist=True,
                 )
+                state_dict_to_populate_orig = _remap_checkpoint_keys(state_dict_to_populate_orig)
                 original_model.load_state_dict(state_dict_to_populate_orig)
             elif original_checkpoint_path.endswith(".safetensors"):
                 state_dict_orig = load_safetensors_file(original_checkpoint_path, device=device.type)
+                state_dict_orig = _remap_checkpoint_keys(state_dict_orig)
                 original_model.load_state_dict(state_dict_orig)
             else:
-                original_model.load_state_dict(torch.load(original_checkpoint_path, map_location=device))
+                state_dict_orig = torch.load(original_checkpoint_path, map_location=device)
+                state_dict_orig = _remap_checkpoint_keys(state_dict_orig)
+                original_model.load_state_dict(state_dict_orig)
 
             original_model.eval()
             logger.info("Original model loaded successfully for L0 target calculation.")
