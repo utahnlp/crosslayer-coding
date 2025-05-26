@@ -41,7 +41,7 @@ from contextlib import contextmanager
 from collections import defaultdict
 import psutil
 
-from clt.training.utils import to_bfloat16
+from clt.training.utils import torch_bfloat16_to_numpy_uint16
 
 try:
     import GPUtil
@@ -768,9 +768,8 @@ class ActivationGenerator:
                                 with self._conditional_measure(f"chunk_{chunk_idx}_layer_{lid}_convert_numpy"):
                                     # Handle bfloat16 conversion
                                     if h5py_dtype_str == "uint16":
-                                        inp_np = to_bfloat16(inp_perm.to(torch.float32).numpy())
-                                        tgt_np = to_bfloat16(tgt_perm.to(torch.float32).numpy())
-
+                                        inp_np = torch_bfloat16_to_numpy_uint16(inp_perm)
+                                        tgt_np = torch_bfloat16_to_numpy_uint16(tgt_perm)
                                     else:
                                         inp_np = inp_perm.to(self.torch_dtype).numpy()
                                         tgt_np = tgt_perm.to(self.torch_dtype).numpy()

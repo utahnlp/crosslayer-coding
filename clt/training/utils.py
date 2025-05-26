@@ -1,6 +1,7 @@
 import datetime
 
 import numpy as np
+import torch
 
 
 # Helper function to format elapsed time
@@ -15,5 +16,5 @@ def _format_elapsed_time(seconds: float) -> str:
         return f"{minutes:02d}:{seconds:02d}"
 
 
-def to_bfloat16(x: np.ndarray) -> np.ndarray:
-    return np.frombuffer(np.array(x, dtype=np.float32).tobytes()[::2], dtype=np.uint16)
+def torch_bfloat16_to_numpy_uint16(x: torch.Tensor) -> np.ndarray:
+    return np.frombuffer(x.float().numpy().tobytes(), dtype=np.uint16)[1::2].reshape(x.shape)
