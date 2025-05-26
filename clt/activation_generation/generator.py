@@ -41,6 +41,8 @@ from contextlib import contextmanager
 from collections import defaultdict
 import psutil
 
+from clt.training.utils import torch_bfloat16_to_numpy_uint16
+
 try:
     import GPUtil
 except ImportError:
@@ -764,13 +766,13 @@ class ActivationGenerator:
 
                                 # Convert to numpy
                                 with self._conditional_measure(f"chunk_{chunk_idx}_layer_{lid}_convert_numpy"):
-                                    inp_np = inp_perm.to(self.torch_dtype).numpy()
-                                    tgt_np = tgt_perm.to(self.torch_dtype).numpy()
-
-                                # Handle bfloat16 conversion
-                                if h5py_dtype_str == "uint16" and inp_np.dtype == np.dtype("bfloat16"):
-                                    inp_np = inp_np.view(np.uint16)
-                                    tgt_np = tgt_np.view(np.uint16)
+                                    # Handle bfloat16 conversion
+                                    if h5py_dtype_str == "uint16":
+                                        inp_np = torch_bfloat16_to_numpy_uint16(inp_perm)
+                                        tgt_np = torch_bfloat16_to_numpy_uint16(tgt_perm)
+                                    else:
+                                        inp_np = inp_perm.to(self.torch_dtype).numpy()
+                                        tgt_np = tgt_perm.to(self.torch_dtype).numpy()
 
                                 # Store prepared data
                                 layer_data[lid] = (inp_np, tgt_np)
