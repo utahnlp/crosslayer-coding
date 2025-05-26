@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Literal, Optional, Dict, Any
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -74,7 +77,23 @@ class ActivationConfig:
             except ImportError:
                 raise ImportError("h5py is required for HDF5 output format. Install with: pip install h5py")
         if self.compression not in ["lz4", "gzip", None, False]:
-            print(
+            logger.warning(
                 f"Warning: Unsupported compression '{self.compression}'. Will attempt without compression for {self.output_format}."
             )
             # Allow generator to handle disabling if format doesn't support it.
+
+        # Example: Print a summary or key values
+        # This is more for user feedback than programmatic use.
+        logger.info(
+            "ActivationConfig Summary:\n"
+            f"  Model: {self.model_name}\n"
+            f"  Dataset: {self.dataset_path} (Split: {self.dataset_split})\n"
+            f"  Target Tokens: {self.target_total_tokens}\n"
+            f"  Chunk Threshold: {self.chunk_token_threshold}\n"
+            f"  Activation Dtype: {self.activation_dtype}\n"
+            f"  Output Dir: {self.activation_dir}"
+        )
+        if self.remote_server_url:
+            logger.info(f"  Remote Server URL: {self.remote_server_url}")
+        if self.delete_after_upload:
+            logger.info("  Delete after upload: Enabled")

@@ -206,6 +206,7 @@ vis/
 clt_test_pythia_70m_jumprelu/
 clt_smoke_output_local_wandb_batchtopk/
 clt_smoke_output_remote_wandb/
+wandb/
 
 # models
 *.pt

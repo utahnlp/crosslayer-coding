@@ -6,18 +6,21 @@ from torch.distributed.checkpoint.state_dict_saver import save_state_dict
 from torch.distributed.checkpoint.state_dict_loader import load_state_dict
 from torch.distributed.checkpoint.default_planner import DefaultSavePlanner, DefaultLoadPlanner
 from torch.distributed.checkpoint.filesystem import FileSystemWriter, FileSystemReader
-from typing import Optional, Union, Dict, Any
+from typing import Optional, Union, Dict, Any, TYPE_CHECKING
 from safetensors.torch import save_file as save_safetensors_file, load_file as load_safetensors_file
+import logging
 
 # Import for type hinting, moved outside TYPE_CHECKING for runtime availability
 from clt.training.wandb_logger import WandBLogger, DummyWandBLogger
 
 # Forward declarations for type hinting to avoid circular imports
-if False:  # TYPE_CHECKING
+if TYPE_CHECKING:
     from clt.models.clt import CrossLayerTranscoder
     from clt.training.data.base_store import BaseActivationStore
 
     # from clt.training.wandb_logger import WandBLogger, DummyWandBLogger # No longer needed here
+
+logger = logging.getLogger(__name__)
 
 
 class CheckpointManager:
@@ -86,7 +89,7 @@ class CheckpointManager:
                 torch.save(trainer_state_to_save, latest_trainer_state_path)
 
             except Exception as e:
-                print(f"Warning: Failed to save non-distributed checkpoint at step {step}: {e}")
+                logger.warning(f"Warning: Failed to save non-distributed checkpoint at step {step}: {e}")
             return
 
         # --- Distributed Save ---
@@ -109,7 +112,9 @@ class CheckpointManager:
                 no_dist=False,
             )
         except Exception as e:
-            print(f"Rank {self.rank}: Warning: Failed to save distributed model checkpoint at step {step}: {e}")
+            logger.warning(
+                f"Rank {self.rank}: Warning: Failed to save distributed model checkpoint at step {step}: {e}"
+            )
 
         if self.rank == 0:
             # Save activation store
@@ -119,7 +124,7 @@ class CheckpointManager:
                 torch.save(self.activation_store.state_dict(), store_checkpoint_path)
                 torch.save(self.activation_store.state_dict(), latest_store_path)
             except Exception as e:
-                print(f"Rank 0: Warning: Failed to save activation store state at step {step}: {e}")
+                logger.warning(f"Rank 0: Warning: Failed to save activation store state at step {step}: {e}")
 
             # Save consolidated model as .safetensors
             model_safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
@@ -128,11 +133,11 @@ class CheckpointManager:
                 full_model_state_dict = self.model.state_dict()
                 save_safetensors_file(full_model_state_dict, model_safetensors_path)
                 save_safetensors_file(full_model_state_dict, latest_model_safetensors_path)
-                print(
+                logger.info(
                     f"Rank 0: Saved consolidated model to {model_safetensors_path} and {latest_model_safetensors_path}"
                 )
             except Exception as e:
-                print(f"Rank 0: Warning: Failed to save consolidated .safetensors model at step {step}: {e}")
+                logger.warning(f"Rank 0: Warning: Failed to save consolidated .safetensors model at step {step}: {e}")
 
             # Save trainer state (optimizer, scheduler, etc.)
             trainer_state_filepath = os.path.join(checkpoint_dir, "trainer_state.pt")
@@ -140,9 +145,11 @@ class CheckpointManager:
             try:
                 torch.save(trainer_state_to_save, trainer_state_filepath)
                 torch.save(trainer_state_to_save, latest_trainer_state_filepath)
-                print(f"Rank 0: Saved trainer state to {trainer_state_filepath} and {latest_trainer_state_filepath}")
+                logger.info(
+                    f"Rank 0: Saved trainer state to {trainer_state_filepath} and {latest_trainer_state_filepath}"
+                )
             except Exception as e:
-                print(f"Rank 0: Warning: Failed to save trainer state at step {step}: {e}")
+                logger.warning(f"Rank 0: Warning: Failed to save trainer state at step {step}: {e}")
 
             self.wandb_logger.log_artifact(
                 artifact_path=checkpoint_dir,
@@ -168,16 +175,16 @@ class CheckpointManager:
         if not self.distributed:  # Non-distributed load
             model_file_path = checkpoint_path  # Expecting path to .safetensors
             if not (os.path.isfile(model_file_path) and model_file_path.endswith(".safetensors")):
-                print(
+                logger.error(
                     f"Error: For non-distributed load, checkpoint_path must be a .safetensors model file. Got: {model_file_path}"
                 )
                 return loaded_trainer_state  # Return empty if path is not as expected
 
-            print(f"Attempting to load non-distributed checkpoint from model file: {model_file_path}")
+            logger.info(f"Attempting to load non-distributed checkpoint from model file: {model_file_path}")
             try:
                 full_state_dict = load_safetensors_file(model_file_path, device=str(self.device))
                 self.model.load_state_dict(full_state_dict)
-                print(f"Successfully loaded non-distributed model from {model_file_path}")
+                logger.info(f"Successfully loaded non-distributed model from {model_file_path}")
 
                 # Infer paths for store and trainer state
                 base_dir = os.path.dirname(model_file_path)
@@ -195,7 +202,7 @@ class CheckpointManager:
                     trainer_state_fname = f"trainer_state_{step_str}.pt"
 
                 if not store_checkpoint_fname or not trainer_state_fname:
-                    print(
+                    logger.warning(
                         f"Warning: Could not determine store/trainer state filenames from model path {model_file_path}"
                     )
                 else:
@@ -206,27 +213,27 @@ class CheckpointManager:
                     if os.path.exists(store_path):
                         store_state = torch.load(store_path, map_location=self.device)
                         self.activation_store.load_state_dict(store_state)
-                        print(f"Loaded activation store state from {store_path}")
+                        logger.info(f"Loaded activation store state from {store_path}")
                     else:
-                        print(f"Warning: Activation store checkpoint not found at {store_path}")
+                        logger.warning(f"Warning: Activation store checkpoint not found at {store_path}")
 
                     # Load trainer state
                     if os.path.exists(trainer_state_path):
                         loaded_trainer_state = torch.load(
                             trainer_state_path, map_location=self.device, weights_only=False
                         )
-                        print(f"Loaded trainer state from {trainer_state_path}")
+                        logger.info(f"Loaded trainer state from {trainer_state_path}")
                     else:
-                        print(f"Warning: Trainer state checkpoint not found at {trainer_state_path}")
+                        logger.warning(f"Warning: Trainer state checkpoint not found at {trainer_state_path}")
 
             except Exception as e:
-                print(f"Error loading non-distributed checkpoint from {model_file_path}: {e}")
+                logger.error(f"Error loading non-distributed checkpoint from {model_file_path}: {e}")
             return loaded_trainer_state
 
         # --- Distributed Load ---
         # checkpoint_path is a directory for distributed checkpoints
         if not os.path.isdir(checkpoint_path):
-            print(
+            logger.error(
                 f"Error: Checkpoint path {checkpoint_path} is not a directory. Distributed checkpoints are saved as directories."
             )
             return loaded_trainer_state
@@ -241,14 +248,14 @@ class CheckpointManager:
             )
             # The model's state_dict is modified in-place by load_state_dict
             # self.model.load_state_dict(state_dict_to_load) # Not needed if modified in-place
-            print(f"Rank {self.rank}: Loaded distributed model checkpoint from {checkpoint_path}")
+            logger.info(f"Rank {self.rank}: Loaded distributed model checkpoint from {checkpoint_path}")
         except Exception as e:
-            print(f"Rank {self.rank}: Error loading distributed model checkpoint from {checkpoint_path}: {e}")
+            logger.error(f"Rank {self.rank}: Error loading distributed model checkpoint from {checkpoint_path}: {e}")
             # Attempt to load consolidated if sharded load fails (e.g. loading TP model on single GPU)
             # This part is tricky because load_state_dict above might have partially modified the model.
             # A cleaner approach for "load TP sharded on single GPU" would be separate.
             # For now, if distributed load_state_dict fails, we try the consolidated .safetensors
-            print(
+            logger.info(
                 f"Rank {self.rank}: Attempting to load consolidated model.safetensors from the directory as fallback."
             )
             consolidated_model_path = os.path.join(checkpoint_path, "model.safetensors")
@@ -257,14 +264,16 @@ class CheckpointManager:
                     # This load is for a single rank, assuming this rank needs the full model
                     full_model_state = load_safetensors_file(consolidated_model_path, device=str(self.device))
                     self.model.load_state_dict(full_model_state)
-                    print(f"Rank {self.rank}: Successfully loaded consolidated model from {consolidated_model_path}")
+                    logger.info(
+                        f"Rank {self.rank}: Successfully loaded consolidated model from {consolidated_model_path}"
+                    )
                 except Exception as e_consol:
-                    print(
+                    logger.error(
                         f"Rank {self.rank}: Failed to load consolidated model from {consolidated_model_path}: {e_consol}"
                     )
                     return loaded_trainer_state  # Failed both sharded and consolidated
             else:
-                print(
+                logger.info(
                     f"Rank {self.rank}: Consolidated model.safetensors not found in {checkpoint_path}. Cannot fallback."
                 )
                 return loaded_trainer_state  # Failed sharded, no consolidated to fallback to
@@ -278,22 +287,24 @@ class CheckpointManager:
                 try:
                     store_state = torch.load(store_file_path, map_location=self.device)
                     self.activation_store.load_state_dict(store_state)
-                    print(f"Rank 0: Loaded activation store state from {store_file_path}")
+                    logger.info(f"Rank 0: Loaded activation store state from {store_file_path}")
                 except Exception as e:
-                    print(f"Rank 0: Warning: Failed to load activation store state from {store_file_path}: {e}")
+                    logger.warning(
+                        f"Rank 0: Warning: Failed to load activation store state from {store_file_path}: {e}"
+                    )
             else:
-                print(f"Rank 0: Warning: Activation store checkpoint not found in {checkpoint_path}")
+                logger.warning(f"Rank 0: Warning: Activation store checkpoint not found in {checkpoint_path}")
 
             trainer_state_file_path = os.path.join(checkpoint_path, "trainer_state.pt")
             if os.path.exists(trainer_state_file_path):
                 try:
                     # map_location CPU for items that might be on CUDA but not needed there by all ranks yet
                     loaded_trainer_state = torch.load(trainer_state_file_path, map_location="cpu", weights_only=False)
-                    print(f"Rank 0: Loaded trainer state from {trainer_state_file_path}")
+                    logger.info(f"Rank 0: Loaded trainer state from {trainer_state_file_path}")
                 except Exception as e:
-                    print(f"Rank 0: Warning: Failed to load trainer state from {trainer_state_file_path}: {e}")
+                    logger.warning(f"Rank 0: Warning: Failed to load trainer state from {trainer_state_file_path}: {e}")
             else:
-                print(f"Rank 0: Warning: Trainer state file not found in {checkpoint_path}")
+                logger.warning(f"Rank 0: Warning: Trainer state file not found in {checkpoint_path}")
 
         # Barrier to ensure all ranks have attempted model loading before proceeding.
         # And rank 0 has loaded other states.
@@ -311,18 +322,20 @@ class CheckpointManager:
             # Ensure loaded_trainer_state is a dict even if broadcast failed or returned None (defensive)
             if loaded_trainer_state is None:
                 loaded_trainer_state = {}
-            print(f"Rank {self.rank}: Received broadcasted trainer state. Step: {loaded_trainer_state.get('step')}")
+            logger.info(
+                f"Rank {self.rank}: Received broadcasted trainer state. Step: {loaded_trainer_state.get('step')}"
+            )
 
         return loaded_trainer_state
 
     def _load_non_distributed_checkpoint(self, checkpoint_path: str, store_checkpoint_path: Optional[str] = None):
         """Loads a standard single-file model checkpoint (.pt or .safetensors)."""
         if self.distributed:
-            print("Error: Attempting to load non-distributed checkpoint in distributed mode.")
+            logger.error("Error: Attempting to load non-distributed checkpoint in distributed mode.")
             return
 
         if not os.path.exists(checkpoint_path):
-            print(f"Error: Model checkpoint not found at {checkpoint_path}")
+            logger.error(f"Error: Model checkpoint not found at {checkpoint_path}")
             return
         try:
             if checkpoint_path.endswith(".safetensors"):
@@ -332,12 +345,14 @@ class CheckpointManager:
             elif checkpoint_path.endswith(".pt"):
                 full_state_dict = torch.load(checkpoint_path, map_location=self.device)
             else:
-                print(f"Error: Unknown checkpoint file extension for {checkpoint_path}. Must be .pt or .safetensors.")
+                logger.error(
+                    f"Error: Unknown checkpoint file extension for {checkpoint_path}. Must be .pt or .safetensors."
+                )
                 return
             self.model.load_state_dict(full_state_dict)
-            print(f"Loaded non-distributed model checkpoint from {checkpoint_path}")
+            logger.info(f"Loaded non-distributed model checkpoint from {checkpoint_path}")
         except Exception as e:
-            print(f"Error loading non-distributed model checkpoint from {checkpoint_path}: {e}")
+            logger.error(f"Error loading non-distributed model checkpoint from {checkpoint_path}: {e}")
             return
 
         if store_checkpoint_path is None:
@@ -372,12 +387,12 @@ class CheckpointManager:
                 store_state = torch.load(store_checkpoint_path, map_location=self.device)
                 if hasattr(self, "activation_store") and self.activation_store is not None:
                     self.activation_store.load_state_dict(store_state)
-                    print(f"Loaded activation store state from {store_checkpoint_path}")
+                    logger.info(f"Loaded activation store state from {store_checkpoint_path}")
                 else:
-                    print("Warning: Activation store not initialized. Cannot load state.")
+                    logger.warning("Warning: Activation store not initialized. Cannot load state.")
             except Exception as e:
-                print(f"Warning: Failed to load activation store state from {store_checkpoint_path}: {e}")
+                logger.warning(f"Warning: Failed to load activation store state from {store_checkpoint_path}: {e}")
         else:
-            print(
+            logger.warning(
                 f"Warning: Activation store checkpoint path not found or specified: {store_checkpoint_path}. Store state not loaded."
             )

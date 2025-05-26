@@ -1,8 +1,12 @@
-import time
-import importlib.util
+import wandb
+import os
 from typing import Dict, Optional, Any
+import logging
+from dataclasses import asdict
 
 from clt.config import CLTConfig, TrainingConfig
+
+logger = logging.getLogger(__name__)
 
 
 # Define the dummy logger class explicitly for better type checking
@@ -32,6 +36,7 @@ class WandBLogger:
     """Wrapper class for Weights & Biases logging."""
 
     _run_id: Optional[str] = None
+    wandb_run: Optional[Any]
 
     def __init__(
         self,
@@ -50,67 +55,51 @@ class WandBLogger:
         """
         self.enabled = training_config.enable_wandb
         self.log_dir = log_dir
+        self.resume_wandb_id = resume_wandb_id
 
         if not self.enabled:
+            logger.info("WandB logging is disabled by training_config.enable_wandb=False.")
+            self.wandb_run = None
             return
 
-        # Check if wandb is installed
-        if not importlib.util.find_spec("wandb"):
-            print(
-                "Warning: WandB logging requested but wandb not installed. "
-                "Install with 'pip install wandb'. Continuing without WandB."
-            )
-            self.enabled = False
-            return
+        try:
+            # Try to get project from env var first, then from config
+            project_name = os.environ.get("WANDB_PROJECT", training_config.wandb_project)
+            entity_name = os.environ.get("WANDB_ENTITY", training_config.wandb_entity)
+            run_name = training_config.wandb_run_name  # Can be None
 
-        # Import wandb
-        import wandb
-
-        # Set up run name with timestamp if not provided
-        run_name = training_config.wandb_run_name
-        if run_name is None:
-            run_name = f"clt-{time.strftime('%Y%m%d-%H%M%S')}"
-
-        # Initialize wandb
-        wandb_init_kwargs = {
-            "project": training_config.wandb_project,
-            "entity": training_config.wandb_entity,
-            "name": run_name,
-            "dir": log_dir,
-            "tags": training_config.wandb_tags,
-            "config": {
-                **clt_config.__dict__,
-                **training_config.__dict__,
-                "log_dir": log_dir,
-            },
-        }
-
-        if resume_wandb_id:
-            wandb_init_kwargs["id"] = resume_wandb_id
-            wandb_init_kwargs["resume"] = "must"
-            # If resuming by ID, let WandB use the original run's name or handle naming.
-            # Setting name explicitly here might conflict if the auto-generated name differs.
-            # Let's try removing the name from kwargs if resume_wandb_id is present.
-            if "name" in wandb_init_kwargs:
-                # Important: Only remove 'name' if we are truly trying to resume by ID.
-                # If resume_wandb_id was found, we prioritize it.
-                del wandb_init_kwargs["name"]
-            print(
-                f"Attempting to resume WandB run with ID: {resume_wandb_id} and resume='must'. Name will be sourced from existing run."
-            )
-
-        wandb.init(**wandb_init_kwargs)
-
-        if wandb.run is not None:
-            print(f"WandB logging initialized: {wandb.run.name} (ID: {wandb.run.id})")
-            self._run_id = wandb.run.id
-        else:
-            if resume_wandb_id:
-                print(
-                    f"Warning: Failed to resume WandB run {resume_wandb_id}. A new run might have been started or init failed."
-                )
+            if self.resume_wandb_id:
+                logger.info(f"Attempting to resume WandB run with ID: {self.resume_wandb_id}")
+                # When resuming, wandb.init will use the passed id. Do not pass project/entity/name again if resuming.
+                self.wandb_run = wandb.init(id=self.resume_wandb_id, resume="allow")
             else:
-                print("Warning: WandB run initialization failed.")
+                self.wandb_run = wandb.init(
+                    project=project_name,
+                    entity=entity_name,
+                    name=run_name,
+                    config=self._create_wandb_config(training_config, clt_config),
+                    reinit=True,  # Allow re-initialization in the same process if needed
+                )
+
+            if self.wandb_run:
+                logger.info(f"WandB logging initialized: {self.wandb_run.name} (ID: {self.wandb_run.id})")
+            else:
+                logger.warning("Warning: WandB run initialization failed but no exception was raised.")
+
+        except ImportError:
+            logger.warning("wandb library not installed. Please install with `pip install wandb` to use WandB logging.")
+            self.wandb_run = None
+        except Exception as e:
+            logger.error(f"Error initializing WandB: {e}")
+            self.wandb_run = None
+
+    def _create_wandb_config(self, training_config: TrainingConfig, clt_config: CLTConfig) -> Dict[str, Any]:
+        config_dict = {
+            "training_config": asdict(training_config),
+            "clt_config": asdict(clt_config),
+            "log_dir": self.log_dir,
+        }
+        return config_dict
 
     def get_current_wandb_run_id(self) -> Optional[str]:
         """Returns the current WandB run ID, if a run is active."""
@@ -169,7 +158,11 @@ class WandBLogger:
             metrics["training/total_tokens_processed"] = total_tokens_processed
 
         # Log to wandb
-        wandb.log(metrics, step=step)
+        if self.wandb_run:
+            try:
+                self.wandb_run.log(metrics, step=step)
+            except Exception as e:
+                logger.error(f"Wandb: Error logging metrics at step {step}: {e}")
 
     def log_evaluation(self, step: int, eval_metrics: Dict[str, Any]):
         """Log evaluation metrics, organized by the structure from CLTEvaluator.
@@ -202,7 +195,7 @@ class WandBLogger:
                             try:
                                 wandb_log_dict[wandb_key] = wandb.Histogram(layer_value)
                             except Exception as e:
-                                print(f"Wandb: Error creating histogram for {wandb_key}: {e}")
+                                logger.error(f"Wandb: Error creating histogram for {wandb_key}: {e}")
                                 # Fallback: log mean or placeholder
                                 try:
                                     mean_val = sum(layer_value) / len(layer_value) if layer_value else 0.0
@@ -220,7 +213,7 @@ class WandBLogger:
                 try:
                     wandb_log_dict[key] = wandb.Histogram(value)
                 except Exception as e:
-                    print(f"Wandb: Error creating aggregate histogram for {key}: {e}")
+                    logger.error(f"Wandb: Error creating aggregate histogram for {key}: {e}")
                     # Optional Fallback: log mean of aggregate data
                     try:
                         mean_val = sum(value) / len(value) if value else 0.0
@@ -250,7 +243,11 @@ class WandBLogger:
 
         # Log the prepared dictionary to wandb
         if wandb_log_dict:
-            wandb.log(wandb_log_dict, step=step)
+            if self.wandb_run:
+                try:
+                    self.wandb_run.log(wandb_log_dict, step=step)
+                except Exception as e:
+                    logger.error(f"Wandb: Error logging metrics at step {step}: {e}")
 
     def log_artifact(self, artifact_path: str, artifact_type: str, name: Optional[str] = None):
         """Log an artifact to WandB.

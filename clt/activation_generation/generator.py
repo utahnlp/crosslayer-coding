@@ -14,14 +14,13 @@ Public API is unchanged: create with `ActivationGeneratorConfig`, call
 from __future__ import annotations
 
 import os
-import time
 import json
 import queue
 import random
 import logging
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Tuple, Any, DefaultDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import torch
@@ -36,7 +35,7 @@ from clt.nnsight.extractor import ActivationExtractorCLT  # noqa: E402
 from clt.config.data_config import ActivationConfig  # noqa: E402
 
 # --- Profiling Imports ---
-import time  # Already imported, but good to note
+import time  # Keep this one
 from contextlib import contextmanager
 from collections import defaultdict
 import psutil
@@ -58,8 +57,8 @@ ActivationBatch = Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]
 # --- Performance Profiler Class ---
 class PerformanceProfiler:
     def __init__(self, chunk_tokens_threshold: int = 1_000_000):
-        self.timings = defaultdict(list)
-        self.memory_snapshots = []
+        self.timings: DefaultDict[str, List[float]] = defaultdict(list)
+        self.memory_snapshots: List[Dict[str, Any]] = []
         self.chunk_tokens_threshold = chunk_tokens_threshold
         self.system_metrics_log: List[Dict[str, Any]] = []
         self.layer_ids_ref: Optional[List[int]] = None
@@ -143,7 +142,7 @@ class PerformanceProfiler:
         return metrics
 
     def report(self):
-        print("\n=== Performance Report ===")
+        logger.info("\n=== Performance Report ===")
         # Sort by total time descending for timings
         sorted_timings = sorted(self.timings.items(), key=lambda item: sum(item[1]), reverse=True)
 
@@ -155,15 +154,17 @@ class PerformanceProfiler:
             min_time = min(times)
             max_time = max(times)
 
-            print(f"\n--- Operation: {name} ---")
-            print(f"  Count: {len(times)}")
-            print(f"  Total time: {total_time:.3f}s")
-            print(f"  Avg time: {avg_time:.4f}s")
-            print(f"  Min time: {min_time:.4f}s")
-            print(f"  Max time: {max_time:.4f}s")
+            logger.info(f"\n--- Operation: {name} ---")
+            logger.info(f"  Count: {len(times)}")
+            logger.info(f"  Total time: {total_time:.3f}s")
+            logger.info(f"  Avg time: {avg_time:.4f}s")
+            logger.info(f"  Min time: {min_time:.4f}s")
+            logger.info(f"  Max time: {max_time:.4f}s")
 
             if "chunk_write_total_idx" in name:  # New unique name per chunk
-                print(f"  Avg ms/k-tok (for this chunk): {avg_time / self.chunk_tokens_threshold * 1000 * 1000:.2f}")
+                logger.info(
+                    f"  Avg ms/k-tok (for this chunk): {avg_time / self.chunk_tokens_threshold * 1000 * 1000:.2f}"
+                )
             elif (
                 name == "batch_processing_total"
                 and self.batch_processing_total_calls > 0
@@ -173,29 +174,29 @@ class PerformanceProfiler:
                     self.total_tokens_processed_for_batch_profiling / self.batch_processing_total_calls
                 )
                 if avg_tok_per_batch_call > 0:
-                    print(
+                    logger.info(
                         f"  Avg ms/k-tok (estimated for batch_processing_total): {avg_time / avg_tok_per_batch_call * 1000 * 1000:.2f}"
                     )
 
-        print("\n=== Memory Snapshots (showing top 10 by RSS delta) ===")
+        logger.info("\n=== Memory Snapshots (showing top 10 by RSS delta) ===")
         interesting_mem_snapshots = sorted(
             self.memory_snapshots, key=lambda x: abs(x["rss_delta_bytes"]), reverse=True
         )[:10]
         for snap in interesting_mem_snapshots:
-            print(
+            logger.info(
                 f"  {snap['name']} (took {snap['duration_s']:.3f}s): Total RSS {snap['rss_total_bytes'] / (1024**3):.3f} GB (ΔRSS {snap['rss_delta_bytes'] / (1024**3):.3f} GB)"
             )
 
-        print("\n=== System Metrics Log (sample) ===")
+        logger.info("\n=== System Metrics Log (sample) ===")
         for i, metrics in enumerate(self.system_metrics_log[:5]):  # Print first 5 samples
-            print(
+            logger.info(
                 f"  Sample {i} ({metrics['interval_name']}): CPU {metrics['cpu_percent']:.1f}%, Mem {metrics['memory_percent']:.1f}%, GPU {metrics['gpu_util_percent']:.1f}% (Mem {metrics['gpu_memory_percent']:.1f}%)"
             )
         if len(self.system_metrics_log) > 5:
-            print("  ...")
+            logger.info("  ...")
             if self.system_metrics_log:  # Check if not empty before accessing last element
                 metrics = self.system_metrics_log[-1]
-                print(
+                logger.info(
                     f"  Sample End ({metrics['interval_name']}): CPU {metrics['cpu_percent']:.1f}%, Mem {metrics['memory_percent']:.1f}%, GPU {metrics['gpu_util_percent']:.1f}% (Mem {metrics['gpu_memory_percent']:.1f}%)"
                 )
 
@@ -288,7 +289,7 @@ def _async_uploader(upload_q: "queue.Queue[Optional[Path]]", cfg: ActivationConf
         # --> ADDED: Retry Loop <--
         for attempt in range(max_retries_per_chunk):
             try:
-                print(
+                logger.info(
                     f"[Uploader Thread Attempt {attempt + 1}/{max_retries_per_chunk}] Uploading chunk: {p.name} to {url}"
                 )
                 with open(p, "rb") as f:
@@ -972,7 +973,7 @@ if __name__ == "__main__":
     try:
         activation_config_instance = ActivationConfig(**loaded_config)
     except TypeError as e:
-        print(f"Error creating ActivationConfig from YAML. Ensure all keys are correct: {e}")
+        logger.error(f"Error creating ActivationConfig from YAML. Ensure all keys are correct: {e}")
         import sys
 
         sys.exit(1)
