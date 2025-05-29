@@ -20,31 +20,31 @@ def parse_arguments():
 
     # Arguments map directly to ActivationConfig fields
     # --- Model Source ---
-    parser.add_argument("--model-name", type=str, required=True, help="Model name or path.")
+    parser.add_argument("--model_name", type=str, required=True, help="Model name or path.")
     parser.add_argument(
-        "--mlp-input-template",
+        "--mlp_input_template",
         type=str,
         required=True,
         help="NNsight path template for MLP inputs.",
     )
     parser.add_argument(
-        "--mlp-output-template",
+        "--mlp_output_template",
         type=str,
         required=True,
         help="NNsight path template for MLP outputs.",
     )
     parser.add_argument(
-        "--model-dtype",
+        "--model_dtype",
         type=str,
         default=None,
         help="Optional model dtype (e.g., 'float16').",
     )
 
     # --- Dataset Source ---
-    parser.add_argument("--dataset-path", type=str, required=True, help="Dataset name or path.")
-    parser.add_argument("--dataset-split", type=str, default="train", help="Dataset split.")
+    parser.add_argument("--dataset_path", type=str, required=True, help="Dataset name or path.")
+    parser.add_argument("--dataset_split", type=str, default="train", help="Dataset split.")
     parser.add_argument(
-        "--dataset-text-column",
+        "--dataset_text_column",
         type=str,
         default="text",
         help="Dataset text column name.",
@@ -52,20 +52,20 @@ def parse_arguments():
 
     # --- Generation Parameters ---
     parser.add_argument(
-        "--context-size",
+        "--context_size",
         type=int,
         default=128,
         help="Context size for tokenization/inference.",
     )
-    parser.add_argument("--inference-batch-size", type=int, default=512, help="Inference batch size.")
+    parser.add_argument("--inference_batch_size", type=int, default=512, help="Inference batch size.")
     parser.add_argument(
-        "--exclude-special-tokens",
+        "--exclude_special_tokens",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Exclude special tokens.",
     )
     parser.add_argument(
-        "--prepend-bos",
+        "--prepend_bos",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Prepend BOS token.",
@@ -79,7 +79,7 @@ def parse_arguments():
         help="Use HF dataset streaming.",
     )
     parser.add_argument(
-        "--trust-remote-code",
+        "--trust_remote_code",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Trust remote code for dataset.",
@@ -88,7 +88,7 @@ def parse_arguments():
 
     # --- Generation Output Control ---
     parser.add_argument(
-        "--target-total-tokens",
+        "--target_total_tokens",
         type=int,
         default=None,
         help="Target number of tokens to generate.",
@@ -97,13 +97,13 @@ def parse_arguments():
 
     # --- Storage Parameters ---
     parser.add_argument(
-        "--activation-dir",
+        "--activation_dir",
         type=str,
         default="./activations",
         help="Base directory to save activations.",
     )
     parser.add_argument(
-        "--output-format",
+        "--output_format",
         type=str,
         default="hdf5",
         choices=["hdf5", "npz"],
@@ -116,19 +116,19 @@ def parse_arguments():
         help="Compression ('lz4', 'gzip', or 'None').",
     )
     parser.add_argument(
-        "--chunk-token-threshold",
+        "--chunk_token_threshold",
         type=int,
         default=1_000_000,
         help="Target tokens per chunk file.",
     )
     parser.add_argument(
-        "--remote-server-url",
+        "--remote_server_url",
         type=str,
         default=None,
         help="Optional URL for the remote activation server (e.g., 'http://host:port').",
     )
     parser.add_argument(
-        "--activation-dtype",
+        "--activation_dtype",
         type=str,
         default="float32",
         help="Data type for storing activations (e.g., 'float32', 'bfloat16').",
@@ -136,25 +136,25 @@ def parse_arguments():
 
     # --- Upload Parameters (for remote storage) ---
     parser.add_argument(
-        "--delete-after-upload",
+        "--delete_after_upload",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Delete local chunk files after successful remote upload.",
     )
     parser.add_argument(
-        "--upload-max-retries",
+        "--upload_max_retries",
         type=int,
         default=5,
         help="Maximum number of upload retries per chunk file (default: 5).",
     )
     parser.add_argument(
-        "--upload-initial-backoff",
+        "--upload_initial_backoff",
         type=float,
         default=1.0,
         help="Initial backoff delay in seconds for upload retries (default: 1.0).",
     )
     parser.add_argument(
-        "--upload-max-backoff",
+        "--upload_max_backoff",
         type=float,
         default=30.0,
         help="Maximum backoff delay in seconds for upload retries (default: 30.0).",
@@ -162,7 +162,7 @@ def parse_arguments():
 
     # --- Normalization ---
     parser.add_argument(
-        "--compute-norm-stats",
+        "--compute_norm_stats",
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Compute and save normalization stats.",
@@ -176,7 +176,7 @@ def parse_arguments():
         help="Device override for generation ('cuda', 'cpu').",
     )
     parser.add_argument(
-        "--storage-type",
+        "--storage_type",
         type=str,
         default="local",
         choices=["local", "remote"],
@@ -185,7 +185,7 @@ def parse_arguments():
 
     # --- Profiling Argument ---
     parser.add_argument(
-        "--enable-profiling",
+        "--enable_profiling",
         action=argparse.BooleanOptionalAction,
         default=False,
         help="Enable detailed performance profiling during activation generation.",
@@ -193,13 +193,13 @@ def parse_arguments():
 
     # --- NNsight Arguments (Potentially pass as JSON strings) ---
     parser.add_argument(
-        "--nnsight-tracer-kwargs-json",
+        "--nnsight_tracer_kwargs_json",
         type=str,
         default="{}",
         help="JSON string for nnsight model.trace() kwargs.",
     )
     parser.add_argument(
-        "--nnsight-invoker-args-json",
+        "--nnsight_invoker_args_json",
         type=str,
         default="{}",
         help="JSON string for nnsight model.trace() invoker_args.",
