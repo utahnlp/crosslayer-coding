@@ -1,17 +1,15 @@
 import argparse
 import sys
 import os
-import json  # For potential future use with dict args
+import json
+
+from clt.activation_generation.generator import ActivationGenerator
+from clt.config.data_config import ActivationConfig
 
 # Ensure the clt package is discoverable
-# This assumes the script is run from the root of the project
-# Or that the clt package is installed
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-
-from clt.activation_generation.generator import ActivationGenerator
-from clt.config.data_config import ActivationConfig  # Import ActivationConfig
 
 
 def parse_arguments():
@@ -211,13 +209,11 @@ def parse_arguments():
 def main():
     args = parse_arguments()
 
-    # Handle potential None for compression argument
     if args.compression and args.compression.lower() == "none":
         compression_algo = None
     else:
         compression_algo = args.compression
 
-    # Parse JSON strings for NNsight kwargs
     try:
         nnsight_tracer_kwargs = json.loads(args.nnsight_tracer_kwargs_json)
         nnsight_invoker_args = json.loads(args.nnsight_invoker_args_json)
@@ -226,7 +222,6 @@ def main():
         print("Please provide valid JSON strings or empty dicts '{}'.")
         sys.exit(1)
 
-    # Create ActivationConfig from parsed arguments
     activation_config = ActivationConfig(
         model_name=args.model_name,
         mlp_input_module_path_template=args.mlp_input_template,
@@ -259,16 +254,12 @@ def main():
         enable_profiling=args.enable_profiling,
     )
 
-    # Instantiate the generator, passing the config and optional device override
     generator = ActivationGenerator(
-        cfg=activation_config,  # Use 'cfg' parameter name
-        device=args.device,  # Pass device separately
+        cfg=activation_config,
+        device=args.device,
     )
 
-    # Set the storage type explicitly (controls workflow, not part of ActivationConfig)
     generator.set_storage_type(args.storage_type)
-
-    # Run the generation process - it now uses the config internally
     generator.generate_and_save()
 
     print("Activation generation script finished.")
