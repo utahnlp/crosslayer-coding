@@ -142,13 +142,22 @@ class PerformanceProfiler:
         self.system_metrics_log.append(metrics)
         return metrics
 
-    def report(self):
+    def report(self, top_n_ops: Optional[int] = 20):
         logger.info("\n=== Performance Report ===")
         # Sort by total time descending for timings
-        sorted_timings = sorted(self.timings.items(), key=lambda item: sum(item[1]), reverse=True)
+        # Filter out operations with zero total time before sorting and slicing
+        valid_timings = {name: times for name, times in self.timings.items() if sum(times) > 0}
+        sorted_timings = sorted(valid_timings.items(), key=lambda item: sum(item[1]), reverse=True)
 
-        for name, times in sorted_timings:
-            if not times:
+        if top_n_ops is not None and top_n_ops > 0:
+            logger.info(f"--- Showing Top {top_n_ops} Timed Operations (by total time) ---")
+            timings_to_show = sorted_timings[:top_n_ops]
+        else:
+            logger.info("--- Showing All Timed Operations (by total time) ---")
+            timings_to_show = sorted_timings
+
+        for name, times in timings_to_show:
+            if not times:  # Should be redundant due to pre-filtering but safe
                 continue
             avg_time = sum(times) / len(times)
             total_time = sum(times)
@@ -387,10 +396,22 @@ def _async_uploader(upload_q: "queue.Queue[Optional[Path]]", cfg: ActivationConf
 # Welford online stats helper
 # ---------------------------------------------------------------------------
 class _RunningStat:
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, device: Optional[torch.device | str] = None):
         self.n = 0
-        self.mean = torch.zeros(dim, dtype=torch.float64)
-        self.M2 = torch.zeros(dim, dtype=torch.float64)
+        self.device = (
+            torch.device(device) if isinstance(device, str) else device
+        )  # Resolve device string to torch.device
+
+        if self.device and self.device.type == "mps":
+            self.stats_dtype = torch.float32
+            logger.info("Using float32 for running stats on MPS device.")
+        else:
+            self.stats_dtype = torch.float64
+
+        # Initialize to CPU if device is None, then move on first update, or initialize directly if device is known.
+        initial_device_for_zeros = self.device if self.device else "cpu"
+        self.mean = torch.zeros(dim, dtype=self.stats_dtype, device=initial_device_for_zeros)
+        self.M2 = torch.zeros(dim, dtype=self.stats_dtype, device=initial_device_for_zeros)
 
     def update(self, x: torch.Tensor):
         """Update running mean & M2 using a mini-batch (Welford, parallel form).
@@ -398,9 +419,19 @@ class _RunningStat:
         This corrects the previous implementation which **under-estimated** the
         variance by failing to include the between-batch mean shift term.
         """
+        if self.device is None:
+            self.device = x.device
+            # Update self.stats_dtype if it was default and first tensor is MPS
+            if self.device.type == "mps" and self.stats_dtype == torch.float64:
+                self.stats_dtype = torch.float32
+                logger.info("Switched running stats to float32 due to MPS device tensor.")
+            self.mean = self.mean.to(device=self.device, dtype=self.stats_dtype)
+            self.M2 = self.M2.to(device=self.device, dtype=self.stats_dtype)
+        elif x.device != self.device:
+            x = x.to(self.device)
 
-        # Promote to float64 for numerical stability
-        x = x.to(torch.float64)
+        # Ensure x is on the correct device and has the stats_dtype for calculations
+        x = x.to(device=self.device, dtype=self.stats_dtype)
 
         cnt = x.shape[0]
         if cnt == 0:
@@ -425,7 +456,10 @@ class _RunningStat:
 
     def finalize(self) -> Tuple[np.ndarray, np.ndarray]:
         var = self.M2 / max(self.n - 1, 1)
-        return self.mean.cpu().numpy().astype("float32"), np.sqrt(var).cpu().numpy().astype("float32")
+        # Ensure tensors are moved to CPU before NumPy conversion and operations like np.sqrt
+        mean_cpu = self.mean.cpu()
+        var_cpu = var.cpu()
+        return mean_cpu.numpy().astype("float32"), np.sqrt(var_cpu.numpy()).astype("float32")
 
 
 # ---------------------------------------------------------------------------
@@ -545,8 +579,8 @@ class ActivationGenerator:
                             buf_tgt[lid] = []
                             if cfg.compute_norm_stats:
                                 stats[lid] = {
-                                    "inputs": _RunningStat(d_model),
-                                    "targets": _RunningStat(d_model),
+                                    "inputs": _RunningStat(d_model, device=self.device),
+                                    "targets": _RunningStat(d_model, device=self.device),
                                 }
                         logger.info(
                             "Layers=%d d_model=%d dtype=%s", len(layer_ids) if layer_ids else 0, d_model, dtype_str
@@ -566,8 +600,8 @@ class ActivationGenerator:
                                 buf_tgt[lid].append(tgt)
                                 if cfg.compute_norm_stats and lid in stats:
                                     with self._conditional_measure(f"batch_norm_stats_update_layer_{lid}"):
-                                        stats[lid]["inputs"].update(inp.cpu())
-                                        stats[lid]["targets"].update(tgt.cpu())
+                                        stats[lid]["inputs"].update(inp)
+                                        stats[lid]["targets"].update(tgt)
                             else:
                                 logger.warning(
                                     f"Layer {lid} expected but not found in current batch. Skipping accumulation for this layer."
