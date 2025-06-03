@@ -900,6 +900,8 @@ class ActivationGenerator:
                     # Provide a default MANIFEST_DTYPE if not defined
                     manifest_dtype = np.dtype([("chunk_id", np.int32), ("num_tokens", np.int32), ("offset", np.int64)])
 
+                # <<< ADDED DIAGNOSTIC LOGGING >>>
+                logger.info(f"Manifest entry for chunk {chunk_idx}: num_tokens = {rows}, offset = {offset}")
                 current_manifest_entry = np.array([(chunk_idx, rows, offset)], dtype=manifest_dtype)
                 manifest_rows.append(current_manifest_entry)
 
