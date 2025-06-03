@@ -16,8 +16,12 @@ import json
 # Attempt to import transformers for model dimension detection
 try:
     from transformers import AutoConfig
+    import transformers  # Import the library itself to check version
+    import sys  # Import sys to check path
 except ImportError:
     AutoConfig = None
+    transformers = None  # type: ignore
+    sys = None  # type: ignore
 
 # Import necessary CLT components
 try:
@@ -46,10 +50,33 @@ def get_model_dimensions(model_name: str) -> tuple[Optional[int], Optional[int]]
         return None, None  # Indicate failure to auto-detect
 
     try:
-        config = AutoConfig.from_pretrained(model_name)
-        num_layers = getattr(config, "num-hidden-layers", None) or getattr(config, "n-layer", None)
-        d_model = getattr(config, "hidden-size", None) or getattr(config, "n-embd", None)
+        if transformers and hasattr(transformers, "__version__"):
+            logger.info(f"Transformers library version: {transformers.__version__}")
+        if sys:
+            logger.info(f"Python sys.path: {sys.path}")
 
+        logger.info(f"Attempting to load config for model_name: '{model_name}'")
+        config = AutoConfig.from_pretrained(model_name)
+        logger.info(f"Loaded config object: type={type(config)}")
+        if hasattr(config, "to_dict"):
+            # Log only a few key attributes to avoid excessively long log messages
+            # if the config is huge. Relevant ones might be 'model_type', 'architectures'.
+            config_dict_summary = {
+                k: v
+                for k, v in config.to_dict().items()
+                if k in ["model_type", "architectures", "num_hidden_layers", "n_layer", "hidden_size", "n_embd"]
+            }
+            logger.info(f"Config content summary: {config_dict_summary}")
+            # If still debugging, can log the full dict, but be wary of verbosity:
+            # logger.debug(f"Full config content: {config.to_dict()}")
+        elif hasattr(config, "__dict__"):
+            logger.info(f"Config content (vars): {vars(config)}")
+        else:
+            logger.info(f"Config object does not have to_dict or __dict__ methods. Content: {config}")
+
+        num_layers = getattr(config, "num_hidden_layers", None) or getattr(config, "n_layer", None)
+        d_model = getattr(config, "hidden_size", None) or getattr(config, "n_embd", None)
+        logger.info(f"Attempted to get dimensions: num_layers={num_layers}, d_model={d_model}")
         if num_layers is None or d_model is None:
             logger.warning(
                 f"Could not automatically determine num_layers or d_model for {model_name}. "
@@ -86,7 +113,7 @@ def parse_args():
         "--output-dir",
         type=str,
         default=f"clt_train_{int(time.time())}",
-        help="Directory to save logs, checkpoints, and final model. If resuming, this might be overridden by --resume-from-checkpoint-dir.",
+        help="Directory to save logs, checkpoints, and final model. If resuming, this might be overridden by --resume_from_checkpoint_dir.",
     )
     core_group.add_argument(
         "--model-name",
@@ -106,16 +133,16 @@ def parse_args():
         help="Enable distributed training (requires torchrun/appropriate launcher).",
     )
     core_group.add_argument(
-        "--resume-from-checkpoint-dir",
+        "--resume_from_checkpoint_dir",
         type=str,
         default=None,
-        help="Path to the output directory of a previous run to resume from. Will attempt to load 'latest' or a specific step if --resume-step is also given.",
+        help="Path to the output directory of a previous run to resume from. Will attempt to load 'latest' or a specific step if --resume_step is also given.",
     )
     core_group.add_argument(
-        "--resume-step",
+        "--resume_step",
         type=int,
         default=None,
-        help="Optional specific step to resume from. Used in conjunction with --resume-from-checkpoint-dir.",
+        help="Optional specific step to resume from. Used in conjunction with --resume_from_checkpoint_dir.",
     )
 
     # --- Local Activation Source Parameters ---
