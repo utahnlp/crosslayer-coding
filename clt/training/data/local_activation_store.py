@@ -146,7 +146,7 @@ class LocalActivationStore(ManifestActivationStore):
             logger.error(f"Error reading norm_stats file {path}: {e}")
             return None
 
-    @lru_cache(maxsize=256)
+    @lru_cache(maxsize=64)
     def _load_chunk(self, chunk_path: str, layer_key: str, data_type: str):
         """Loads entire HDF5 chunk from disk and caches"""
 
