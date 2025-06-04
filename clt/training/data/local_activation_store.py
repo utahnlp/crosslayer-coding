@@ -96,9 +96,22 @@ class LocalActivationStore(ManifestActivationStore):
                 # New format with 3 fields (chunk_id, num_tokens, offset)
                 manifest_dtype = np.dtype([("chunk_id", np.int32), ("num_tokens", np.int32), ("offset", np.int64)])
                 data_structured = np.fromfile(path, dtype=manifest_dtype)
-                logger.info(f"Manifest loaded (3-field format) from {path} ({data_structured.shape[0]} rows).")
-                # Convert to Nx2 uint32 array expected by downstream code (drop offset)
-                data = np.stack((data_structured["chunk_id"], data_structured["num_tokens"]), axis=1).astype(np.uint32)
+                logger.info(
+                    f"Manifest loaded (3-field format) from {path} ({data_structured.shape[0]} chunks). Expanding to per-row entries."
+                )
+                # Expand into per-row entries expected by downstream (chunk_id, row_in_chunk)
+                chunk_ids = data_structured["chunk_id"].astype(np.uint32)
+                num_tokens_arr = data_structured["num_tokens"].astype(np.uint32)
+                # Compute total rows
+                total_rows = int(num_tokens_arr.sum())
+                logger.info(f"Expanding manifest: total rows = {total_rows}")
+                # Pre-allocate array
+                data = np.empty((total_rows, 2), dtype=np.uint32)
+                row_ptr = 0
+                for cid, ntok in zip(chunk_ids, num_tokens_arr):
+                    data[row_ptr : row_ptr + ntok, 0] = cid  # chunk_id column
+                    data[row_ptr : row_ptr + ntok, 1] = np.arange(ntok, dtype=np.uint32)  # row index within chunk
+                    row_ptr += ntok
             elif file_size_bytes % 8 == 0:
                 # Legacy 2-field format already matches expected shape
                 data = np.fromfile(path, dtype=np.uint32).reshape(-1, 2)
