@@ -168,6 +168,19 @@ class LocalActivationStore(ManifestActivationStore):
     def _fetch_slice(self, chunk_id: int, row_indices: np.ndarray) -> bytes:
 
         chunk_path = self.dataset_path / f"chunk_{chunk_id}.h5"
+        if not chunk_path.exists():
+            # Fall back to .hdf5 extension (newer generator default)
+            alt_path = self.dataset_path / f"chunk_{chunk_id}.hdf5"
+            if alt_path.exists():
+                chunk_path = alt_path
+            else:
+                # Provide clearer error message before _open_h5 raises
+                logger.error(
+                    "Chunk file for chunk_id %d not found with either .h5 or .hdf5 extension in %s",
+                    chunk_id,
+                    self.dataset_path,
+                )
+
         hf = _open_h5(chunk_path)
 
         try:
