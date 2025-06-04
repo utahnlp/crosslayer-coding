@@ -89,12 +89,28 @@ class LocalActivationStore(ManifestActivationStore):
             logger.error(f"Manifest file not found: {path}")
             return None
         try:
-            with open(path, "rb") as f:
-                data = np.frombuffer(f.read(), dtype=np.uint32).reshape(-1, 2)
-            logger.info(f"Manifest loaded from {path} ({len(data)} rows).")
+            file_size_bytes = path.stat().st_size
+            # Heuristic: older 2-field format is 8 bytes per entry (two uint32),
+            # newer 3-field format is 16 bytes per entry (int32, int32, int64).
+            if file_size_bytes % 16 == 0:
+                # New format with 3 fields (chunk_id, num_tokens, offset)
+                manifest_dtype = np.dtype([("chunk_id", np.int32), ("num_tokens", np.int32), ("offset", np.int64)])
+                data_structured = np.fromfile(path, dtype=manifest_dtype)
+                logger.info(f"Manifest loaded (3-field format) from {path} ({data_structured.shape[0]} rows).")
+                # Convert to Nx2 uint32 array expected by downstream code (drop offset)
+                data = np.stack((data_structured["chunk_id"], data_structured["num_tokens"]), axis=1).astype(np.uint32)
+            elif file_size_bytes % 8 == 0:
+                # Legacy 2-field format already matches expected shape
+                data = np.fromfile(path, dtype=np.uint32).reshape(-1, 2)
+                logger.info(f"Manifest loaded (legacy 2-field format) from {path} ({data.shape[0]} rows).")
+            else:
+                logger.error(
+                    f"Manifest file size ({file_size_bytes} bytes) is not compatible with known formats (8 or 16 bytes per row)."
+                )
+                return None
             return data
         except ValueError as e:
-            logger.error(f"Error reshaping manifest data from {path} (expected Nx2): {e}")
+            logger.error(f"Error parsing manifest data from {path}: {e}")
             return None
         except OSError as e:
             logger.error(f"Error reading manifest file {path}: {e}")
@@ -129,7 +145,9 @@ class LocalActivationStore(ManifestActivationStore):
             logger.error(f"Chunk file not found for fetch: {chunk_path}")
             raise
         except KeyError as e:
-            raise RuntimeError(f"Missing 'inputs' or 'targets' dataset in layer group '{layer_key}' of chunk {chunk_path}") from e
+            raise RuntimeError(
+                f"Missing 'inputs' or 'targets' dataset in layer group '{layer_key}' of chunk {chunk_path}"
+            ) from e
         except Exception as e:
             logger.error(f"Failed to open chunk at {chunk_path}: {e}")
             raise RuntimeError(f"Failed to access chunk HDF5 file: {chunk_path}") from e
@@ -162,8 +180,8 @@ class LocalActivationStore(ManifestActivationStore):
                 row_indices_h5 = row_indices
 
             for i, lk in enumerate(layer_keys):
-                input_data = self._load_chunk(chunk_path, lk, 'inputs')[row_indices_h5, :]
-                target_data = self._load_chunk(chunk_path, lk, 'targets')[row_indices_h5, :]
+                input_data = self._load_chunk(chunk_path, lk, "inputs")[row_indices_h5, :]
+                target_data = self._load_chunk(chunk_path, lk, "targets")[row_indices_h5, :]
                 bufs.append(input_data.tobytes())
                 bufs.append(target_data.tobytes())
             return b"".join(bufs)
