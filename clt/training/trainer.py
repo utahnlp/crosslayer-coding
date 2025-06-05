@@ -132,7 +132,13 @@ class CLTTrainer:
         # Initialize GradScaler (enabled only for fp16 on CUDA)
         # MPS doesn't use GradScaler in the same way, typically.
         # The warning is about autocast itself, not scaler.
-        self.scaler = torch.cuda.amp.GradScaler(enabled=(self.mixed_precision == "fp16" and torch.cuda.is_available()))
+        scaler_enabled = (self.mixed_precision == "fp16" and torch.cuda.is_available())
+        try:
+            # Use the new API if available (PyTorch 2.1+)
+            self.scaler = torch.amp.GradScaler('cuda', enabled=scaler_enabled)
+        except (AttributeError, TypeError):
+            # Fallback to deprecated API for older PyTorch versions
+            self.scaler = torch.cuda.amp.GradScaler(enabled=scaler_enabled)
 
         logger.info(
             f"Rank {self.rank}: Mixed precision mode: {self.mixed_precision}, autocast_enabled: {self.autocast_enabled}, autocast_dtype: {self.autocast_dtype}"

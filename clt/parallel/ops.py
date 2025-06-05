@@ -68,6 +68,10 @@ def all_reduce(
     if not tensor.is_contiguous():
         tensor.data = tensor.contiguous()
     
+    # Add CUDA synchronization for CUDA 12.8 stability
+    if tensor.device.type == 'cuda':
+        torch.cuda.synchronize(device=tensor.device)
+    
     return dist.all_reduce(tensor, op=op, group=group, async_op=async_op)
 
 
@@ -127,5 +131,9 @@ def all_gather(
     for i, t in enumerate(tensor_list):
         if not t.is_contiguous():
             tensor_list[i] = t.contiguous()
+
+    # Add CUDA synchronization for CUDA 12.8 stability
+    if tensor.device.type == 'cuda':
+        torch.cuda.synchronize(device=tensor.device)
 
     return dist.all_gather(tensor_list, tensor, group=group, async_op=async_op)

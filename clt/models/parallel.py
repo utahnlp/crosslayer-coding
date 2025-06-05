@@ -141,10 +141,29 @@ class _Gather(torch.autograd.Function):
                 )
                 gathered.append(empty_tensor)
 
+        # Ensure CUDA synchronization before collective operation for CUDA 12.8
+        if input_contig.device.type == 'cuda':
+            torch.cuda.synchronize(device=input_contig.device)
+        
         # Perform the collective using new utility function wrapper
         dist_ops.all_gather(gathered, input_contig, group=process_group)
 
-        output = torch.cat(gathered, dim=dim)
+        # Ensure all tensors are contiguous and on the same device before concatenation
+        # This is critical for CUDA 12.8 compatibility
+        device = input_contig.device
+        dtype = input_contig.dtype
+        gathered_safe = []
+        for i, tensor in enumerate(gathered):
+            # Ensure tensor is on correct device, dtype, and contiguous
+            if tensor.device != device:
+                tensor = tensor.to(device)
+            if tensor.dtype != dtype:
+                tensor = tensor.to(dtype)
+            if not tensor.is_contiguous():
+                tensor = tensor.contiguous()
+            gathered_safe.append(tensor)
+
+        output = torch.cat(gathered_safe, dim=dim)
 
         # If we padded the tensor dimension for divisibility, remove the excess.
         if output.size(dim) > ctx.full_dim_size:
@@ -203,6 +222,10 @@ class _Reduce(torch.autograd.Function):
         # Create a copy to avoid in-place operations on the input tensor which can cause
         # CUDA 12.8 device-side asserts in autograd graphs
         input_contig = input_.contiguous().clone()
+
+        # Ensure CUDA synchronization before collective operation for CUDA 12.8
+        if input_contig.device.type == 'cuda':
+            torch.cuda.synchronize(device=input_contig.device)
 
         # Perform the all-reduce with SUM operation using new utility function wrapper.
         dist_ops.all_reduce(input_contig, op=dist_ops.SUM, group=process_group)
