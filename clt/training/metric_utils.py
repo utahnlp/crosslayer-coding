@@ -49,7 +49,7 @@ class MetricLogger:
         self.metrics["train_losses"].append({"step": step, **loss_dict})
 
         if not self.distributed or self.rank == 0:
-            total_tokens_processed = self.training_config.train_batch_size_tokens * self.world_size * (step + 1)
+            total_tokens_processed = self.training_config.train_batch_size_tokens * (step + 1)
 
             self.wandb_logger.log_step(
                 step,
