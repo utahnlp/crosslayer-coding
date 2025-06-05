@@ -125,10 +125,21 @@ class _Gather(torch.autograd.Function):
         # Ensure a contiguous tensor before communication for NCCL efficiency.
         input_contig = input_.contiguous()
 
-        gathered: list[torch.Tensor] = [torch.empty_like(input_contig) for _ in range(world_size)]
-        # Preserve the *exact* tensor object for the local slice so that autograd
-        # can track the dependency (no copy!).
-        gathered[rank] = input_contig
+        # Create gather tensors with explicit memory format and alignment for CUDA 12.8
+        gathered: list[torch.Tensor] = []
+        for i in range(world_size):
+            if i == rank:
+                # Use the original contiguous tensor for this rank
+                gathered.append(input_contig)
+            else:
+                # Create empty tensors with same dtype, device, and memory layout
+                empty_tensor = torch.empty(
+                    input_contig.shape, 
+                    dtype=input_contig.dtype, 
+                    device=input_contig.device,
+                    memory_format=torch.contiguous_format
+                )
+                gathered.append(empty_tensor)
 
         # Perform the collective using new utility function wrapper
         dist_ops.all_gather(gathered, input_contig, group=process_group)
@@ -189,7 +200,9 @@ class _Reduce(torch.autograd.Function):
             return input_
 
         ctx.process_group = process_group
-        input_contig = input_.contiguous()  # Ensure contiguous before collective
+        # Create a copy to avoid in-place operations on the input tensor which can cause
+        # CUDA 12.8 device-side asserts in autograd graphs
+        input_contig = input_.contiguous().clone()
 
         # Perform the all-reduce with SUM operation using new utility function wrapper.
         dist_ops.all_reduce(input_contig, op=dist_ops.SUM, group=process_group)
@@ -388,14 +401,25 @@ class RowParallelLinear(_ParallelLinear):
                 # Determine the batch dimensions from input_
                 batch_shape = input_.shape[:-1] if not self.input_is_parallel else local_input.shape[:-1]
                 output_shape = batch_shape + (self.local_out_features,)
-                local_output = torch.zeros(output_shape, dtype=input_.dtype, device=input_.device)
+                # Ensure device and dtype match weight for CUDA 12.8 compatibility
+                local_output = torch.zeros(
+                    output_shape, 
+                    dtype=self.weight.dtype, 
+                    device=self.weight.device,
+                    memory_format=torch.contiguous_format
+                )
             else:
                 # Pad the input slice with zeros on the right to match the weight's expected dimension
                 pad_size = expected_local_features - actual_local_features
-                padded_input = F.pad(local_input, (0, pad_size))
+                # Ensure padding preserves device and uses contiguous memory format
+                padded_input = F.pad(local_input, (0, pad_size), mode='constant', value=0.0)
+                # Ensure input is contiguous before linear operation for CUDA 12.8
+                padded_input = padded_input.contiguous()
                 local_output = F.linear(padded_input, self.weight)  # Bias is added after reduce
         elif actual_local_features == expected_local_features:
             # Input size matches expected padded size, no padding needed.
+            # Ensure input is contiguous before linear operation for CUDA 12.8
+            local_input = local_input.contiguous()
             local_output = F.linear(local_input, self.weight)  # Bias is added after reduce
         else:
             # This should not happen if _split and input processing are correct.

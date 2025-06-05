@@ -63,6 +63,11 @@ def all_reduce(
     """
     if not is_dist_initialized_and_available() or get_world_size(group=group) == 1:
         return None
+    
+    # Ensure tensor is contiguous for CUDA 12.8 compatibility
+    if not tensor.is_contiguous():
+        tensor.data = tensor.contiguous()
+    
     return dist.all_reduce(tensor, op=op, group=group, async_op=async_op)
 
 
@@ -113,5 +118,14 @@ def all_gather(
         if rank < len(tensor_list):
             tensor_list[rank] = tensor  # pyright: ignore[reportGeneralTypeIssues]
         return None
+
+    # Ensure input tensor is contiguous for CUDA 12.8 compatibility
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    
+    # Ensure all tensors in the output list are contiguous
+    for i, t in enumerate(tensor_list):
+        if not t.is_contiguous():
+            tensor_list[i] = t.contiguous()
 
     return dist.all_gather(tensor_list, tensor, group=group, async_op=async_op)
