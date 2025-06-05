@@ -148,22 +148,49 @@ class _Gather(torch.autograd.Function):
         # Perform the collective using new utility function wrapper
         dist_ops.all_gather(gathered, input_contig, group=process_group)
 
-        # Ensure all tensors are contiguous and on the same device before concatenation
-        # This is critical for CUDA 12.8 compatibility
+        # Create a safe output tensor manually to avoid CUDA 12.8 concat issues
         device = input_contig.device
         dtype = input_contig.dtype
-        gathered_safe = []
+        
+        # Calculate output shape
+        output_shape = list(input_contig.shape)
+        total_dim_size = sum(t.size(dim) for t in gathered)
+        output_shape[dim] = total_dim_size
+        
+        # Create output tensor with explicit memory format
+        output = torch.empty(
+            output_shape, 
+            dtype=dtype, 
+            device=device, 
+            memory_format=torch.contiguous_format
+        )
+        
+        # Manually copy data instead of using torch.cat
+        current_offset = 0
         for i, tensor in enumerate(gathered):
-            # Ensure tensor is on correct device, dtype, and contiguous
-            if tensor.device != device:
-                tensor = tensor.to(device)
-            if tensor.dtype != dtype:
-                tensor = tensor.to(dtype)
-            if not tensor.is_contiguous():
-                tensor = tensor.contiguous()
-            gathered_safe.append(tensor)
+            # Ensure tensor is properly formatted
+            safe_tensor = tensor
+            if safe_tensor.device != device:
+                safe_tensor = safe_tensor.to(device)
+            if safe_tensor.dtype != dtype:
+                safe_tensor = safe_tensor.to(dtype)
+            if not safe_tensor.is_contiguous():
+                safe_tensor = safe_tensor.contiguous()
+            
+            tensor_size = safe_tensor.size(dim)
+            if tensor_size > 0:  # Only copy if tensor has content
+                # Create slice indices
+                slice_indices = [slice(None)] * output.dim()
+                slice_indices[dim] = slice(current_offset, current_offset + tensor_size)
+                
+                # Copy data
+                output[tuple(slice_indices)].copy_(safe_tensor)
+                
+            current_offset += tensor_size
 
-        output = torch.cat(gathered_safe, dim=dim)
+        # Ensure all copy operations are complete before proceeding
+        if device.type == 'cuda':
+            torch.cuda.synchronize(device=device)
 
         # If we padded the tensor dimension for divisibility, remove the excess.
         if output.size(dim) > ctx.full_dim_size:
