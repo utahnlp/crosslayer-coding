@@ -17,7 +17,7 @@ try:
     from clt.models.clt import CrossLayerTranscoder
     from clt.training.data.local_activation_store import LocalActivationStore  # Default store for this script
     from clt.training.evaluator import CLTEvaluator  # Added for NMSE check
-    from safetensors.torch import load_file as load_safetensors_file  # Added for safetensors support
+    from safetensors.torch import load_file, save_file  # Added for safetensors support
 
     # Add other store types if needed, e.g., RemoteActivationStore
 except ImportError as e:
@@ -124,14 +124,32 @@ def main(args):
         else:  # Standard single-file checkpoint
             if args.batchtopk_checkpoint_path.endswith(".safetensors"):
                 logger.info(f"Loading BatchTopK model state from safetensors file: {args.batchtopk_checkpoint_path}")
-                state_dict = load_safetensors_file(args.batchtopk_checkpoint_path, device=device.type)
-                state_dict = _remap_checkpoint_keys(state_dict)  # Remap keys
-                model.load_state_dict(state_dict)
+                state_dict = load_file(args.batchtopk_checkpoint_path, device=device.type)
             else:
                 logger.info(f"Loading BatchTopK model state from .pt file: {args.batchtopk_checkpoint_path}")
                 state_dict = torch.load(args.batchtopk_checkpoint_path, map_location=device)
-                state_dict = _remap_checkpoint_keys(state_dict)  # Remap keys
-                model.load_state_dict(state_dict)
+
+            state_dict = _remap_checkpoint_keys(state_dict)  # Remap keys
+
+            # --- Add config validation against checkpoint ---
+            first_encoder_weight_key = "encoder_module.encoders.0.weight"
+            if first_encoder_weight_key in state_dict:
+                checkpoint_num_features = state_dict[first_encoder_weight_key].shape[0]
+                config_num_features = clt_config_batchtopk.num_features
+                if checkpoint_num_features != config_num_features:
+                    logger.error("--- CONFIGURATION MISMATCH ---")
+                    logger.error(
+                        f"The 'num_features' in your config file ({config_num_features}) "
+                        f"does not match the number of features in the checkpoint ({checkpoint_num_features})."
+                    )
+                    logger.error(f"  Config path: {args.config_path}")
+                    logger.error(f"  Checkpoint path: {args.batchtopk_checkpoint_path}")
+                    logger.error(
+                        "Please ensure you are using the correct config file that was used to train this model."
+                    )
+                    return  # Exit the script
+
+            model.load_state_dict(state_dict)
 
         model.eval()
         logger.info("BatchTopK model loaded and set to eval mode.")
@@ -174,7 +192,7 @@ def main(args):
 
     try:
         estimated_thetas = model.estimate_theta_posthoc(
-            data_iter=activation_store_theta,
+            data_iter=iter(activation_store_theta),
             num_batches=args.num_batches_for_theta_estimation,
             default_theta_value=args.default_theta_value,
             device=device,  # Pass device to ensure buffers are on correct device
@@ -193,7 +211,12 @@ def main(args):
     # 5. Save the Converted JumpReLU Model and its Config
     logger.info(f"Saving converted JumpReLU model state to: {args.output_model_path}")
     os.makedirs(os.path.dirname(args.output_model_path), exist_ok=True)
-    torch.save(model.state_dict(), args.output_model_path)
+    if args.output_model_path.endswith(".safetensors"):
+        save_file(model.state_dict(), args.output_model_path)
+        logger.info(f"Saved converted JumpReLU model state as safetensors to: {args.output_model_path}")
+    else:
+        torch.save(model.state_dict(), args.output_model_path)
+        logger.info(f"Saved converted JumpReLU model state as .pt to: {args.output_model_path}")
 
     logger.info(f"Saving converted JumpReLU model config to: {args.output_config_path}")
     os.makedirs(os.path.dirname(args.output_config_path), exist_ok=True)
@@ -404,7 +427,7 @@ def main(args):
                 state_dict_to_populate_orig = _remap_checkpoint_keys(state_dict_to_populate_orig)
                 original_model.load_state_dict(state_dict_to_populate_orig)
             elif original_checkpoint_path.endswith(".safetensors"):
-                state_dict_orig = load_safetensors_file(original_checkpoint_path, device=device.type)
+                state_dict_orig = load_file(original_checkpoint_path, device=device.type)
                 state_dict_orig = _remap_checkpoint_keys(state_dict_orig)
                 original_model.load_state_dict(state_dict_orig)
             else:
@@ -569,6 +592,16 @@ def calibrate_layerwise_theta_for_l0_matching(
     logger.info("Starting layer-wise L0 calibration...")
     model_to_calibrate.eval()  # Ensure model is in eval mode
 
+    if model_to_calibrate.config.activation_fn != "jumprelu":
+        logger.error(
+            f"Model activation function is '{model_to_calibrate.config.activation_fn}', not 'jumprelu'. "
+            "Cannot perform theta calibration. Exiting calibration."
+        )
+        return
+    if model_to_calibrate.log_threshold is None:
+        logger.error("model_to_calibrate.log_threshold is None. Cannot perform calibration. Exiting.")
+        return
+
     # Detach original log_thresholds to use as base for scaling, to avoid them changing with each layer's calibration
     original_log_thetas_exp = model_to_calibrate.log_threshold.exp().detach().clone()
 
@@ -605,7 +638,8 @@ def calibrate_layerwise_theta_for_l0_matching(
             # We are calibrating one layer at a time. When checking layer_idx,
             # we modify only model.log_threshold.data[layer_idx].
             current_scaled_theta_layer = base_theta_layer * mid_s
-            model_to_calibrate.log_threshold.data[layer_idx] = torch.log(current_scaled_theta_layer.clamp_min(1e-9))
+            if model_to_calibrate.log_threshold is not None:
+                model_to_calibrate.log_threshold.data[layer_idx] = torch.log(current_scaled_theta_layer.clamp_min(1e-9))
 
             # Check L0 with this new theta for the current layer
             # run_quick_l0_checks_script returns a dict {layer_idx: l0_val}
@@ -653,7 +687,8 @@ def calibrate_layerwise_theta_for_l0_matching(
 
         # Set the layer's log_threshold to the one corresponding to the best scale found
         final_scaled_theta_layer = base_theta_layer * current_best_scale
-        model_to_calibrate.log_threshold.data[layer_idx] = torch.log(final_scaled_theta_layer.clamp_min(1e-9))
+        if model_to_calibrate.log_threshold is not None:
+            model_to_calibrate.log_threshold.data[layer_idx] = torch.log(final_scaled_theta_layer.clamp_min(1e-9))
         logger.info(f"Layer {layer_idx}: Set final scale {current_best_scale:.3f}. Log_threshold updated.")
 
     logger.info("Layer-wise L0 calibration finished.")
