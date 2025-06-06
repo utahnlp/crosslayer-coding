@@ -78,14 +78,24 @@ def merge_state_dict(tp_model: CrossLayerTranscoder, num_features: int, d_model:
             if rank == 0:
                 full_state[name] = gathered
                 print(f"    └─> Merged shape: {gathered.shape}")
-        # NEW: Handle log_threshold, sharded on feature dimension
-        elif name.endswith("log_threshold") and param.ndim == 2 and param.shape[1] * world_size == num_features:
+        # Special handling for log_threshold to add more logging
+        elif "log_threshold" in name:
             if rank == 0:
-                print(f"  - Gathering THRESHOLD:    {name} (shard shape: {param.shape})")
-            gathered = gather_tensor_parallel_param(param, dim=1, world_size=world_size)
-            if rank == 0:
-                full_state[name] = gathered
-                print(f"    └─> Merged shape: {gathered.shape}")
+                print(f"  - Found 'log_threshold': {name} (shard shape: {param.shape}, ndim: {param.ndim})")
+            # Check if it matches the sharding pattern we expect
+            if param.ndim == 2 and param.shape[1] * world_size == num_features:
+                if rank == 0:
+                    print("    └─> Classified as SHARDED. Gathering...")
+                gathered = gather_tensor_parallel_param(param, dim=1, world_size=world_size)
+                if rank == 0:
+                    full_state[name] = gathered
+                    print(f"      └─> Merged shape: {gathered.shape}")
+            else:
+                # If it doesn't match, it's either replicated or has an unexpected shape.
+                # In either case, we take rank 0's copy and log a warning.
+                if rank == 0:
+                    print("    └─> WARNING: 'log_threshold' did not match sharding criteria. Treating as REPLICATED.")
+                    full_state[name] = param.cpu()
         # Bias or vector split along features: [num_features/world]
         elif param.ndim == 1 and param.shape[0] * world_size == num_features:
             if rank == 0:
