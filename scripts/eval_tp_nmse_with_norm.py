@@ -43,10 +43,13 @@ def load_normalization_stats(activation_path: str) -> Tuple[Dict[int, torch.Tens
     std_tg = {}
 
     # Convert the norm stats to the format expected by the evaluator
-    for layer_idx in range(len(norm_stats)):
-        layer_stats = norm_stats[layer_idx]
-        mean_tg[layer_idx] = torch.tensor(layer_stats["mean"], dtype=torch.float32)
-        std_tg[layer_idx] = torch.tensor(layer_stats["std"], dtype=torch.float32)
+    # norm_stats is structured as {"layer_0": {"inputs": {...}, "targets": {...}}, ...}
+    for layer_name, layer_data in norm_stats.items():
+        if layer_name.startswith("layer_"):
+            layer_idx = int(layer_name.split("_")[1])
+            if "targets" in layer_data and "mean" in layer_data["targets"] and "std" in layer_data["targets"]:
+                mean_tg[layer_idx] = torch.tensor(layer_data["targets"]["mean"], dtype=torch.float32)
+                std_tg[layer_idx] = torch.tensor(layer_data["targets"]["std"], dtype=torch.float32)
 
     logger.info(f"Loaded normalization stats for {len(mean_tg)} layers")
     return mean_tg, std_tg
