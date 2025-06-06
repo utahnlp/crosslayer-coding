@@ -17,25 +17,24 @@ from __future__ import annotations
 
 import argparse
 import os
+import sys
 from pathlib import Path
 from typing import Dict, List
 
+# Add project root to path *before* importing from clt
+project_root = Path(__file__).resolve().parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import torch
 import torch.distributed as dist
+from safetensors.torch import save_file as save_safetensors_file
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
 from torch.distributed.checkpoint.filesystem import FileSystemReader
 from torch.distributed.checkpoint.state_dict_loader import load_state_dict
-from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
-from safetensors.torch import save_file as save_safetensors_file
 
-# -----------------------------------------------------------------------------
-# Project-local imports – add project root to PYTHONPATH automatically.
-# -----------------------------------------------------------------------------
-import sys
-
-project_root = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(project_root))
-from clt.config import CLTConfig  # type: ignore
-from clt.models.clt import CrossLayerTranscoder  # type: ignore
+from clt.config import CLTConfig
+from clt.models.clt import CrossLayerTranscoder
 
 
 def gather_tensor_parallel_param(param: torch.Tensor, dim: int, world_size: int) -> torch.Tensor:
@@ -67,6 +66,11 @@ def merge_state_dict(tp_model: CrossLayerTranscoder, num_features: int, d_model:
                 full_state[name] = gathered
         # Row-parallel weight: [d_model, num_features/world]
         elif param.ndim == 2 and param.shape[0] == d_model and param.shape[1] * world_size == num_features:
+            gathered = gather_tensor_parallel_param(param, dim=1, world_size=world_size)
+            if rank == 0:
+                full_state[name] = gathered
+        # NEW: Handle log_threshold, sharded on feature dimension
+        elif name.endswith("log_threshold") and param.ndim == 2 and param.shape[1] * world_size == num_features:
             gathered = gather_tensor_parallel_param(param, dim=1, world_size=world_size)
             if rank == 0:
                 full_state[name] = gathered

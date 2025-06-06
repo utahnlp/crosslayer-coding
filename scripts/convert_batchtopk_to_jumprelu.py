@@ -4,7 +4,7 @@ import json
 import argparse
 import sys
 import logging
-from typing import Dict, List
+from typing import Dict, List, Optional
 import math
 
 # Ensure the project root is in the Python path
@@ -192,7 +192,7 @@ def main(args):
 
     try:
         estimated_thetas = model.estimate_theta_posthoc(
-            data_iter=iter(activation_store_theta),
+            data_iter=activation_store_theta,
             num_batches=args.num_batches_for_theta_estimation,
             default_theta_value=args.default_theta_value,
             device=device,  # Pass device to ensure buffers are on correct device
@@ -227,10 +227,6 @@ def main(args):
     # 6. Perform a quick L0 and NMSE check on the converted model
     logger.info("Performing L0 and NMSE check on the converted JumpReLU model...")
 
-    all_sample_inputs_for_l0: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
-    all_sample_targets_for_nmse: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
-    # total_tokens_collected_per_layer: Dict[int, int] = {i: 0 for i in range(model.config.num_layers)} # No longer needed with direct cat
-
     l0_check_fetch_batch_size = (
         args.l0_check_batch_size_tokens
         if hasattr(args, "l0_check_batch_size_tokens") and args.l0_check_batch_size_tokens is not None
@@ -241,7 +237,12 @@ def main(args):
         f"Collecting data for L0/NMSE check using {args.num_batches_for_l0_check} batches with fetch batch size {l0_check_fetch_batch_size} tokens."
     )
 
-    mean_tg_for_eval = None  # To store normalization stats for Evaluator
+    # --- Initialise accumulators for batch-wise processing to conserve memory ---
+    total_l0_per_layer: Dict[int, float] = {i: 0.0 for i in range(model.config.num_layers)}
+    total_tokens_for_l0_per_layer: Dict[int, int] = {i: 0 for i in range(model.config.num_layers)}
+    all_reconstructions_for_nmse: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
+    all_targets_for_nmse_check: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
+    mean_tg_for_eval = None
     std_tg_for_eval = None
 
     try:
@@ -258,7 +259,6 @@ def main(args):
         )
         data_iterator_for_l0_check = iter(activation_store_for_l0_check)
 
-        # Retrieve mean_tg and std_tg if store has them (after iter is created, stats should be available if auto)
         if hasattr(activation_store_for_l0_check, "mean_tg") and hasattr(activation_store_for_l0_check, "std_tg"):
             mean_tg_for_eval = activation_store_for_l0_check.mean_tg
             std_tg_for_eval = activation_store_for_l0_check.std_tg
@@ -269,123 +269,102 @@ def main(args):
                     "mean_tg or std_tg not available from L0 check store. NMSE will be on potentially normalized values."
                 )
 
+        # --- Process data batch by batch ---
         for batch_idx in range(args.num_batches_for_l0_check):
             try:
                 sample_inputs_batch, sample_targets_batch = next(data_iterator_for_l0_check)
-                for layer_idx in sample_inputs_batch.keys():  # Iterate over layers present in the input batch
-                    if layer_idx in all_sample_inputs_for_l0:
-                        input_tensor_data = sample_inputs_batch[layer_idx]
-                        if input_tensor_data.dim() == 3:
-                            num_tokens = input_tensor_data.shape[0] * input_tensor_data.shape[1]
-                            all_sample_inputs_for_l0[layer_idx].append(
-                                input_tensor_data.reshape(num_tokens, model.config.d_model)
-                            )
-                        elif input_tensor_data.dim() == 2:
-                            all_sample_inputs_for_l0[layer_idx].append(input_tensor_data)
+                # Flatten inputs and targets from (B, S, D) to (B*S, D)
+                flat_inputs_batch = {
+                    layer_idx: (t.reshape(-1, t.shape[-1]) if t.dim() == 3 else t)
+                    for layer_idx, t in sample_inputs_batch.items()
+                }
+                flat_targets_batch = {
+                    layer_idx: (t.reshape(-1, t.shape[-1]) if t.dim() == 3 else t)
+                    for layer_idx, t in sample_targets_batch.items()
+                }
+                if not flat_inputs_batch:
+                    continue
 
-                    if (
-                        layer_idx in sample_targets_batch and layer_idx in all_sample_targets_for_nmse
-                    ):  # Check if target exists for the layer
-                        target_tensor_data = sample_targets_batch[layer_idx]
-                        if target_tensor_data.dim() == 3:
-                            num_tokens = target_tensor_data.shape[0] * target_tensor_data.shape[1]
-                            all_sample_targets_for_nmse[layer_idx].append(
-                                target_tensor_data.reshape(num_tokens, model.config.d_model)
-                            )
-                        elif target_tensor_data.dim() == 2:
-                            all_sample_targets_for_nmse[layer_idx].append(target_tensor_data)
+                # 1. Compute and accumulate L0 statistics
+                with torch.no_grad():
+                    l0s_batch = run_quick_l0_checks_script(
+                        model, flat_inputs_batch, args.num_tokens_for_l0_check_script
+                    )
+                for layer_idx, l0_val in l0s_batch.items():
+                    if layer_idx in flat_inputs_batch and not math.isnan(l0_val):
+                        tokens_in_batch = flat_inputs_batch[layer_idx].shape[0]
+                        total_l0_per_layer[layer_idx] += l0_val * tokens_in_batch
+                        total_tokens_for_l0_per_layer[layer_idx] += tokens_in_batch
+
+                # 2. Get reconstructions for NMSE, moving to CPU to free up VRAM
+                with torch.no_grad():
+                    reconstructions_batch = model(flat_inputs_batch)
+                for layer_idx, recon_tensor in reconstructions_batch.items():
+                    if layer_idx in flat_targets_batch and recon_tensor.numel() > 0:
+                        all_reconstructions_for_nmse[layer_idx].append(recon_tensor.cpu())
+                        all_targets_for_nmse_check[layer_idx].append(flat_targets_batch[layer_idx].cpu())
 
             except StopIteration:
                 logger.warning(
-                    f"Activation store exhausted after {batch_idx + 1} batches during L0/NMSE check data collection. Proceeding with collected data."
+                    f"Activation store exhausted after {batch_idx + 1} batches. Proceeding with collected data."
                 )
                 break
 
-        if hasattr(activation_store_for_l0_check, "close") and callable(
-            getattr(activation_store_for_l0_check, "close")
-        ):
+        if hasattr(activation_store_for_l0_check, "close"):
             activation_store_for_l0_check.close()
 
     except Exception as e_l0_fetch:
-        logger.warning(
-            f"Error initializing or fetching batches for L0/NMSE check: {e_l0_fetch}. Check might use zero or incomplete input."
-        )
+        logger.error(f"Error during L0/NMSE check data processing: {e_l0_fetch}. Check may be incomplete.")
+        # Allow to proceed with any data collected so far
 
-    final_sample_batch_for_l0_inputs: Dict[int, torch.Tensor] = {}
-    for layer_idx, tensor_list in all_sample_inputs_for_l0.items():
-        if tensor_list:
-            final_sample_batch_for_l0_inputs[layer_idx] = torch.cat(tensor_list, dim=0)
-            logger.info(
-                f"Layer {layer_idx}: Collected {final_sample_batch_for_l0_inputs[layer_idx].shape[0]} total input tokens for L0/NMSE check."
-            )
-        else:
-            logger.warning(f"Layer {layer_idx}: No input tokens collected for L0/NMSE check.")
-            final_sample_batch_for_l0_inputs[layer_idx] = torch.empty(
-                (0, model.config.d_model), device=device, dtype=model.dtype
-            )
-
-    final_sample_targets_for_nmse_check: Dict[int, torch.Tensor] = {}
-    for layer_idx, tensor_list in all_sample_targets_for_nmse.items():
-        if tensor_list:
-            final_sample_targets_for_nmse_check[layer_idx] = torch.cat(tensor_list, dim=0)
-            logger.info(
-                f"Layer {layer_idx}: Collected {final_sample_targets_for_nmse_check[layer_idx].shape[0]} total target tokens for NMSE check."
-            )
-        else:
-            logger.warning(f"Layer {layer_idx}: No target tokens collected for NMSE check.")
-            final_sample_targets_for_nmse_check[layer_idx] = torch.empty(
-                (0, model.config.d_model), device=device, dtype=model.dtype
-            )
-
-    model_for_l0_check = model
-
-    empirical_l0s_per_layer = run_quick_l0_checks_script(
-        model_for_l0_check, final_sample_batch_for_l0_inputs, args.num_tokens_for_l0_check_script
-    )
-    logger.info(f"Empirical L0 per layer (out of {args.num_tokens_for_l0_check_script} sampled tokens):")
+    # --- Finalize and Log Metrics ---
+    logger.info("Empirical L0 per layer (averaged over collected data):")
     total_empirical_l0 = 0.0
-    for l_idx, l0_val in empirical_l0s_per_layer.items():
-        logger.info(f"  Layer {l_idx}: {l0_val:.2f}")
-        if not (isinstance(l0_val, float) and math.isnan(l0_val)):
-            total_empirical_l0 += l0_val
+    empirical_l0s_per_layer = {}
+    for layer_idx in range(model.config.num_layers):
+        if total_tokens_for_l0_per_layer.get(layer_idx, 0) > 0:
+            avg_l0 = total_l0_per_layer[layer_idx] / total_tokens_for_l0_per_layer[layer_idx]
+            empirical_l0s_per_layer[layer_idx] = avg_l0
+            logger.info(f"  Layer {layer_idx}: {avg_l0:.2f}")
+            if not math.isnan(avg_l0):
+                total_empirical_l0 += avg_l0
+        else:
+            empirical_l0s_per_layer[layer_idx] = float("nan")
+            logger.info(f"  Layer {layer_idx}: nan (no tokens processed)")
     logger.info(f"Total Empirical L0 across all layers: {total_empirical_l0:.2f}")
 
     # Compute and log NMSE
-    logger.info("Computing NMSE...")
-    evaluator = CLTEvaluator(model=model_for_l0_check, device=device, mean_tg=mean_tg_for_eval, std_tg=std_tg_for_eval)
-
-    # Ensure inputs and targets for NMSE have corresponding layers and non-empty tensors before calling
-    valid_layers_for_nmse = set(final_sample_batch_for_l0_inputs.keys()) & set(
-        final_sample_targets_for_nmse_check.keys()
-    )
-    inputs_for_nmse_metric = {
-        k: v for k, v in final_sample_batch_for_l0_inputs.items() if k in valid_layers_for_nmse and v.numel() > 0
+    logger.info("Computing NMSE on collected data...")
+    final_reconstructions = {
+        layer_idx: torch.cat(tensors).to(device)
+        for layer_idx, tensors in all_reconstructions_for_nmse.items()
+        if tensors
     }
-    targets_for_nmse_metric = {
-        k: v for k, v in final_sample_targets_for_nmse_check.items() if k in valid_layers_for_nmse and v.numel() > 0
+    final_targets = {
+        layer_idx: torch.cat(tensors).to(device) for layer_idx, tensors in all_targets_for_nmse_check.items() if tensors
     }
 
-    if (
-        not inputs_for_nmse_metric
-        or not targets_for_nmse_metric
-        or not any(v.numel() > 0 for v in inputs_for_nmse_metric.values())
-        or not any(v.numel() > 0 for v in targets_for_nmse_metric.values())
-    ):
+    if not final_reconstructions or not final_targets:
         logger.warning(
-            "Insufficient data for NMSE calculation after filtering (empty inputs or targets for common layers). Skipping NMSE."
+            "Insufficient data for NMSE calculation after processing (empty reconstructions or targets). Skipping NMSE."
         )
     else:
-        # Get reconstructions from the model using the collected inputs
-        with torch.no_grad():  # Ensure no gradients are computed during this forward pass
-            reconstructions_for_nmse = model_for_l0_check(inputs_for_nmse_metric)
+        evaluator = CLTEvaluator(model=model, device=device, mean_tg=mean_tg_for_eval, std_tg=std_tg_for_eval)
+        # Filter to common layers with data
+        valid_layers_for_nmse = set(final_reconstructions.keys()) & set(final_targets.keys())
+        reconstructions_for_metric = {k: v for k, v in final_reconstructions.items() if k in valid_layers_for_nmse}
+        targets_for_metric = {k: v for k, v in final_targets.items() if k in valid_layers_for_nmse}
 
-        reconstruction_metrics = evaluator._compute_reconstruction_metrics(
-            targets=targets_for_nmse_metric, reconstructions=reconstructions_for_nmse
-        )
-        nmse_value = reconstruction_metrics.get("reconstruction/normalized_mean_reconstruction_error", float("nan"))
-        explained_variance = reconstruction_metrics.get("reconstruction/explained_variance", float("nan"))
-        logger.info(f"Normalized Mean Squared Error (NMSE) on collected data: {nmse_value:.4f}")
-        logger.info(f"Explained Variance (EV) on collected data: {explained_variance:.4f}")
+        if not reconstructions_for_metric or not targets_for_metric:
+            logger.warning("No common layers with data between reconstructions and targets. Skipping NMSE.")
+        else:
+            reconstruction_metrics = evaluator._compute_reconstruction_metrics(
+                targets=targets_for_metric, reconstructions=reconstructions_for_metric
+            )
+            nmse_value = reconstruction_metrics.get("reconstruction/normalized_mean_reconstruction_error", float("nan"))
+            explained_variance = reconstruction_metrics.get("reconstruction/explained_variance", float("nan"))
+            logger.info(f"Normalized Mean Squared Error (NMSE) on collected data: {nmse_value:.4f}")
+            logger.info(f"Explained Variance (EV) on collected data: {explained_variance:.4f}")
 
     # --- Optional Layer-wise L0 Calibration --- #
     if args.l0_layerwise_calibrate:
@@ -485,7 +464,18 @@ def main(args):
             final_calibration_inputs: Dict[int, torch.Tensor] = {}
             for layer_idx_cal, tensor_list_cal in calibration_inputs_collected.items():
                 if tensor_list_cal:
-                    final_calibration_inputs[layer_idx_cal] = torch.cat(tensor_list_cal, dim=0)
+                    concatenated = torch.cat(tensor_list_cal, dim=0)
+                    # --- NEW: Down-sample to avoid huge tensors that crash MPS ---
+                    num_tokens_available = concatenated.shape[0]
+                    max_tokens = (
+                        args.num_tokens_for_l0_check_script
+                        if args.num_tokens_for_l0_check_script > 0
+                        else num_tokens_available
+                    )
+                    if num_tokens_available > max_tokens:
+                        sel_indices = torch.randperm(num_tokens_available, device=concatenated.device)[:max_tokens]
+                        concatenated = concatenated[sel_indices]
+                    final_calibration_inputs[layer_idx_cal] = concatenated
                 else:
                     logger.warning(f"Layer {layer_idx_cal}: No calibration input tokens collected.")
                     final_calibration_inputs[layer_idx_cal] = torch.empty(
@@ -511,7 +501,7 @@ def main(args):
 
         # 4. Calibrate the converted JumpReLU model (model_for_l0_check is the one already converted)
         calibrate_layerwise_theta_for_l0_matching(
-            model_to_calibrate=model_for_l0_check,
+            model_to_calibrate=model,
             calibration_inputs=final_calibration_inputs,
             target_l0s_per_layer=target_l0s,
             num_tokens_for_l0_check=args.num_tokens_for_l0_check_script,
@@ -525,54 +515,102 @@ def main(args):
         # 5. Log final L0s of the calibrated model
         logger.info("--- L0s after Layer-wise Calibration ---")
         calibrated_l0s_per_layer = run_quick_l0_checks_script(
-            model_for_l0_check, final_calibration_inputs, args.num_tokens_for_l0_check_script
+            model, final_calibration_inputs, args.num_tokens_for_l0_check_script
         )
         total_calibrated_l0 = 0.0
-        for l_idx, l0_val in calibrated_l0s_per_layer.items():
-            logger.info(f"  Layer {l_idx}: {l0_val:.2f} (Target: {target_l0s.get(l_idx, float('nan')):.2f})")
+        for layer_idx, l0_val in calibrated_l0s_per_layer.items():
+            logger.info(f"  Layer {layer_idx}: {l0_val:.2f} (Target: {target_l0s.get(layer_idx, float('nan')):.2f})")
             if not (isinstance(l0_val, float) and math.isnan(l0_val)):
                 total_calibrated_l0 += l0_val
         logger.info(f"Total Empirical L0 across all layers (Calibrated): {total_calibrated_l0:.2f}")
 
         # 6. Re-save the calibrated model
         logger.info(f"Re-saving calibrated JumpReLU model state to: {args.output_model_path}")
-        torch.save(model_for_l0_check.state_dict(), args.output_model_path)
+        torch.save(model.state_dict(), args.output_model_path)
         # Config remains the same (JumpReLU), only log_thresholds changed.
         logger.info("--- Layer-wise L0 Calibration Step Finished ---")
 
         # --- Re-evaluate NMSE/EV after L0 calibration ---
         logger.info("--- NMSE/EV after Layer-wise Calibration ---")
-        if (
-            not inputs_for_nmse_metric  # This was defined before the calibration block
-            or not targets_for_nmse_metric
-            or not any(v.numel() > 0 for v in inputs_for_nmse_metric.values())
-            or not any(v.numel() > 0 for v in targets_for_nmse_metric.values())
-        ):
-            logger.warning(
-                "Insufficient data for NMSE re-evaluation after calibration (empty inputs or targets for common layers). Skipping."
-            )
-        else:
-            # Ensure the evaluator uses the potentially updated model_for_l0_check (calibrated model)
-            # If evaluator was initialized with model, and model_for_l0_check is the same instance that was modified, this is fine.
-            # If not, evaluator might need to be updated or re-initialized with the calibrated model.
-            # Assuming model_for_l0_check is the same instance that evaluator holds or that CLTEvaluator uses the model passed at evaluation time.
-            # CLTEvaluator constructor takes a model, but its _compute_reconstruction_metrics does not, it uses self.model.
-            # So, we need to ensure the evaluator has the *calibrated* model.
-            evaluator_after_calib = CLTEvaluator(
-                model=model_for_l0_check, device=device, mean_tg=mean_tg_for_eval, std_tg=std_tg_for_eval
-            )
-            with torch.no_grad():
-                reconstructions_after_calib = model_for_l0_check(inputs_for_nmse_metric)
+        logger.info("Re-fetching data for post-calibration NMSE/EV evaluation...")
 
-            metrics_after_calib = evaluator_after_calib._compute_reconstruction_metrics(
-                targets=targets_for_nmse_metric, reconstructions=reconstructions_after_calib
+        post_calib_recons: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
+        post_calib_targets: Dict[int, List[torch.Tensor]] = {i: [] for i in range(model.config.num_layers)}
+
+        try:
+            store_for_post_calib_eval = LocalActivationStore(
+                dataset_path=args.activation_data_path,
+                train_batch_size_tokens=l0_check_fetch_batch_size,
+                device=device,
+                dtype=args.activation_dtype or clt_config_batchtopk.expected_input_dtype or "float32",
+                rank=0,
+                world=1,
+                seed=args.seed + 1,  # Use same seed as pre-calibration check
+                sampling_strategy="sequential",
+                normalization_method="auto",
             )
-            nmse_after_calib = metrics_after_calib.get(
-                "reconstruction/normalized_mean_reconstruction_error", float("nan")
+            iterator_post_calib = iter(store_for_post_calib_eval)
+
+            for _ in range(args.num_batches_for_l0_check):
+                try:
+                    inputs, targets = next(iterator_post_calib)
+                    flat_inputs = {
+                        layer_idx: (t.reshape(-1, t.shape[-1]) if t.dim() == 3 else t)
+                        for layer_idx, t in inputs.items()
+                    }
+                    flat_targets = {
+                        layer_idx: (t.reshape(-1, t.shape[-1]) if t.dim() == 3 else t)
+                        for layer_idx, t in targets.items()
+                    }
+
+                    if not flat_inputs:
+                        continue
+
+                    with torch.no_grad():
+                        recons = model(flat_inputs)  # Use calibrated model
+
+                    for layer_idx, recon_tensor in recons.items():
+                        if layer_idx in flat_targets and recon_tensor.numel() > 0:
+                            post_calib_recons[layer_idx].append(recon_tensor.cpu())
+                            post_calib_targets[layer_idx].append(flat_targets[layer_idx].cpu())
+                except StopIteration:
+                    logger.info("Store exhausted during post-calibration evaluation.")
+                    break
+
+            if hasattr(store_for_post_calib_eval, "close"):
+                store_for_post_calib_eval.close()
+        except Exception as e_post_calib:
+            logger.error(f"Error during post-calibration NMSE data processing: {e_post_calib}")
+
+        final_post_calib_recons = {
+            layer_idx: torch.cat(tensors).to(device) for layer_idx, tensors in post_calib_recons.items() if tensors
+        }
+        final_post_calib_targets = {
+            layer_idx: torch.cat(tensors).to(device) for layer_idx, tensors in post_calib_targets.items() if tensors
+        }
+
+        if not final_post_calib_recons or not final_post_calib_targets:
+            logger.warning("Insufficient data for post-calibration NMSE calculation. Skipping.")
+        else:
+            evaluator_after_calib = CLTEvaluator(
+                model=model, device=device, mean_tg=mean_tg_for_eval, std_tg=std_tg_for_eval
             )
-            ev_after_calib = metrics_after_calib.get("reconstruction/explained_variance", float("nan"))
-            logger.info(f"NMSE (post-L0-calibration): {nmse_after_calib:.4f}")
-            logger.info(f"EV (post-L0-calibration): {ev_after_calib:.4f}")
+            valid_layers = set(final_post_calib_recons.keys()) & set(final_post_calib_targets.keys())
+            recons_metric = {k: v for k, v in final_post_calib_recons.items() if k in valid_layers}
+            targets_metric = {k: v for k, v in final_post_calib_targets.items() if k in valid_layers}
+
+            if recons_metric and targets_metric:
+                metrics_after_calib = evaluator_after_calib._compute_reconstruction_metrics(
+                    targets=targets_metric, reconstructions=recons_metric
+                )
+                nmse_after_calib = metrics_after_calib.get(
+                    "reconstruction/normalized_mean_reconstruction_error", float("nan")
+                )
+                ev_after_calib = metrics_after_calib.get("reconstruction/explained_variance", float("nan"))
+                logger.info(f"NMSE (post-L0-calibration): {nmse_after_calib:.4f}")
+                logger.info(f"EV (post-L0-calibration): {ev_after_calib:.4f}")
+            else:
+                logger.warning("No common layers with data for post-calibration NMSE calculation. Skipping.")
 
     logger.info("Conversion script finished successfully.")
 
@@ -801,6 +839,38 @@ def run_quick_l0_checks_script(
     return empirical_l0s_per_layer
 
 
+def _override_store_norm_stats(store, stats_path: Optional[str]):
+    """If stats_path is provided, load that JSON and inject into the store for normalisation & evaluator."""
+    if not stats_path:
+        return None, None
+    try:
+        with open(stats_path) as f:
+            stats_json = json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to load norm_stats from {stats_path}: {e}")
+        return None, None
+    # Populate the tensors the same way ManifestActivationStore._prep_norm does
+    mean_tg: Dict[int, torch.Tensor] = {}
+    std_tg: Dict[int, torch.Tensor] = {}
+    mean_in: Dict[int, torch.Tensor] = {}
+    std_in: Dict[int, torch.Tensor] = {}
+    device = store.device
+    for layer_idx_str, stats in stats_json.items():
+        li = int(layer_idx_str)
+        if "inputs" in stats and "mean" in stats["inputs"] and "std" in stats["inputs"]:
+            mean_in[li] = torch.tensor(stats["inputs"]["mean"], device=device, dtype=torch.float32).unsqueeze(0)
+            std_in[li] = (torch.tensor(stats["inputs"]["std"], device=device, dtype=torch.float32) + 1e-6).unsqueeze(0)
+        if "targets" in stats and "mean" in stats["targets"] and "std" in stats["targets"]:
+            mean_tg[li] = torch.tensor(stats["targets"]["mean"], device=device, dtype=torch.float32).unsqueeze(0)
+            std_tg[li] = (torch.tensor(stats["targets"]["std"], device=device, dtype=torch.float32) + 1e-6).unsqueeze(0)
+    if mean_in and std_in:
+        store.mean_in, store.std_in = mean_in, std_in
+        store.mean_tg, store.std_tg = mean_tg, std_tg
+        store.apply_normalization = True
+        logger.info(f"Overrode normalisation stats with {stats_path}")
+    return mean_tg, std_tg
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Convert a BatchTopK CLT model to JumpReLU with post-hoc theta estimation."
@@ -937,6 +1007,13 @@ if __name__ == "__main__":
         type=int,
         default=15,
         help="Maximum iterations for binary search per layer during L0 calibration.",
+    )
+
+    parser.add_argument(
+        "--norm-stats-path",
+        type=str,
+        default=None,
+        help="Optional path to a norm_stats.json file to override the store's statistics (use the training stats for consistent NMSE/EV).",
     )
 
     # Note: clt_dtype for the model will be taken from the loaded config_dict_batchtopk initially.

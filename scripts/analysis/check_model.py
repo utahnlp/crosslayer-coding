@@ -5,7 +5,7 @@ import json
 from safetensors.torch import load_file
 
 # Load model from safetensors file
-model_path = "/Users/curttigges/Projects/crosslayer-coding/conversion_test/gpt2_32k/model_65k.safetensors"
+model_path = "/Users/curttigges/Projects/crosslayer-coding/conversion_test/gpt2_32k/full_model.safetensors"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 if os.path.exists(model_path):
