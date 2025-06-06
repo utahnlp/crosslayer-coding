@@ -188,7 +188,6 @@ def main():
         checkpoint_interval=50,
         eval_interval=25,
         log_interval=10,
-        output_dir=str(output_dir),
         enable_wandb=False,
         mixed_precision="fp16",
         optimizer="adamw",
@@ -207,13 +206,16 @@ def main():
     # Step 2: Train for a few steps
     logger.info(f"Rank {rank}: Training model...")
     
+    # Update configs with activation info
+    training_config.activation_source = "local_manifest"
+    training_config.activation_path = args.activation_path
+    training_config.normalization_method = "auto"
+    
     trainer = CLTTrainer(
-        model=model,
         clt_config=clt_config,
         training_config=training_config,
-        activation_source="local_manifest",
-        activation_path=args.activation_path,
-        normalization_method="auto",
+        log_dir=str(output_dir),
+        distributed=(world_size > 1),
     )
     
     # Train and capture metrics during training

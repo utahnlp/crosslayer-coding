@@ -78,7 +78,7 @@ def main():
     
     # Get preactivations from one layer
     layer_idx = 0
-    layer_input = inputs[layer_idx]
+    layer_input = inputs[layer_idx].to(dtype=torch.float32)  # Convert to float32 to match model
     encoder = model.encoder_module.encoders[layer_idx]
     
     # Compute preactivations
@@ -107,8 +107,10 @@ def main():
     
     with torch.no_grad():
         with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+            # Convert inputs to float32 to match model
+            inputs_f32 = {k: v.to(dtype=torch.float32) for k, v in inputs.items()}
             # Get feature activations
-            feature_acts = model.get_feature_activations(inputs)
+            feature_acts = model.get_feature_activations(inputs_f32)
             
             # Check how the model computes activations
             logger.info("   Checking model's actual k value during forward pass...")
@@ -140,7 +142,7 @@ def main():
     with torch.no_grad():
         for layer_idx, layer_input in inputs.items():
             encoder = model.encoder_module.encoders[layer_idx]
-            preact = encoder(layer_input)
+            preact = encoder(layer_input.to(dtype=torch.float32))
             preactivations[layer_idx] = preact
     
     # Check what _apply_activation does
