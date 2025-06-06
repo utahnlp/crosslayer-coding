@@ -83,6 +83,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--batch-size", type=int, default=512, help="Tokens per batch when reading activations (should match training)"
     )
+    p.add_argument("--debug", action="store_true", help="Enable debug output")
     return p.parse_args()
 
 
@@ -124,6 +125,13 @@ def main() -> None:
 
     # --- load config & TP model ---
     cfg = CLTConfig.from_json(args.config)
+    if rank == 0:
+        print(
+            f"Model config: activation_fn={cfg.activation_fn}, num_features={cfg.num_features}, d_model={cfg.d_model}"
+        )
+        if cfg.activation_fn == "batchtopk":
+            print(f"BatchTopK settings: k={cfg.batchtopk_k}")
+
     model = CrossLayerTranscoder(cfg, process_group=dist.group.WORLD, device=device)
     model.eval()
 
@@ -139,6 +147,13 @@ def main() -> None:
     if rank == 0:
         print("Loaded TP checkpoint")
 
+        # Debug: Check if theta values are loaded for BatchTopK
+        if cfg.activation_fn == "batchtopk" and hasattr(model, "log_threshold") and model.log_threshold is not None:
+            theta_values = torch.exp(model.log_threshold).detach().cpu()
+            print(
+                f"Theta values loaded - min: {theta_values.min():.4f}, max: {theta_values.max():.4f}, mean: {theta_values.mean():.4f}"
+            )
+
     # --- CRITICAL FIX: For tensor parallelism, all ranks must see the SAME data ---
     # In TP mode, we shard the model across features, not data samples.
     # All ranks need to process the same batch for collective operations to work correctly.
@@ -152,6 +167,7 @@ def main() -> None:
         seed=42,
         sampling_strategy="sequential",
         normalization_method="auto",
+        shard_data=False,  # CRITICAL: Don't shard data across ranks in TP mode
     )
 
     # Only need to override norm stats once globally – do it on all ranks for simplicity
@@ -160,7 +176,11 @@ def main() -> None:
 
     iterator = iter(store)
     total_ev, total_nmse, cnt = 0.0, 0.0, 0
-    for _ in range(args.batches):
+
+    # Debug first batch
+    debug_first_batch = args.debug
+
+    for batch_idx in range(args.batches):
         try:
             inputs, targets = next(iterator)
         except StopIteration:
@@ -168,14 +188,63 @@ def main() -> None:
                 print("Activation store exhausted early.")
             break
 
+        # Debug output for first batch
+        if debug_first_batch and batch_idx == 0:
+            if rank == 0:
+                print(f"\n--- Debug info for first batch ---")
+                print(f"Input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
+                print(f"Target shapes: {[(k, v.shape) for k, v in targets.items()]}")
+
+                # Check input statistics
+                for layer_idx in sorted(inputs.keys()):
+                    inp = inputs[layer_idx]
+                    print(
+                        f"Layer {layer_idx} input stats - min: {inp.min():.4f}, max: {inp.max():.4f}, mean: {inp.mean():.4f}, std: {inp.std():.4f}"
+                    )
+
         # All ranks process the same batch
-        metrics = evaluator._compute_reconstruction_metrics(targets, model(inputs))
+        with torch.no_grad():
+            # Get feature activations to debug
+            if debug_first_batch and batch_idx == 0:
+                feature_acts = model.get_feature_activations(inputs)
+                if rank == 0:
+                    print(f"\nFeature activation shapes: {[(k, v.shape) for k, v in feature_acts.items()]}")
+                    # Check if features are all zeros
+                    for layer_idx in sorted(feature_acts.keys()):
+                        acts = feature_acts[layer_idx]
+                        num_nonzero = (acts != 0).sum().item()
+                        print(
+                            f"Layer {layer_idx} - non-zero features: {num_nonzero}/{acts.numel()} ({100 * num_nonzero / acts.numel():.1f}%)"
+                        )
+
+            # Get reconstructions
+            reconstructions = model(inputs)
+
+            if debug_first_batch and batch_idx == 0 and rank == 0:
+                print(f"\nReconstruction shapes: {[(k, v.shape) for k, v in reconstructions.items()]}")
+                # Check reconstruction statistics
+                for layer_idx in sorted(reconstructions.keys()):
+                    recon = reconstructions[layer_idx]
+                    tgt = targets[layer_idx]
+                    print(
+                        f"Layer {layer_idx} reconstruction stats - min: {recon.min():.4f}, max: {recon.max():.4f}, mean: {recon.mean():.4f}, std: {recon.std():.4f}"
+                    )
+                    print(
+                        f"Layer {layer_idx} target stats - min: {tgt.min():.4f}, max: {tgt.max():.4f}, mean: {tgt.mean():.4f}, std: {tgt.std():.4f}"
+                    )
+
+            metrics = evaluator._compute_reconstruction_metrics(targets, reconstructions)
 
         # Only rank 0 accumulates metrics to avoid double counting
         if rank == 0:
             total_ev += metrics["reconstruction/explained_variance"]
             total_nmse += metrics["reconstruction/normalized_mean_reconstruction_error"]
             cnt += 1
+
+            if debug_first_batch and batch_idx == 0:
+                print(
+                    f"\nBatch 0 metrics - NMSE: {metrics['reconstruction/normalized_mean_reconstruction_error']:.4f}, EV: {metrics['reconstruction/explained_variance']:.4f}"
+                )
 
     # Only rank 0 reports results
     if rank == 0:
