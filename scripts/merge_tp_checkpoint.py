@@ -58,31 +58,50 @@ def merge_state_dict(tp_model: CrossLayerTranscoder, num_features: int, d_model:
     full_state: Dict[str, torch.Tensor] = {}
     rank = dist.get_rank()
 
+    if rank == 0:
+        print("\n--- Merging State Dict ---")
+
     for name, param in tp_model.state_dict().items():
         # Column-parallel weight: [num_features/world, d_model]
         if param.ndim == 2 and param.shape[0] * world_size == num_features and param.shape[1] == d_model:
+            if rank == 0:
+                print(f"  - Gathering COL_PARALLEL: {name} (shard shape: {param.shape})")
             gathered = gather_tensor_parallel_param(param, dim=0, world_size=world_size)
             if rank == 0:
                 full_state[name] = gathered
+                print(f"    └─> Merged shape: {gathered.shape}")
         # Row-parallel weight: [d_model, num_features/world]
         elif param.ndim == 2 and param.shape[0] == d_model and param.shape[1] * world_size == num_features:
+            if rank == 0:
+                print(f"  - Gathering ROW_PARALLEL: {name} (shard shape: {param.shape})")
             gathered = gather_tensor_parallel_param(param, dim=1, world_size=world_size)
             if rank == 0:
                 full_state[name] = gathered
+                print(f"    └─> Merged shape: {gathered.shape}")
         # NEW: Handle log_threshold, sharded on feature dimension
         elif name.endswith("log_threshold") and param.ndim == 2 and param.shape[1] * world_size == num_features:
+            if rank == 0:
+                print(f"  - Gathering THRESHOLD:    {name} (shard shape: {param.shape})")
             gathered = gather_tensor_parallel_param(param, dim=1, world_size=world_size)
             if rank == 0:
                 full_state[name] = gathered
+                print(f"    └─> Merged shape: {gathered.shape}")
         # Bias or vector split along features: [num_features/world]
         elif param.ndim == 1 and param.shape[0] * world_size == num_features:
+            if rank == 0:
+                print(f"  - Gathering BIAS/VECTOR:  {name} (shard shape: {param.shape})")
             gathered = gather_tensor_parallel_param(param, dim=0, world_size=world_size)
             if rank == 0:
                 full_state[name] = gathered
+                print(f"    └─> Merged shape: {gathered.shape}")
         else:
             # Replicated parameters – take rank 0 copy
             if rank == 0:
+                print(f"  - Replicated:           {name} (shape: {param.shape})")
                 full_state[name] = param.cpu()
+
+    if rank == 0:
+        print("--- Merge Complete ---\n")
     return full_state
 
 
