@@ -184,7 +184,6 @@ def main():
     training_config = TrainingConfig(
         training_steps=args.training_steps,
         train_batch_size_tokens=args.batch_size,
-        eval_batch_size_tokens=args.batch_size,
         learning_rate=1e-4,
         checkpoint_interval=50,
         eval_interval=25,
