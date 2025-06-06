@@ -128,10 +128,12 @@ def main():
     
     # Initialize distributed if needed
     if args.world_size > 1:
-        if not dist.is_initialized():
+        if "RANK" not in os.environ:
             logger.error("This script should be run with torchrun for distributed training")
             logger.error(f"Example: torchrun --nproc_per_node={args.world_size} {__file__} ...")
             return
+        
+        dist.init_process_group(backend="nccl")
         
         rank = dist.get_rank()
         world_size = dist.get_world_size()
