@@ -99,9 +99,21 @@ def main() -> None:
 
     rank, local_rank, world_size = init_dist()
 
-    device_str = args.device or (
-        f"cuda:{local_rank}" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
-    )
+    if args.device is None:
+        # Auto-select: CUDA with local rank if available, else MPS, else CPU
+        if torch.cuda.is_available():
+            device_str = f"cuda:{local_rank}"
+        elif torch.backends.mps.is_available():
+            device_str = "mps"
+        else:
+            device_str = "cpu"
+    else:
+        # User passed --device.  If they said just "cuda", expand to cuda:<local_rank>
+        if args.device.lower() == "cuda":
+            device_str = f"cuda:{local_rank}"
+        else:
+            device_str = args.device  # trust they know what they're doing
+
     device = torch.device(device_str)
     if device.type == "cuda":
         torch.cuda.set_device(device)
