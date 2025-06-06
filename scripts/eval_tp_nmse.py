@@ -137,41 +137,50 @@ def main() -> None:
     if rank == 0:
         print("Loaded TP checkpoint")
 
-    # --- evaluation only on rank 0 to avoid duplicate data I/O ---
-    if rank == 0:
-        store = LocalActivationStore(
-            dataset_path=args.activation_data,
-            train_batch_size_tokens=args.batch_size,
-            device=device,
-            dtype=args.dtype,
-            rank=0,
-            world=1,
-            seed=42,
-            sampling_strategy="sequential",
-            normalization_method="auto",
-        )
-        mean_tg, std_tg = override_norm_stats(store, Path(args.norm_stats) if args.norm_stats else None)
-        evaluator = CLTEvaluator(model=model, device=device, mean_tg=mean_tg, std_tg=std_tg)
+    # --- every rank loads its shard of the activation data ---
+    store = LocalActivationStore(
+        dataset_path=args.activation_data,
+        train_batch_size_tokens=args.batch_size,
+        device=device,
+        dtype=args.dtype,
+        rank=rank,
+        world=world_size,
+        seed=42,
+        sampling_strategy="sequential",
+        normalization_method="auto",
+    )
 
-        iterator = iter(store)
-        total_ev, total_nmse, cnt = 0.0, 0.0, 0
-        for _ in range(args.batches):
-            try:
-                inputs, targets = next(iterator)
-            except StopIteration:
-                print("Activation store exhausted early.")
-                break
-            metrics = evaluator._compute_reconstruction_metrics(targets, model(inputs))
-            total_ev += metrics["reconstruction/explained_variance"]
-            total_nmse += metrics["reconstruction/normalized_mean_reconstruction_error"]
-            cnt += 1
-        if cnt == 0:
+    # Only need to override norm stats once globally – do it on all ranks for simplicity
+    mean_tg, std_tg = override_norm_stats(store, Path(args.norm_stats) if args.norm_stats else None)
+    evaluator = CLTEvaluator(model=model, device=device, mean_tg=mean_tg, std_tg=std_tg)
+
+    iterator = iter(store)
+    total_ev, total_nmse, cnt = 0.0, 0.0, 0
+    for _ in range(args.batches):
+        try:
+            inputs, targets = next(iterator)
+        except StopIteration:
+            if rank == 0:
+                print("Activation store exhausted early on some rank.")
+            break
+        metrics = evaluator._compute_reconstruction_metrics(targets, model(inputs))
+        total_ev += metrics["reconstruction/explained_variance"]
+        total_nmse += metrics["reconstruction/normalized_mean_reconstruction_error"]
+        cnt += 1
+
+    # Reduce metrics across ranks so rank 0 can report global average
+    tensor_buf = torch.tensor([total_ev, total_nmse, cnt], dtype=torch.float64, device=device)
+    dist.all_reduce(tensor_buf, op=dist.ReduceOp.SUM)
+
+    if rank == 0:
+        total_ev_all, total_nmse_all, cnt_all = tensor_buf.tolist()
+        if cnt_all == 0:
             print("No batches evaluated.")
         else:
-            print(f"\nEvaluated {cnt} batches (rank 0)")
-            print(f"Avg NMSE : {total_nmse / cnt:.4f}")
-            print(f"Avg EV   : {total_ev / cnt:.4f}")
-        store.close()
+            print(f"\nEvaluated {int(cnt_all)} batches per rank (world_size={world_size}) => {int(cnt_all)} total")
+            print(f"Avg NMSE : {total_nmse_all / cnt_all:.4f}")
+            print(f"Avg EV   : {total_ev_all / cnt_all:.4f}")
+    store.close()
 
     # Barrier so all ranks wait until rank0 prints
     dist.barrier()
