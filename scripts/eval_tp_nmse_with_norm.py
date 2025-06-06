@@ -78,9 +78,9 @@ def load_model_from_checkpoint(checkpoint_path: str, device: torch.device) -> Op
         config_dict = json.load(f)
     config = CLTConfig(**config_dict)
 
-    # Create model
+    # Create model (pass None for process_group since we're doing single-GPU eval)
     logger.info(f"Loading consolidated model from {model_path}")
-    model = CrossLayerTranscoder(config, device=device)
+    model = CrossLayerTranscoder(config, device=device, process_group=None)
 
     # Load state dict
     state_dict = load_safetensors_file(str(model_path), device="cpu")
