@@ -267,9 +267,9 @@ class CLTEvaluator:
                 recon_act_denorm = recon_act * std + mean
             # --- End De-normalisation ---
 
-            # Ensure shapes match (flatten if necessary)
-            target_flat = target_act_denorm.view(-1, target_act_denorm.shape[-1])
-            recon_flat = recon_act_denorm.view(-1, recon_act_denorm.shape[-1])
+            # Ensure shapes match (flatten if necessary) and up-cast to float32 for numerically stable metrics
+            target_flat = target_act_denorm.view(-1, target_act_denorm.shape[-1]).float()
+            recon_flat = recon_act_denorm.view(-1, recon_act_denorm.shape[-1]).float()
 
             if target_flat.shape != recon_flat.shape or target_flat.numel() == 0:
                 continue
