@@ -39,6 +39,11 @@ def load_model_from_checkpoint(checkpoint_path: str, device: torch.device) -> Op
 
         with open(config_path, "r") as f:
             config_dict = json.load(f)
+
+        # IMPORTANT: Use the config from the checkpoint, not defaults!
+        logger.info(
+            f"Loading model with config from checkpoint: num_features={config_dict.get('num_features')}, num_layers={config_dict.get('num_layers')}"
+        )
         clt_config = CLTConfig(**config_dict)
 
         # Try to load consolidated model first

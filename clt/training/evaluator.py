@@ -100,7 +100,7 @@ class CLTEvaluator:
             Metrics are organized into 'reconstruction', 'sparsity', 'dead_features',
             'layerwise'.
         """
-        mem_before_eval = 0
+        mem_before_eval = 0.0
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_before_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
             elapsed_str = _format_elapsed_time(time.time() - self.start_time)
