@@ -11,7 +11,7 @@ Usage (example for 2-way TP):
         --device   cuda \
         --dtype    float16 \
         --batches  50 \
-        --batch-size 1024
+        --batch-size 512
 
 Only rank 0 iterates over the activation store and prints results; other ranks just
 participate in tensor-parallel computation.
@@ -80,7 +80,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", default=None, help="cpu | cuda | cuda:0 | mps (auto if None)")
     p.add_argument("--dtype", default="float16", help="Activation dtype to load (float16/float32/bfloat16)")
     p.add_argument("--batches", type=int, default=50, help="Number of batches to evaluate")
-    p.add_argument("--batch-size", type=int, default=1024, help="Tokens per batch when reading activations")
+    p.add_argument(
+        "--batch-size", type=int, default=512, help="Tokens per batch when reading activations (should match training)"
+    )
     return p.parse_args()
 
 
@@ -137,14 +139,16 @@ def main() -> None:
     if rank == 0:
         print("Loaded TP checkpoint")
 
-    # --- every rank loads its shard of the activation data ---
+    # --- CRITICAL FIX: For tensor parallelism, all ranks must see the SAME data ---
+    # In TP mode, we shard the model across features, not data samples.
+    # All ranks need to process the same batch for collective operations to work correctly.
     store = LocalActivationStore(
         dataset_path=args.activation_data,
         train_batch_size_tokens=args.batch_size,
         device=device,
         dtype=args.dtype,
-        rank=rank,
-        world=world_size,
+        rank=0,  # All ranks use rank 0's data
+        world=1,  # Treat as single process for data loading
         seed=42,
         sampling_strategy="sequential",
         normalization_method="auto",
@@ -161,25 +165,27 @@ def main() -> None:
             inputs, targets = next(iterator)
         except StopIteration:
             if rank == 0:
-                print("Activation store exhausted early on some rank.")
+                print("Activation store exhausted early.")
             break
+
+        # All ranks process the same batch
         metrics = evaluator._compute_reconstruction_metrics(targets, model(inputs))
-        total_ev += metrics["reconstruction/explained_variance"]
-        total_nmse += metrics["reconstruction/normalized_mean_reconstruction_error"]
-        cnt += 1
 
-    # Reduce metrics across ranks so rank 0 can report global average
-    tensor_buf = torch.tensor([total_ev, total_nmse, cnt], dtype=torch.float64, device=device)
-    dist.all_reduce(tensor_buf, op=dist.ReduceOp.SUM)
+        # Only rank 0 accumulates metrics to avoid double counting
+        if rank == 0:
+            total_ev += metrics["reconstruction/explained_variance"]
+            total_nmse += metrics["reconstruction/normalized_mean_reconstruction_error"]
+            cnt += 1
 
+    # Only rank 0 reports results
     if rank == 0:
-        total_ev_all, total_nmse_all, cnt_all = tensor_buf.tolist()
-        if cnt_all == 0:
+        if cnt == 0:
             print("No batches evaluated.")
         else:
-            print(f"\nEvaluated {int(cnt_all)} batches per rank (world_size={world_size}) => {int(cnt_all)} total")
-            print(f"Avg NMSE : {total_nmse_all / cnt_all:.4f}")
-            print(f"Avg EV   : {total_ev_all / cnt_all:.4f}")
+            print(f"\nEvaluated {cnt} batches")
+            print(f"Avg NMSE : {total_nmse / cnt:.4f}")
+            print(f"Avg EV   : {total_ev / cnt:.4f}")
+
     store.close()
 
     # Barrier so all ranks wait until rank0 prints
