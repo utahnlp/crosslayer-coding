@@ -191,7 +191,7 @@ def main() -> None:
         # Debug output for first batch
         if debug_first_batch and batch_idx == 0:
             if rank == 0:
-                print(f"\n--- Debug info for first batch ---")
+                print("\n--- Debug info for first batch ---")
                 print(f"Input shapes: {[(k, v.shape) for k, v in inputs.items()]}")
                 print(f"Target shapes: {[(k, v.shape) for k, v in targets.items()]}")
 
@@ -204,36 +204,50 @@ def main() -> None:
 
         # All ranks process the same batch
         with torch.no_grad():
-            # Get feature activations to debug
-            if debug_first_batch and batch_idx == 0:
-                feature_acts = model.get_feature_activations(inputs)
-                if rank == 0:
-                    print(f"\nFeature activation shapes: {[(k, v.shape) for k, v in feature_acts.items()]}")
-                    # Check if features are all zeros
-                    for layer_idx in sorted(feature_acts.keys()):
-                        acts = feature_acts[layer_idx]
-                        num_nonzero = (acts != 0).sum().item()
+            # Use autocast to match training behavior
+            # During training, forward passes were done with fp16 autocast
+            # We need to match this for correct numerical behavior
+            autocast_device_type = device.type if device.type in ["cuda", "mps"] else "cpu"
+            autocast_enabled = (args.dtype == "float16" and device.type == "cuda") or (
+                args.dtype == "bfloat16" and device.type in ["cuda", "cpu"]
+            )
+            autocast_dtype = (
+                torch.float16
+                if args.dtype == "float16"
+                else (torch.bfloat16 if args.dtype == "bfloat16" else torch.float32)
+            )
+
+            with torch.autocast(device_type=autocast_device_type, dtype=autocast_dtype, enabled=autocast_enabled):
+                # Get feature activations to debug
+                if debug_first_batch and batch_idx == 0:
+                    feature_acts = model.get_feature_activations(inputs)
+                    if rank == 0:
+                        print(f"\nFeature activation shapes: {[(k, v.shape) for k, v in feature_acts.items()]}")
+                        # Check if features are all zeros
+                        for layer_idx in sorted(feature_acts.keys()):
+                            acts = feature_acts[layer_idx]
+                            num_nonzero = (acts != 0).sum().item()
+                            print(
+                                f"Layer {layer_idx} - non-zero features: {num_nonzero}/{acts.numel()} ({100 * num_nonzero / acts.numel():.1f}%)"
+                            )
+
+                # Get reconstructions
+                reconstructions = model(inputs)
+
+                if debug_first_batch and batch_idx == 0 and rank == 0:
+                    print(f"\nReconstruction shapes: {[(k, v.shape) for k, v in reconstructions.items()]}")
+                    # Check reconstruction statistics
+                    for layer_idx in sorted(reconstructions.keys()):
+                        recon = reconstructions[layer_idx]
+                        tgt = targets[layer_idx]
                         print(
-                            f"Layer {layer_idx} - non-zero features: {num_nonzero}/{acts.numel()} ({100 * num_nonzero / acts.numel():.1f}%)"
+                            f"Layer {layer_idx} reconstruction stats - min: {recon.min():.4f}, max: {recon.max():.4f}, mean: {recon.mean():.4f}, std: {recon.std():.4f}"
+                        )
+                        print(
+                            f"Layer {layer_idx} target stats - min: {tgt.min():.4f}, max: {tgt.max():.4f}, mean: {tgt.mean():.4f}, std: {tgt.std():.4f}"
                         )
 
-            # Get reconstructions
-            reconstructions = model(inputs)
-
-            if debug_first_batch and batch_idx == 0 and rank == 0:
-                print(f"\nReconstruction shapes: {[(k, v.shape) for k, v in reconstructions.items()]}")
-                # Check reconstruction statistics
-                for layer_idx in sorted(reconstructions.keys()):
-                    recon = reconstructions[layer_idx]
-                    tgt = targets[layer_idx]
-                    print(
-                        f"Layer {layer_idx} reconstruction stats - min: {recon.min():.4f}, max: {recon.max():.4f}, mean: {recon.mean():.4f}, std: {recon.std():.4f}"
-                    )
-                    print(
-                        f"Layer {layer_idx} target stats - min: {tgt.min():.4f}, max: {tgt.max():.4f}, mean: {tgt.mean():.4f}, std: {tgt.std():.4f}"
-                    )
-
-            metrics = evaluator._compute_reconstruction_metrics(targets, reconstructions)
+                metrics = evaluator._compute_reconstruction_metrics(targets, reconstructions)
 
         # Only rank 0 accumulates metrics to avoid double counting
         if rank == 0:
