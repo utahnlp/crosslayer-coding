@@ -78,10 +78,10 @@ def run_simple_test():
     if temp_dir is None:
         temp_dir = f"/tmp/clt_debug_simple_rank{rank}"
     
-    # Configuration matching GPT-2 activations
+    # Configuration matching your actual working setup
     clt_config = CLTConfig(
         d_model=768,  # GPT-2 hidden size
-        num_features=32768,  # Full size to match your actual model
+        num_features=32768,  # Same as your working config
         num_layers=12,  # GPT-2 layers
         activation_fn="batchtopk",
         batchtopk_k=200,
@@ -89,20 +89,28 @@ def run_simple_test():
     
     training_config = TrainingConfig(
         learning_rate=1e-4,
-        training_steps=10,  # Just a few steps
-        train_batch_size_tokens=32,
+        training_steps=10,  # Just a few steps for testing
+        train_batch_size_tokens=1024,  # Same as your working config
         checkpoint_interval=5,
         eval_interval=5,
         log_interval=1,
         enable_wandb=False,
-        precision="fp32",
+        precision="fp16",  # Same as your working config
         optimizer="adamw",
-        lr_scheduler="constant",
+        optimizer_beta2=0.98,  # Same as your working config
+        lr_scheduler="constant",  # Simplified for testing
         aux_loss_factor=0.03125,
-        sparsity_lambda=0.001,
+        sparsity_lambda=0.0,  # Same as your working config
+        sparsity_c=0.0,
+        preactivation_coef=0.0,
+        apply_sparsity_penalty_to_batchtopk=False,
         activation_source="local_manifest",
-        activation_path="./activations_local_100M/gpt2/pile-uncopyrighted_train",
+        activation_path="./activations_local_100M/gpt2/pile-uncopyrighted_train",  # 100M dataset
+        activation_dtype="float16",  # Same as your working config
         normalization_method="auto",
+        sampling_strategy="sequential",
+        dead_feature_window=10000,  # Same as your working config
+        seed=42,
     )
     
     # Initialize trainer (handles distributed setup internally)
