@@ -69,17 +69,14 @@ def run_simple_test():
     else:
         temp_dir = None
     
-    # Simple broadcast of temp_dir path
+    # Set CUDA device for distributed training
     if world_size > 1:
-        # Set CUDA device before initializing process group
         local_rank = int(os.environ.get("LOCAL_RANK", rank))
         torch.cuda.set_device(local_rank)
-        
-        dist.init_process_group(backend="nccl")
-        temp_dir_list = [temp_dir]
-        dist.broadcast_object_list(temp_dir_list, src=0)
-        temp_dir = temp_dir_list[0]
-        dist.destroy_process_group()
+    
+    # Use shared temp dir path for all ranks
+    if temp_dir is None:
+        temp_dir = f"/tmp/clt_debug_simple_rank{rank}"
     
     # Configuration matching GPT-2 activations
     clt_config = CLTConfig(
@@ -201,9 +198,7 @@ def run_simple_test():
                 logger.info(f"Loaded model metrics: NMSE={metrics.get('reconstruction/normalized_mean_reconstruction_error', -1):.4f}, "
                            f"EV={metrics.get('reconstruction/explained_variance', -1):.4f}")
     
-    # Cleanup
-    if trainer.distributed:
-        dist.destroy_process_group()
+    # The trainer handles process group cleanup automatically
     
     if rank == 0:
         logger.info(f"\nTest complete. Results in: {temp_dir}")
