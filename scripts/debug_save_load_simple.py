@@ -89,10 +89,10 @@ def run_simple_test():
     
     training_config = TrainingConfig(
         learning_rate=1e-4,
-        training_steps=10,  # Just a few steps for testing
+        training_steps=5,  # Reduced steps
         train_batch_size_tokens=1024,  # Same as your working config
-        checkpoint_interval=5,  # Enable checkpointing to reproduce the error
-        eval_interval=5,
+        checkpoint_interval=5,  # Save only at step 5
+        eval_interval=999,  # Disable eval during training to save time
         log_interval=1,
         enable_wandb=False,
         precision="fp16",  # Same as your working config
@@ -135,11 +135,7 @@ def run_simple_test():
     if rank == 0:
         logger.info(f"Final in-memory weight stats: {json.dumps(final_memory_stats, indent=2)}")
     
-    # Wait for all ranks to finish training
-    if trainer.distributed:
-        dist.barrier()
-    
-    # Now test checkpoint loading (only on rank 0 for simplicity)
+    # Test checkpoint loading (only on rank 0 for simplicity)
     if rank == 0:
         logger.info("\n=== TESTING CHECKPOINT LOAD ===")
         
@@ -206,7 +202,7 @@ def run_simple_test():
                 logger.info(f"Loaded model metrics: NMSE={metrics.get('reconstruction/normalized_mean_reconstruction_error', -1):.4f}, "
                            f"EV={metrics.get('reconstruction/explained_variance', -1):.4f}")
     
-    # The trainer handles process group cleanup automatically
+    # The trainer already cleaned up the process group
     
     if rank == 0:
         logger.info(f"\nTest complete. Results in: {temp_dir}")
