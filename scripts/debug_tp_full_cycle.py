@@ -189,7 +189,7 @@ def main():
         eval_interval=25,
         log_interval=10,
         enable_wandb=False,
-        mixed_precision="fp16",
+        precision="fp16",
         optimizer="adamw",
         lr_scheduler="constant",
         aux_loss_factor=0.03125,
