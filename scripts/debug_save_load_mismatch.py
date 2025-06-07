@@ -77,7 +77,11 @@ def run_distributed_test():
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    device = torch.device(f"cuda:{rank}")
+    
+    # Set CUDA device for this rank
+    local_rank = int(os.environ.get("LOCAL_RANK", rank))
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f"cuda:{local_rank}")
     
     logger.info(f"Rank {rank}/{world_size}: Starting test")
     
@@ -126,22 +130,18 @@ def run_distributed_test():
         normalization_method="auto",
     )
     
-    # Create model
-    process_group = dist.group.WORLD if world_size > 1 else None
-    model = CrossLayerTranscoder(clt_config, device=device, process_group=process_group)
-    
-    # Track initial weights
-    initial_stats = get_weight_stats(model, "initial_")
-    if rank == 0:
-        logger.info(f"Initial weight stats: {json.dumps(initial_stats, indent=2)}")
-    
-    # Initialize trainer
+    # Initialize trainer (it will create the model internally)
     trainer = CLTTrainer(
         clt_config=clt_config,
         training_config=training_config,
         log_dir=temp_dir,
         distributed=(world_size > 1),
     )
+    
+    # Track initial weights using trainer's model
+    initial_stats = get_weight_stats(trainer.model, "initial_")
+    if rank == 0:
+        logger.info(f"Initial weight stats: {json.dumps(initial_stats, indent=2)}")
     
     # Custom training loop to track weights
     weight_history = []
@@ -199,6 +199,7 @@ def run_distributed_test():
         merge_script = f"""
 import sys
 sys.path.insert(0, '{project_root}')
+import os
 import torch
 import torch.distributed as dist
 from scripts.merge_tp_checkpoint import merge_state_dict
@@ -214,7 +215,9 @@ import json
 dist.init_process_group(backend="nccl")
 rank = dist.get_rank()
 world_size = dist.get_world_size()
-device = torch.device(f"cuda:{{rank}}")
+local_rank = int(os.environ.get("LOCAL_RANK", rank))
+torch.cuda.set_device(local_rank)
+device = torch.device(f"cuda:{{local_rank}}")
 
 # Load config
 with open("{checkpoint_dir}/cfg.json", "r") as f:
