@@ -91,7 +91,7 @@ def run_simple_test():
         learning_rate=1e-4,
         training_steps=10,  # Just a few steps for testing
         train_batch_size_tokens=1024,  # Same as your working config
-        checkpoint_interval=5,
+        checkpoint_interval=5,  # Enable checkpointing to reproduce the error
         eval_interval=5,
         log_interval=1,
         enable_wandb=False,
