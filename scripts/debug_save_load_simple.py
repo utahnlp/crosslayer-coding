@@ -78,22 +78,22 @@ def run_simple_test():
     if temp_dir is None:
         temp_dir = f"/tmp/clt_debug_simple_rank{rank}"
     
-    # Configuration matching your actual working setup
+    # Smaller configuration for faster testing
     clt_config = CLTConfig(
         d_model=768,  # GPT-2 hidden size
-        num_features=32768,  # Same as your working config
+        num_features=1536,  # 2x expansion factor for faster testing
         num_layers=12,  # GPT-2 layers
         activation_fn="batchtopk",
-        batchtopk_k=200,
+        batchtopk_k=20,  # Smaller k for faster testing
     )
     
     training_config = TrainingConfig(
         learning_rate=1e-4,
-        training_steps=5,  # Reduced steps
-        train_batch_size_tokens=1024,  # Same as your working config
-        checkpoint_interval=5,  # Save only at step 5
-        eval_interval=999,  # Disable eval during training to save time
-        log_interval=1,
+        training_steps=20,  # More steps to see weight evolution
+        train_batch_size_tokens=256,  # Smaller batch for faster iteration
+        checkpoint_interval=10,  # Save at steps 10 and 20
+        eval_interval=10,  # Eval at steps 10 and 20
+        log_interval=5,
         enable_wandb=False,
         precision="fp16",  # Same as your working config
         optimizer="adamw",
@@ -130,10 +130,19 @@ def run_simple_test():
     logger.info(f"Rank {rank}: Starting training...")
     trainer.train()
     
-    # Get final in-memory stats
+    # Get final in-memory stats and evaluation
     final_memory_stats = get_weight_stats(trainer.model, "final_memory_")
     if rank == 0:
         logger.info(f"Final in-memory weight stats: {json.dumps(final_memory_stats, indent=2)}")
+        
+        # Do a final in-memory evaluation
+        logger.info("\n=== FINAL IN-MEMORY EVALUATION ===")
+        try:
+            final_metrics = trainer.evaluate(num_batches=5)
+            logger.info(f"In-memory model final metrics: NMSE={final_metrics.get('reconstruction/normalized_mean_reconstruction_error', -1):.4f}, "
+                       f"EV={final_metrics.get('reconstruction/explained_variance', -1):.4f}")
+        except Exception as e:
+            logger.error(f"Failed to evaluate in-memory model: {e}")
     
     # Test checkpoint loading (only on rank 0 for simplicity)
     if rank == 0:
