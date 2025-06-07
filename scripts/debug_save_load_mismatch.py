@@ -126,7 +126,7 @@ def run_distributed_test():
         aux_loss_factor=0.03125,
         sparsity_lambda=0.001,
         activation_source="local_manifest",
-        activation_path="./activations_local_1M/gpt2/pile-uncopyrighted_train",
+        activation_path="./activations_local_100M/gpt2/pile-uncopyrighted_train",  # Use 100M dataset
         normalization_method="auto",
     )
     
@@ -307,7 +307,7 @@ dist.destroy_process_group()
             
             # Create evaluator and test
             activation_store = LocalActivationStore(
-                dataset_path=training_config.activation_path,
+                dataset_path="./activations_local_100M/gpt2/pile-uncopyrighted_train",
                 train_batch_size_tokens=batch_size,
                 device=device,
                 dtype="float32",
