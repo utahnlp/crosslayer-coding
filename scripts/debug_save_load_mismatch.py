@@ -147,9 +147,51 @@ def run_distributed_test():
     weight_history = []
     eval_history = []
     
+    # Get activation store from trainer
+    activation_store = trainer.activation_store
+    
     for step in range(training_steps):
-        # Training step
-        metrics = trainer.train_step()
+        # Get batch
+        try:
+            inputs, targets = next(activation_store)
+        except StopIteration:
+            logger.info("Activation store exhausted")
+            break
+            
+        # Training step - manually do forward/backward/optimizer
+        trainer.optimizer.zero_grad(set_to_none=True)
+        
+        with torch.autocast(
+            device_type=trainer.device.type, 
+            dtype=trainer.autocast_dtype, 
+            enabled=trainer.autocast_enabled
+        ):
+            feature_activations_batch = trainer.model.get_feature_activations(inputs)
+            loss, loss_dict = trainer.loss_manager.compute_total_loss(
+                trainer.model,
+                inputs,
+                targets,
+                step,
+                trainer.training_config.training_steps,
+                precomputed_activations=feature_activations_batch,
+                dead_neuron_mask=trainer.dead_neurons_mask,
+            )
+        
+        # Backward pass
+        trainer.scaler.scale(loss).backward()
+        
+        # Gradient clipping
+        if trainer.training_config.gradient_clip_val is not None:
+            trainer.scaler.unscale_(trainer.optimizer)
+            torch.nn.utils.clip_grad_norm_(trainer.model.parameters(), trainer.training_config.gradient_clip_val)
+        
+        # Optimizer step
+        trainer.scaler.step(trainer.optimizer)
+        trainer.scaler.update()
+        
+        # Average gradients for replicated parameters in distributed training
+        if trainer.distributed and trainer.world_size > 1:
+            average_shared_parameter_grads(trainer.model, trainer.world_size)
         
         # Track weights every 5 steps
         if step % 5 == 0:
