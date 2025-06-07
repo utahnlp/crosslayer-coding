@@ -158,7 +158,40 @@ def run_simple_test():
             
             # For distributed checkpoints, we need to merge first
             if world_size > 1:
-                logger.info("Running merge script...")
+                # First, let's see what files were actually saved
+                checkpoint_files = list(latest_checkpoint.glob("*"))
+                logger.info(f"\nFiles in checkpoint directory:")
+                for f in checkpoint_files:
+                    logger.info(f"  {f.name}")
+                
+                from safetensors.torch import load_file as load_safetensors_file
+                from clt.models.clt import CrossLayerTranscoder
+                
+                logger.info("\nChecking 'consolidated' model shapes...")
+                consolidated_path = latest_checkpoint / "model.safetensors"
+                if consolidated_path.exists():
+                    consolidated_state = load_safetensors_file(str(consolidated_path))
+                    for key in ["encoder_module.encoders.0.weight", "decoder_module.decoders.0->0.weight"]:
+                        if key in consolidated_state:
+                            logger.info(f"  {key} shape: {consolidated_state[key].shape}")
+                    logger.info("⚠️  This 'consolidated' model is actually just rank 0's portion!")
+                    
+                    # This is the key issue - let's test loading this incomplete model
+                    logger.info("\n=== TESTING INCOMPLETE 'CONSOLIDATED' MODEL ===")
+                    incomplete_model = CrossLayerTranscoder(clt_config, device=trainer.device, process_group=None)
+                    
+                    # This will likely fail or give warnings
+                    try:
+                        incomplete_model.load_state_dict(consolidated_state)
+                        logger.info("Loaded incomplete model successfully (this shouldn't happen!)")
+                    except Exception as e:
+                        logger.error(f"Failed to load incomplete model: {e}")
+                        logger.info("This confirms the 'consolidated' model is not actually complete!")
+                
+                logger.info("\nSince distributed checkpoint files don't exist, we can't properly merge.")
+                logger.info("This is likely the root cause of your issue!")
+                return
+                
                 import subprocess
                 
                 merge_script = project_root / "scripts" / "merge_tp_checkpoint.py"
