@@ -162,12 +162,13 @@ def run_simple_test():
                 import subprocess
                 
                 merge_script = project_root / "scripts" / "merge_tp_checkpoint.py"
+                # The merge script requires the correct arguments
                 merge_cmd = [
-                    "python", str(merge_script),
-                    "--checkpoint-dir", str(latest_checkpoint),
-                    "--output-path", str(Path(temp_dir) / "merged_model.safetensors"),
-                    "--num-features", str(clt_config.num_features),
-                    "--d-model", str(clt_config.d_model),
+                    "torchrun", "--standalone", f"--nproc_per_node={world_size}",
+                    str(merge_script),
+                    "--ckpt-dir", str(latest_checkpoint),
+                    "--cfg-json", str(Path(temp_dir) / "cfg.json"),
+                    "--output", str(Path(temp_dir) / "merged_model.safetensors"),
                 ]
                 
                 result = subprocess.run(merge_cmd, capture_output=True, text=True)
@@ -181,8 +182,23 @@ def run_simple_test():
                 from safetensors.torch import load_file as load_safetensors_file
                 from clt.models.clt import CrossLayerTranscoder
                 
+                # First check the saved "consolidated" model to see if it's really consolidated
+                logger.info("\nChecking 'consolidated' model.safetensors...")
+                consolidated_state = load_safetensors_file(str(latest_checkpoint / "model.safetensors"))
+                for key in ["encoder_module.encoders.0.weight", "decoder_module.decoders.0->0.weight"]:
+                    if key in consolidated_state:
+                        logger.info(f"  {key} shape: {consolidated_state[key].shape}")
+                
+                # Now load the properly merged model
+                logger.info("\nLoading merged model...")
                 merged_model = CrossLayerTranscoder(clt_config, device=trainer.device, process_group=None)
-                state_dict = load_safetensors_file(str(temp_dir / "merged_model.safetensors"))
+                state_dict = load_safetensors_file(str(Path(temp_dir) / "merged_model.safetensors"))
+                
+                # Check merged model shapes
+                for key in ["encoder_module.encoders.0.weight", "decoder_module.decoders.0->0.weight"]:
+                    if key in state_dict:
+                        logger.info(f"  Merged {key} shape: {state_dict[key].shape}")
+                
                 merged_model.load_state_dict(state_dict)
                 
                 loaded_stats = get_weight_stats(merged_model, "loaded_")
