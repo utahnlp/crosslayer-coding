@@ -138,7 +138,20 @@ def run_simple_test():
         # Do a final in-memory evaluation
         logger.info("\n=== FINAL IN-MEMORY EVALUATION ===")
         try:
-            final_metrics = trainer.evaluate(num_batches=5)
+            # Get a few batches for evaluation
+            trainer.activation_store.reset_iterator()
+            eval_metrics = {}
+            for i in range(5):
+                inputs, targets = next(trainer.activation_store)
+                batch_metrics = trainer.evaluator.compute_metrics(inputs, targets)
+                # Average the metrics
+                for k, v in batch_metrics.items():
+                    if k not in eval_metrics:
+                        eval_metrics[k] = []
+                    eval_metrics[k].append(v)
+            
+            # Average across batches
+            final_metrics = {k: sum(v) / len(v) for k, v in eval_metrics.items()}
             logger.info(f"In-memory model final metrics: NMSE={final_metrics.get('reconstruction/normalized_mean_reconstruction_error', -1):.4f}, "
                        f"EV={final_metrics.get('reconstruction/explained_variance', -1):.4f}")
         except Exception as e:
@@ -201,15 +214,30 @@ def run_simple_test():
                 # Quick evaluation test
                 logger.info("\n=== EVALUATION TEST ===")
                 from clt.training.evaluator import CLTEvaluator
-                evaluator = CLTEvaluator(model=merged_model, device=trainer.device)
                 
-                # Get one batch from trainer's activation store
+                # Create evaluator with same normalization stats as trainer
+                evaluator = CLTEvaluator(
+                    model=merged_model, 
+                    device=trainer.device,
+                    mean_tg=trainer.evaluator.mean_tg,
+                    std_tg=trainer.evaluator.std_tg
+                )
+                
+                # Evaluate on same batches as in-memory test
                 trainer.activation_store.reset_iterator()
-                inputs, targets = next(trainer.activation_store)
+                loaded_eval_metrics = {}
+                for i in range(5):
+                    inputs, targets = next(trainer.activation_store)
+                    batch_metrics = evaluator.compute_metrics(inputs, targets)
+                    for k, v in batch_metrics.items():
+                        if k not in loaded_eval_metrics:
+                            loaded_eval_metrics[k] = []
+                        loaded_eval_metrics[k].append(v)
                 
-                metrics = evaluator.compute_metrics(inputs, targets)
-                logger.info(f"Loaded model metrics: NMSE={metrics.get('reconstruction/normalized_mean_reconstruction_error', -1):.4f}, "
-                           f"EV={metrics.get('reconstruction/explained_variance', -1):.4f}")
+                # Average across batches
+                loaded_final_metrics = {k: sum(v) / len(v) for k, v in loaded_eval_metrics.items()}
+                logger.info(f"Loaded model metrics: NMSE={loaded_final_metrics.get('reconstruction/normalized_mean_reconstruction_error', -1):.4f}, "
+                           f"EV={loaded_final_metrics.get('reconstruction/explained_variance', -1):.4f}")
     
     # The trainer already cleaned up the process group
     
