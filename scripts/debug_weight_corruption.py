@@ -44,18 +44,20 @@ def compare_weights(state_dict1, state_dict2, name1="Dict1", name2="Dict2"):
             differences.append(f"Shape mismatch for '{key}': {t1.shape} vs {t2.shape}")
             continue
             
-        # Compare values
-        if not torch.allclose(t1, t2, rtol=1e-5, atol=1e-7):
-            max_diff = (t1 - t2).abs().max().item()
-            rel_diff = ((t1 - t2).abs() / (t1.abs() + 1e-8)).max().item()
+        # Compare values (move to CPU for comparison)
+        t1_cpu = t1.cpu()
+        t2_cpu = t2.cpu()
+        if not torch.allclose(t1_cpu, t2_cpu, rtol=1e-5, atol=1e-7):
+            max_diff = (t1_cpu - t2_cpu).abs().max().item()
+            rel_diff = ((t1_cpu - t2_cpu).abs() / (t1_cpu.abs() + 1e-8)).max().item()
             differences.append(f"Value mismatch for '{key}': max_diff={max_diff:.6e}, rel_diff={rel_diff:.6e}")
             
             # Sample some differences
-            if t1.numel() > 10:
-                diff_indices = (t1 - t2).abs().flatten().topk(min(5, t1.numel())).indices
+            if t1_cpu.numel() > 10:
+                diff_indices = (t1_cpu - t2_cpu).abs().flatten().topk(min(5, t1_cpu.numel())).indices
                 for idx in diff_indices[:3]:
-                    idx_tuple = np.unravel_index(idx.item(), t1.shape)
-                    differences.append(f"  At {idx_tuple}: {t1[idx_tuple].item():.6f} vs {t2[idx_tuple].item():.6f}")
+                    idx_tuple = np.unravel_index(idx.item(), t1_cpu.shape)
+                    differences.append(f"  At {idx_tuple}: {t1_cpu[idx_tuple].item():.6f} vs {t2_cpu[idx_tuple].item():.6f}")
     
     return differences
 
