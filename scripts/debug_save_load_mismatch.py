@@ -97,10 +97,10 @@ def run_distributed_test():
     dist.broadcast_object_list(temp_dir_list, src=0)
     temp_dir = temp_dir_list[0]
     
-    # Configuration for small test model
-    d_model = 64
-    num_features = 128  # Small for quick testing
-    num_layers = 2
+    # Configuration for test model matching GPT-2 activations
+    d_model = 768  # Must match GPT-2 hidden size
+    num_features = 512  # Small for quick testing
+    num_layers = 12  # GPT-2 has 12 layers
     batch_size = 32
     training_steps = 20
     
