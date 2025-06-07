@@ -71,6 +71,10 @@ def run_simple_test():
     
     # Simple broadcast of temp_dir path
     if world_size > 1:
+        # Set CUDA device before initializing process group
+        local_rank = int(os.environ.get("LOCAL_RANK", rank))
+        torch.cuda.set_device(local_rank)
+        
         dist.init_process_group(backend="nccl")
         temp_dir_list = [temp_dir]
         dist.broadcast_object_list(temp_dir_list, src=0)
