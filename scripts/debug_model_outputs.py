@@ -117,7 +117,7 @@ def analyze_model_behavior():
     logger.info("\n5. Checking decoder behavior:")
     
     # Get decoder for layer 0->0
-    decoder = model.decoder_module.decoders.decoders[f"{layer_idx}->{layer_idx}"]
+    decoder = model.decoder_module.decoders[f"{layer_idx}->{layer_idx}"]
     decoder_weight = decoder.weight
     logger.info(f"  Decoder {layer_idx}->{layer_idx} weight: shape={decoder_weight.shape}, "
                 f"mean={decoder_weight.mean():.6f}, std={decoder_weight.std():.6f}")
