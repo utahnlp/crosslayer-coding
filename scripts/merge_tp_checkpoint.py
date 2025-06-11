@@ -157,6 +157,13 @@ def main() -> None:
         no_dist=False,  # must be False when running with TP ranks
     )
     model.load_state_dict(tp_state)
+    
+    # Debug: Print what each rank loaded
+    enc_key = "encoder_module.encoders.0.weight"
+    if enc_key in tp_state:
+        checksum = torch.sum(torch.abs(tp_state[enc_key])).item()
+        sample = tp_state[enc_key].flatten()[:3].tolist()
+        print(f"Rank {rank}: Loaded {enc_key} with checksum {checksum:.6f}, first 3 values: {sample}")
 
     # ------------------------------------------------------------------
     # Gather shards → rank 0 builds full state_dict
