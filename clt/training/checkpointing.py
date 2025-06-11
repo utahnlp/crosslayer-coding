@@ -99,16 +99,24 @@ class CheckpointManager:
         # Save model state dict using distributed checkpointing
         model_state_dict_for_dist_save = self.model.state_dict()
         try:
+            # Disable tensor deduplication so that identically shaped but **sharded**
+            # parameters (e.g. TP slices whose shapes are padded to be uniform across
+            # ranks) are still treated as rank-local shards rather than as replicated
+            # tensors.  Without this, only rank-0 data would be saved and, on load, every
+            # rank would receive the *same* weights, destroying the learned TP sharding.
+            planner_no_dedup = DefaultSavePlanner(dedup_replicated_tensors=False)
+
             save_state_dict(
                 state_dict=model_state_dict_for_dist_save,
                 storage_writer=FileSystemWriter(checkpoint_dir),
-                planner=DefaultSavePlanner(),
+                planner=planner_no_dedup,
                 no_dist=False,
             )
+
             save_state_dict(
                 state_dict=model_state_dict_for_dist_save,
                 storage_writer=FileSystemWriter(latest_checkpoint_dir),
-                planner=DefaultSavePlanner(),
+                planner=planner_no_dedup,
                 no_dist=False,
             )
         except Exception as e:
