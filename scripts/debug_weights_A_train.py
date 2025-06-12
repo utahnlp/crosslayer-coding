@@ -83,7 +83,7 @@ def main():
     # Training config
     training_config = TrainingConfig(
         learning_rate=1e-4,
-        training_steps=10,
+        training_steps=1,
         train_batch_size_tokens=1024,
         activation_source="local_manifest",
         activation_path="./activations_local_100M/gpt2/pile-uncopyrighted_train",
@@ -98,7 +98,7 @@ def main():
         precision="fp16",
         log_interval=10,
         eval_interval=1000,
-        checkpoint_interval=10,
+        checkpoint_interval=1,
         enable_wandb=False,
     )
     

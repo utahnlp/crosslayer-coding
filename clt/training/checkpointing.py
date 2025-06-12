@@ -36,6 +36,7 @@ class CheckpointManager:
         rank: int,
         device: torch.device,
         world_size: int,
+        keep_n_checkpoints: int = 3,  # Keep only last N checkpoints to save space
         # Add optimizer, scheduler, scaler to be available for loading if needed
         # For saving, they will be passed to _save_checkpoint
     ):
@@ -47,6 +48,7 @@ class CheckpointManager:
         self.rank = rank
         self.device = device
         self.world_size = world_size
+        self.keep_n_checkpoints = keep_n_checkpoints
 
     def _save_checkpoint(
         self,
@@ -95,35 +97,46 @@ class CheckpointManager:
         # --- Distributed Save ---
         checkpoint_dir = os.path.join(self.log_dir, f"step_{step}")
         latest_checkpoint_dir = os.path.join(self.log_dir, "latest")
+        
+        # Create directories if they don't exist (all ranks should do this)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(latest_checkpoint_dir, exist_ok=True)
+        
+        # Ensure all ranks see the directories before proceeding
+        if self.distributed:
+            dist.barrier()
 
         # Save model state dict using distributed checkpointing
         model_state_dict_for_dist_save = self.model.state_dict()
+        
+        # Option 1: Save per-rank checkpoints separately for debugging
+        rank_checkpoint_path = os.path.join(checkpoint_dir, f"rank_{self.rank}_model.pt")
+        latest_rank_checkpoint_path = os.path.join(latest_checkpoint_dir, f"rank_{self.rank}_model.pt")
+        
         try:
-            # Disable tensor deduplication so that identically shaped but **sharded**
-            # parameters (e.g. TP slices whose shapes are padded to be uniform across
-            # ranks) are still treated as rank-local shards rather than as replicated
-            # tensors.  Without this, only rank-0 data would be saved and, on load, every
-            # rank would receive the *same* weights, destroying the learned TP sharding.
-            planner_no_dedup = DefaultSavePlanner(dedup_replicated_tensors=False)
-
-            save_state_dict(
-                state_dict=model_state_dict_for_dist_save,
-                storage_writer=FileSystemWriter(checkpoint_dir),
-                planner=planner_no_dedup,
-                no_dist=False,
-            )
-
-            save_state_dict(
-                state_dict=model_state_dict_for_dist_save,
-                storage_writer=FileSystemWriter(latest_checkpoint_dir),
-                planner=planner_no_dedup,
-                no_dist=False,
-            )
+            # Save individual rank files
+            torch.save(model_state_dict_for_dist_save, rank_checkpoint_path)
+            torch.save(model_state_dict_for_dist_save, latest_rank_checkpoint_path)
+            logger.info(f"Rank {self.rank}: Saved individual checkpoint to {rank_checkpoint_path}")
+            
+            # Debug: Check what we saved
+            enc_key = "encoder_module.encoders.0.weight"
+            if enc_key in model_state_dict_for_dist_save:
+                checksum = torch.sum(torch.abs(model_state_dict_for_dist_save[enc_key])).item()
+                logger.info(f"Rank {self.rank}: Saved {enc_key} with checksum {checksum:.6f}")
+            
+            # Skip saving distributed checkpoint (.distcp files) to save space
+            # We're using individual rank files instead due to PyTorch bug
+            pass
         except Exception as e:
             logger.warning(
                 f"Rank {self.rank}: Warning: Failed to save distributed model checkpoint at step {step}: {e}"
             )
 
+        # Wait for all ranks to save their individual checkpoints
+        if self.distributed:
+            dist.barrier()
+        
         if self.rank == 0:
             # Save activation store
             store_checkpoint_path = os.path.join(checkpoint_dir, "activation_store.pt")
@@ -133,19 +146,50 @@ class CheckpointManager:
                 torch.save(self.activation_store.state_dict(), latest_store_path)
             except Exception as e:
                 logger.warning(f"Rank 0: Warning: Failed to save activation store state at step {step}: {e}")
-
-            # Save consolidated model as .safetensors
-            model_safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
-            latest_model_safetensors_path = os.path.join(latest_checkpoint_dir, "model.safetensors")
+            
+            # Merge individual rank checkpoints into consolidated model
+            # This is a workaround for the PyTorch distributed checkpoint bug
             try:
-                full_model_state_dict = self.model.state_dict()
-                save_safetensors_file(full_model_state_dict, model_safetensors_path)
-                save_safetensors_file(full_model_state_dict, latest_model_safetensors_path)
-                logger.info(
-                    f"Rank 0: Saved consolidated model to {model_safetensors_path} and {latest_model_safetensors_path}"
-                )
+                logger.info(f"Rank 0: Merging {self.world_size} rank checkpoints...")
+                
+                # Load all rank state dicts
+                state_dicts = []
+                for rank in range(self.world_size):
+                    rank_path = os.path.join(checkpoint_dir, f"rank_{rank}_model.pt")
+                    if os.path.exists(rank_path):
+                        state_dict = torch.load(rank_path, map_location="cpu")
+                        state_dicts.append(state_dict)
+                    else:
+                        logger.error(f"Rank 0: Missing rank checkpoint: {rank_path}")
+                        state_dicts = None
+                        break
+                
+                if state_dicts and len(state_dicts) == self.world_size:
+                    # Merge the state dicts
+                    merged_state = self._merge_tensor_parallel_weights(state_dicts)
+                    
+                    # Save as safetensors
+                    model_safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
+                    latest_model_safetensors_path = os.path.join(latest_checkpoint_dir, "model.safetensors")
+                    save_safetensors_file(merged_state, model_safetensors_path)
+                    save_safetensors_file(merged_state, latest_model_safetensors_path)
+                    logger.info(f"Rank 0: Saved merged model to {model_safetensors_path}")
+                else:
+                    logger.error(f"Rank 0: Failed to merge rank checkpoints - missing files")
+                    # Fall back to single rank save
+                    model_safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
+                    latest_model_safetensors_path = os.path.join(latest_checkpoint_dir, "model.safetensors")
+                    try:
+                        full_model_state_dict = self.model.state_dict()
+                        save_safetensors_file(full_model_state_dict, model_safetensors_path)
+                        save_safetensors_file(full_model_state_dict, latest_model_safetensors_path)
+                        logger.info(
+                            f"Rank 0: Saved consolidated model to {model_safetensors_path} and {latest_model_safetensors_path}"
+                        )
+                    except Exception as e:
+                        logger.warning(f"Rank 0: Warning: Failed to save fallback model at step {step}: {e}")
             except Exception as e:
-                logger.warning(f"Rank 0: Warning: Failed to save consolidated .safetensors model at step {step}: {e}")
+                logger.warning(f"Rank 0: Warning: Failed to merge rank checkpoints at step {step}: {e}")
 
             # Save trainer state (optimizer, scheduler, etc.)
             trainer_state_filepath = os.path.join(checkpoint_dir, "trainer_state.pt")
@@ -159,13 +203,23 @@ class CheckpointManager:
             except Exception as e:
                 logger.warning(f"Rank 0: Warning: Failed to save trainer state at step {step}: {e}")
 
-            self.wandb_logger.log_artifact(
-                artifact_path=checkpoint_dir,
-                artifact_type="model_checkpoint",
-                name=f"dist_checkpoint_{step}",
-            )
+            # Only log artifact if we successfully saved something
+            if os.path.exists(checkpoint_dir) and os.listdir(checkpoint_dir):
+                try:
+                    self.wandb_logger.log_artifact(
+                        artifact_path=checkpoint_dir,
+                        artifact_type="model_checkpoint",
+                        name=f"dist_checkpoint_{step}",
+                    )
+                except Exception as e:
+                    logger.warning(f"Rank 0: Failed to log artifact to WandB: {e}")
 
-        dist.barrier()
+        if self.distributed:
+            dist.barrier()
+        
+        # Clean up old checkpoints to save space
+        if self.rank == 0 and self.keep_n_checkpoints > 0:
+            self._cleanup_old_checkpoints()
 
     def load_checkpoint(self, checkpoint_path: str) -> Dict[str, Any]:
         """Load a checkpoint for model, activation store, and trainer state.
@@ -404,3 +458,74 @@ class CheckpointManager:
             logger.warning(
                 f"Warning: Activation store checkpoint path not found or specified: {store_checkpoint_path}. Store state not loaded."
             )
+    
+    def _merge_tensor_parallel_weights(self, state_dicts: list) -> Dict[str, torch.Tensor]:
+        """
+        Merge tensor-parallel weights from multiple ranks into a single state dict.
+        This is a workaround for the PyTorch distributed checkpoint bug.
+        """
+        merged_state = {}
+        world_size = len(state_dicts)
+        
+        # Get all parameter names from first rank
+        param_names = list(state_dicts[0].keys())
+        
+        for name in param_names:
+            tensors = [sd[name] for sd in state_dicts]
+            
+            # Check if this is a tensor-parallel weight that needs concatenation
+            if "encoder_module.encoders" in name:
+                if "weight" in name:
+                    # Encoder weights are sharded along dim 0 (output features)
+                    merged_state[name] = torch.cat(tensors, dim=0)
+                elif "bias" in name:
+                    # Encoder biases are also sharded along dim 0
+                    merged_state[name] = torch.cat(tensors, dim=0)
+                else:
+                    # Other encoder parameters
+                    merged_state[name] = tensors[0]
+                
+            elif "decoder_module.decoders" in name and "weight" in name:
+                # Decoder weights are sharded along dim 1 (input features)
+                merged_state[name] = torch.cat(tensors, dim=1)
+                
+            elif "log_threshold" in name:
+                # For BatchTopK threshold, concatenate the per-layer thresholds
+                merged_state[name] = torch.cat(tensors, dim=1)
+                
+            else:
+                # For replicated parameters (biases, layer norms, etc.), use rank 0's version
+                merged_state[name] = tensors[0]
+        
+        return merged_state
+    
+    def _cleanup_old_checkpoints(self):
+        """Remove old checkpoints to save disk space, keeping only the last N."""
+        import shutil
+        from pathlib import Path
+        
+        log_path = Path(self.log_dir)
+        
+        # Find all step directories
+        step_dirs = []
+        for item in log_path.iterdir():
+            if item.is_dir() and item.name.startswith("step_"):
+                try:
+                    step_num = int(item.name.replace("step_", ""))
+                    step_dirs.append((step_num, item))
+                except ValueError:
+                    continue
+        
+        # Sort by step number
+        step_dirs.sort(key=lambda x: x[0])
+        
+        # Keep only the last N checkpoints
+        if len(step_dirs) > self.keep_n_checkpoints:
+            dirs_to_remove = step_dirs[:-self.keep_n_checkpoints]
+            
+            for step_num, dir_path in dirs_to_remove:
+                try:
+                    shutil.rmtree(dir_path)
+                    logger.info(f"Removed old checkpoint: {dir_path}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove old checkpoint {dir_path}: {e}")
