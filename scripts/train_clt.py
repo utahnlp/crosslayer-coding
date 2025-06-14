@@ -389,6 +389,11 @@ def parse_args():
         action="store_true",
         help="Enable computation of detailed sparsity diagnostics during evaluation.",
     )
+    train_group.add_argument(
+        "--enable-profiling",
+        action="store_true",
+        help="Enable detailed performance profiling to identify bottlenecks.",
+    )
 
     # --- Sampling Strategy ---
     sampling_group = parser.add_argument_group("Sampling Strategy (TrainingConfig)")
@@ -706,6 +711,7 @@ def main():
         # Dead Features & Diagnostics
         dead_feature_window=args.dead_feature_window,
         compute_sparsity_diagnostics=args.compute_sparsity_diagnostics,
+        enable_profiling=args.enable_profiling,
         # WandB
         enable_wandb=args.enable_wandb,
         wandb_project=args.wandb_project,

@@ -158,6 +158,9 @@ class TrainingConfig:
 
     # Optional diagnostic metrics (can be slow)
     compute_sparsity_diagnostics: bool = False  # Whether to compute detailed sparsity diagnostics during eval
+    
+    # Performance profiling
+    enable_profiling: bool = False  # Whether to enable detailed performance profiling
 
     # Dead feature tracking
     dead_feature_window: int = 1000  # Steps until a feature is considered dead
