@@ -1,5 +1,5 @@
 import torch
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple, Dict, List, Any
 import logging
 from clt.config import CLTConfig
 from torch.distributed import ProcessGroup
@@ -26,9 +26,10 @@ class BatchTopK(torch.autograd.Function):
 
         if k_total_batch > 0:
             _, flat_indices = torch.topk(ranking_flat, k_total_batch, sorted=False)
-            mask_flat = torch.zeros_like(x_flat, dtype=torch.bool)
-            mask_flat[flat_indices] = True
-            mask = mask_flat.view_as(x)
+            # Optimized mask creation - avoid individual indexing
+            mask = torch.zeros(x_flat.numel(), dtype=torch.bool, device=x.device)
+            mask[flat_indices] = True
+            mask = mask.view_as(x)
         else:
             mask = torch.zeros_like(x, dtype=torch.bool)
 
@@ -118,6 +119,7 @@ class TokenTopK(torch.autograd.Function):
 
         if k_per_token > 0:
             _, topk_indices_per_row = torch.topk(ranking_tensor_to_use, k_per_token, dim=-1, sorted=False)
+            # Use scatter_ for efficient mask creation
             mask = torch.zeros_like(x, dtype=torch.bool)
             mask.scatter_(-1, topk_indices_per_row, True)
         else:
@@ -231,6 +233,7 @@ def _apply_batch_topk_helper(
     dtype: torch.dtype,
     rank: int,
     process_group: Optional[ProcessGroup],
+    profiler: Optional[Any] = None,
 ) -> Dict[int, torch.Tensor]:
     """Helper to apply BatchTopK globally across concatenated layer pre-activations."""
 
@@ -304,17 +307,42 @@ def _apply_batch_topk_helper(
 
     if world_size > 1:
         if rank == 0:
-            local_mask = BatchTopK._compute_mask(
+            if profiler:
+                with profiler.timer("batchtopk_compute_mask") as timer:
+                    local_mask = BatchTopK._compute_mask(
+                        concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
+                    )
+                if hasattr(timer, 'elapsed'):
+                    profiler.record("batchtopk_compute_mask", timer.elapsed)
+            else:
+                local_mask = BatchTopK._compute_mask(
+                    concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
+                )
+            mask.copy_(local_mask)
+            
+            if hasattr(profiler, 'dist_profiler') and profiler.dist_profiler:
+                with profiler.dist_profiler.profile_op("batchtopk_broadcast"):
+                    dist_ops.broadcast(mask, src=0, group=process_group)
+            else:
+                dist_ops.broadcast(mask, src=0, group=process_group)
+        else:
+            if hasattr(profiler, 'dist_profiler') and profiler.dist_profiler:
+                with profiler.dist_profiler.profile_op("batchtopk_broadcast"):
+                    dist_ops.broadcast(mask, src=0, group=process_group)
+            else:
+                dist_ops.broadcast(mask, src=0, group=process_group)
+    else:
+        if profiler:
+            with profiler.timer("batchtopk_compute_mask") as timer:
+                mask = BatchTopK._compute_mask(
+                    concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
+                )
+            if hasattr(timer, 'elapsed'):
+                profiler.record("batchtopk_compute_mask", timer.elapsed)
+        else:
+            mask = BatchTopK._compute_mask(
                 concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
             )
-            mask.copy_(local_mask)
-            dist_ops.broadcast(mask, src=0, group=process_group)
-        else:
-            dist_ops.broadcast(mask, src=0, group=process_group)
-    else:
-        mask = BatchTopK._compute_mask(
-            concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
-        )
 
     activated_concatenated = concatenated_preactivations_original * mask.to(dtype)
 
@@ -336,6 +364,7 @@ def _apply_token_topk_helper(
     dtype: torch.dtype,
     rank: int,
     process_group: Optional[ProcessGroup],
+    profiler: Optional[Any] = None,
 ) -> Dict[int, torch.Tensor]:
     """Helper to apply TokenTopK globally across concatenated layer pre-activations."""
     world_size = dist_ops.get_world_size(process_group)
@@ -408,19 +437,46 @@ def _apply_token_topk_helper(
 
     if world_size > 1:
         if rank == 0:
-            local_mask = TokenTopK._compute_mask(
-                concatenated_preactivations_original,
-                k_val_float,
-                concatenated_preactivations_normalized,
-            )
+            if profiler:
+                with profiler.timer("topk_compute_mask") as timer:
+                    local_mask = TokenTopK._compute_mask(
+                        concatenated_preactivations_original,
+                        k_val_float,
+                        concatenated_preactivations_normalized,
+                    )
+                if hasattr(timer, 'elapsed'):
+                    profiler.record("topk_compute_mask", timer.elapsed)
+            else:
+                local_mask = TokenTopK._compute_mask(
+                    concatenated_preactivations_original,
+                    k_val_float,
+                    concatenated_preactivations_normalized,
+                )
             mask.copy_(local_mask)
-            dist_ops.broadcast(mask, src=0, group=process_group)
+            
+            if hasattr(profiler, 'dist_profiler') and profiler.dist_profiler:
+                with profiler.dist_profiler.profile_op("topk_broadcast"):
+                    dist_ops.broadcast(mask, src=0, group=process_group)
+            else:
+                dist_ops.broadcast(mask, src=0, group=process_group)
         else:
-            dist_ops.broadcast(mask, src=0, group=process_group)
+            if hasattr(profiler, 'dist_profiler') and profiler.dist_profiler:
+                with profiler.dist_profiler.profile_op("topk_broadcast"):
+                    dist_ops.broadcast(mask, src=0, group=process_group)
+            else:
+                dist_ops.broadcast(mask, src=0, group=process_group)
     else:
-        mask = TokenTopK._compute_mask(
-            concatenated_preactivations_original, k_val_float, concatenated_preactivations_normalized
-        )
+        if profiler:
+            with profiler.timer("topk_compute_mask") as timer:
+                mask = TokenTopK._compute_mask(
+                    concatenated_preactivations_original, k_val_float, concatenated_preactivations_normalized
+                )
+            if hasattr(timer, 'elapsed'):
+                profiler.record("topk_compute_mask", timer.elapsed)
+        else:
+            mask = TokenTopK._compute_mask(
+                concatenated_preactivations_original, k_val_float, concatenated_preactivations_normalized
+            )
 
     activated_concatenated = concatenated_preactivations_original * mask.to(dtype)
 

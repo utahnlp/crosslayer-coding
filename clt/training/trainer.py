@@ -30,6 +30,7 @@ from .distributed_utils import average_shared_parameter_grads  # Add this import
 from clt.training.data.activation_store_factory import create_activation_store  # Add this import
 from .metric_utils import MetricLogger  # Add this import
 from .diagnostics import compute_sparsity_diagnostics  # Add this import
+from .profiler import TrainingProfiler, CUDAMemoryProfiler, DistributedProfiler  # Add profiler imports
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -157,7 +158,25 @@ class CLTTrainer:
         else:
             logger.warning(f"Rank {self.rank}: No seed provided in TrainingConfig. Using default torch seeding.")
 
-        self.model = CrossLayerTranscoder(clt_config, process_group=self.process_group, device=self.device)
+        # Initialize profilers early (before model creation)
+        self.profiler = TrainingProfiler(
+            enabled=self.training_config.enable_profiling,
+            log_interval=self.training_config.log_interval
+        )
+        self.memory_profiler = CUDAMemoryProfiler(
+            enabled=self.training_config.enable_profiling and torch.cuda.is_available()
+        )
+        self.dist_profiler = DistributedProfiler(
+            enabled=self.training_config.enable_profiling and self.distributed,
+            rank=self.rank
+        )
+        
+        self.model = CrossLayerTranscoder(
+            clt_config, 
+            process_group=self.process_group, 
+            device=self.device,
+            profiler=self.profiler if self.training_config.enable_profiling else None
+        )
 
         # --- Optionally convert model to FP16 (Step 8) ---
         # If precision is "fp16", GradScaler is used, which expects FP32 optimizer parameters.
@@ -568,18 +587,20 @@ class CLTTrainer:
 
                 try:
                     # Get batch directly from the iterator (handles distributed sampling internally)
-                    batch_get_start_time = time.monotonic()
-                    inputs, targets = next(self.activation_store)
-                    batch_get_duration = time.monotonic() - batch_get_start_time
-                    logger.debug(f"Rank {self.rank} Step {step}: Getting batch took {batch_get_duration:.4f}s")
+                    with self.profiler.timer("data_loading") as timer:
+                        inputs, targets = next(self.activation_store)
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("data_loading", timer.elapsed)
+                        logger.debug(f"Rank {self.rank} Step {step}: Getting batch took {timer.elapsed:.4f}s")
 
                     # logging to diagnose batch size mismatch
                     tok_cnt = next(iter(inputs.values())).shape[0]  # number of rows (=tokens) in this batch
                     # Only run the all_gather diagnostic when running in distributed mode
                     if self.distributed and self.world_size > 1 and dist.is_initialized():
-                        tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
-                        gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
-                        dist.all_gather(gathered, tok_cnt_t)
+                        with self.dist_profiler.profile_op("batch_size_all_gather"):
+                            tok_cnt_t = torch.tensor([tok_cnt], device=self.device)
+                            gathered = [torch.zeros_like(tok_cnt_t) for _ in range(self.world_size)]
+                            dist.all_gather(gathered, tok_cnt_t)
 
                 except StopIteration:
                     # Rank 0 prints message
@@ -632,50 +653,62 @@ class CLTTrainer:
                 with torch.autocast(
                     device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled
                 ):
-                    feature_activations_batch = self.model.get_feature_activations(inputs)
-                    loss, loss_dict = self.loss_manager.compute_total_loss(
-                        self.model,
-                        inputs,
-                        targets,
-                        step,
-                        self.training_config.training_steps,
-                        precomputed_activations=feature_activations_batch,
-                        dead_neuron_mask=self.dead_neurons_mask,
-                    )
+                    # Profile forward pass
+                    with self.profiler.timer("forward_pass") as timer:
+                        feature_activations_batch = self.model.get_feature_activations(inputs)
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("forward_pass", timer.elapsed)
+                    
+                    # Profile loss computation
+                    with self.profiler.timer("loss_computation") as timer:
+                        loss, loss_dict = self.loss_manager.compute_total_loss(
+                            self.model,
+                            inputs,
+                            targets,
+                            step,
+                            self.training_config.training_steps,
+                            precomputed_activations=feature_activations_batch,
+                            dead_neuron_mask=self.dead_neurons_mask,
+                        )
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("loss_computation", timer.elapsed)
 
                 # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
                 # We need *full* feature activations *after* non-linearity
                 if hasattr(self, "n_forward_passes_since_fired") and self.n_forward_passes_since_fired is not None:
-                    with torch.no_grad():
-                        for layer_idx, layer_acts in feature_activations_batch.items():
-                            # Ensure layer index is within bounds of the counter tensor
-                            if layer_idx < self.n_forward_passes_since_fired.shape[0]:
-                                if layer_acts.numel() > 0:
-                                    # layer_acts shape: [batch_tokens, num_features]
-                                    fired_mask_per_token = layer_acts > 1e-6
-                                    fired_features_this_layer = fired_mask_per_token.any(dim=0)
+                    with self.profiler.timer("dead_neuron_update") as timer:
+                        with torch.no_grad():
+                            for layer_idx, layer_acts in feature_activations_batch.items():
+                                # Ensure layer index is within bounds of the counter tensor
+                                if layer_idx < self.n_forward_passes_since_fired.shape[0]:
+                                    if layer_acts.numel() > 0:
+                                        # layer_acts shape: [batch_tokens, num_features]
+                                        fired_mask_per_token = layer_acts > 1e-6
+                                        fired_features_this_layer = fired_mask_per_token.any(dim=0)
 
-                                    if fired_features_this_layer.shape[0] == self.n_forward_passes_since_fired.shape[1]:
-                                        self.n_forward_passes_since_fired[layer_idx] += 1
-                                        self.n_forward_passes_since_fired[layer_idx][fired_features_this_layer] = 0
-                                    else:
-                                        # Log warning only on rank 0 to avoid flooding logs
+                                        if fired_features_this_layer.shape[0] == self.n_forward_passes_since_fired.shape[1]:
+                                            self.n_forward_passes_since_fired[layer_idx] += 1
+                                            self.n_forward_passes_since_fired[layer_idx][fired_features_this_layer] = 0
+                                        else:
+                                            # Log warning only on rank 0 to avoid flooding logs
+                                            if not self.distributed or self.rank == 0:
+                                                logger.warning(
+                                                    f"Rank {self.rank}: Shape mismatch for dead neuron update at layer {layer_idx}. "
+                                                    f"Acts shape: {layer_acts.shape}, Fired mask: {fired_features_this_layer.shape}, "
+                                                    f"Counter: {self.n_forward_passes_since_fired.shape}"
+                                                )
+                                    else:  # layer_acts.numel() == 0
                                         if not self.distributed or self.rank == 0:
-                                            logger.warning(
-                                                f"Rank {self.rank}: Shape mismatch for dead neuron update at layer {layer_idx}. "
-                                                f"Acts shape: {layer_acts.shape}, Fired mask: {fired_features_this_layer.shape}, "
-                                                f"Counter: {self.n_forward_passes_since_fired.shape}"
+                                            logger.debug(
+                                                f"Rank {self.rank}: Layer {layer_idx} has empty activations, skipping dead neuron update for this layer."
                                             )
-                                else:  # layer_acts.numel() == 0
+                                else:  # layer_idx out of bounds
                                     if not self.distributed or self.rank == 0:
-                                        logger.debug(
-                                            f"Rank {self.rank}: Layer {layer_idx} has empty activations, skipping dead neuron update for this layer."
+                                        logger.warning(
+                                            f"Rank {self.rank}: layer_idx {layer_idx} out of bounds for n_forward_passes_since_fired (shape {self.n_forward_passes_since_fired.shape}). Skipping dead neuron update."
                                         )
-                            else:  # layer_idx out of bounds
-                                if not self.distributed or self.rank == 0:
-                                    logger.warning(
-                                        f"Rank {self.rank}: layer_idx {layer_idx} out of bounds for n_forward_passes_since_fired (shape {self.n_forward_passes_since_fired.shape}). Skipping dead neuron update."
-                                    )
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("dead_neuron_update", timer.elapsed)
                 else:  # n_forward_passes_since_fired does not exist or is None
                     if not self.distributed or self.rank == 0:
                         logger.warning(
@@ -693,24 +726,37 @@ class CLTTrainer:
                         logger.warning(f"Rank {self.rank}: NaN Loss - Detailed loss_dict at step {step}: {loss_dict}")
                 else:
                     # ---- Back-prop with gradient scaling ----
-                    self.scaler.scale(loss).backward()
+                    with self.profiler.timer("backward_pass") as timer:
+                        self.scaler.scale(loss).backward()
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("backward_pass", timer.elapsed)
 
                     # Unscale gradients before clipping and distributed averaging
                     self.scaler.unscale_(self.optimizer)
 
                     # --- Synchronise gradients of replicated parameters --- #
                     if self.distributed and self.world_size > 1:
-                        average_shared_parameter_grads(self.model, self.world_size)
+                        with self.profiler.timer("gradient_sync") as timer:
+                            with self.dist_profiler.profile_op("gradient_all_reduce"):
+                                average_shared_parameter_grads(self.model, self.world_size)
+                        if hasattr(timer, 'elapsed'):
+                            self.profiler.record("gradient_sync", timer.elapsed)
 
                     # --- Gradient clipping (operates on unscaled gradients) --- #
                     if self.training_config.gradient_clip_val is not None:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.model.parameters(),
-                            self.training_config.gradient_clip_val,
-                        )
+                        with self.profiler.timer("gradient_clipping") as timer:
+                            torch.nn.utils.clip_grad_norm_(
+                                self.model.parameters(),
+                                self.training_config.gradient_clip_val,
+                            )
+                        if hasattr(timer, 'elapsed'):
+                            self.profiler.record("gradient_clipping", timer.elapsed)
 
                     # --- Optimizer step (scaler handles scaling/unscaling) ---
-                    self.scaler.step(self.optimizer)
+                    with self.profiler.timer("optimizer_step") as timer:
+                        self.scaler.step(self.optimizer)
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("optimizer_step", timer.elapsed)
 
                     # --- Update scaler for next iteration ---
                     self.scaler.update()
@@ -726,7 +772,11 @@ class CLTTrainer:
                     and hasattr(self, "n_forward_passes_since_fired")
                     and self.n_forward_passes_since_fired is not None
                 ):
-                    dist.all_reduce(self.n_forward_passes_since_fired, op=dist.ReduceOp.MIN, group=self.process_group)
+                    with self.profiler.timer("dead_neuron_sync") as timer:
+                        with self.dist_profiler.profile_op("dead_neuron_all_reduce"):
+                            dist.all_reduce(self.n_forward_passes_since_fired, op=dist.ReduceOp.MIN, group=self.process_group)
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("dead_neuron_sync", timer.elapsed)
 
                 # --- Scheduler step --- (All ranks)
                 if self.scheduler:
@@ -775,19 +825,23 @@ class CLTTrainer:
                 # We still only log / store the resulting metrics on rank 0.
                 if run_eval_flag:
                     if self.distributed:
-                        dist.barrier()  # Sync before evaluation starts so that all ranks enter together
+                        with self.dist_profiler.profile_op("eval_barrier"):
+                            dist.barrier()  # Sync before evaluation starts so that all ranks enter together
 
                     # Compute evaluation metrics on all ranks to keep collective ops aligned
                     # Wrap the evaluation logic in autocast
-                    with torch.autocast(
-                        device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled
-                    ):
-                        current_dead_mask = self.dead_neurons_mask.detach().clone()
-                        eval_metrics = self.evaluator.compute_metrics(
-                            inputs,  # These inputs are from the current training batch
-                            targets,  # These targets are from the current training batch
-                            dead_neuron_mask=current_dead_mask,
-                        )
+                    with self.profiler.timer("evaluation") as timer:
+                        with torch.autocast(
+                            device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled
+                        ):
+                            current_dead_mask = self.dead_neurons_mask.detach().clone()
+                            eval_metrics = self.evaluator.compute_metrics(
+                                inputs,  # These inputs are from the current training batch
+                                targets,  # These targets are from the current training batch
+                                dead_neuron_mask=current_dead_mask,
+                            )
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("evaluation", timer.elapsed)
 
                         # --- Log per-layer standard deviation of pre-activations ---
                         # This requires getting the pre-activations first.
@@ -886,6 +940,11 @@ class CLTTrainer:
                         "python_rng_state": random.getstate(),
                     }
                     self.checkpoint_manager._save_checkpoint(step, current_trainer_state_for_checkpoint)
+
+                # --- Profile memory and step profiler --- #
+                if not self.distributed or self.rank == 0:
+                    self.memory_profiler.snapshot(f"Step {step}")
+                    self.profiler.step()
 
             # --- Explicitly delete tensors at the very end of the loop iteration --- #
             # Do this on all ranks
@@ -1012,6 +1071,17 @@ class CLTTrainer:
         # --- Close the activation store (stops prefetch thread if applicable) --- #
         if hasattr(self.activation_store, "close") and callable(getattr(self.activation_store, "close")):
             self.activation_store.close()
+
+        # Log final profiling summaries
+        if not self.distributed or self.rank == 0:
+            logger.info("\n" + "="*80)
+            logger.info("FINAL PROFILING SUMMARY")
+            logger.info("="*80)
+            self.profiler.log_summary()
+            self.memory_profiler.log_summary()
+            if self.distributed:
+                self.dist_profiler.log_summary()
+            logger.info("="*80)
 
         # Clean up distributed process group
         if self.distributed:
