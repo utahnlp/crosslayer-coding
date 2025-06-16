@@ -192,7 +192,7 @@ def main(args):
 
     try:
         estimated_thetas = model.estimate_theta_posthoc(
-            data_iter=activation_store_theta,
+            data_iter=iter(activation_store_theta),
             num_batches=args.num_batches_for_theta_estimation,
             default_theta_value=args.default_theta_value,
             device=device,  # Pass device to ensure buffers are on correct device
@@ -526,7 +526,12 @@ def main(args):
 
         # 6. Re-save the calibrated model
         logger.info(f"Re-saving calibrated JumpReLU model state to: {args.output_model_path}")
-        torch.save(model.state_dict(), args.output_model_path)
+        if args.output_model_path.endswith(".safetensors"):
+            save_file(model.state_dict(), args.output_model_path)
+            logger.info(f"Re-saved calibrated JumpReLU model state as safetensors to: {args.output_model_path}")
+        else:
+            torch.save(model.state_dict(), args.output_model_path)
+            logger.info(f"Re-saved calibrated JumpReLU model state as .pt to: {args.output_model_path}")
         # Config remains the same (JumpReLU), only log_thresholds changed.
         logger.info("--- Layer-wise L0 Calibration Step Finished ---")
 
