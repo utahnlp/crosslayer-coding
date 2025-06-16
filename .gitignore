@@ -208,6 +208,7 @@ clt_smoke_output_local_wandb_batchtopk/
 clt_smoke_output_remote_wandb/
 wandb/
 scripts/debug
+scripts/optimization
 
 # models
 *.pt

@@ -135,9 +135,8 @@ activation_config = ActivationConfig(
     # Storage Parameters
     activation_dir=activation_dir,
     output_format="hdf5",
-    compression="gzip",
-    chunk_token_threshold=8_000,
-    activation_dtype="float32",  # Explicitly set desired storage precision
+    chunk_token_threshold=32_000,
+    activation_dtype="float16",  # Explicitly set desired storage precision
     # Normalization
     compute_norm_stats=True,
     # NNsight args (defaults are usually fine)
