@@ -798,6 +798,13 @@ class ActivationGenerator:
                                 chunks=(min(rows, 16384), d_model),
                             )
 
+                        # --- Use a SINGLE permutation shared across all layers --- #
+                        if rows > 0:
+                            shared_perm = torch.randperm(rows, device=next(iter(buf_inp_gpu.values()))[0].device)
+                        else:
+                            # Degenerate case – zero-row chunk (should not normally happen)
+                            shared_perm = None
+
                         layer_data_to_write = []
                         for layer_id in layer_ids:
                             with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_data_prep"):
@@ -805,10 +812,13 @@ class ActivationGenerator:
                                     layer_inp_gpu = torch.cat(buf_inp_gpu[layer_id], dim=0)
                                     layer_tgt_gpu = torch.cat(buf_tgt_gpu[layer_id], dim=0)
 
-                                with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_permute"):
-                                    perm = torch.randperm(rows, device=layer_inp_gpu.device)
-                                    layer_inp_gpu_perm = layer_inp_gpu[perm]
-                                    layer_tgt_gpu_perm = layer_tgt_gpu[perm]
+                                if shared_perm is not None:
+                                    with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_permute"):
+                                        layer_inp_gpu_perm = layer_inp_gpu[shared_perm]
+                                        layer_tgt_gpu_perm = layer_tgt_gpu[shared_perm]
+                                else:
+                                    layer_inp_gpu_perm = layer_inp_gpu
+                                    layer_tgt_gpu_perm = layer_tgt_gpu
 
                                 with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_cpu_transfer"):
                                     layer_inp_cpu = layer_inp_gpu_perm.cpu()
@@ -816,12 +826,12 @@ class ActivationGenerator:
 
                                 with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_convert_numpy"):
                                     inputs_np = (
-                                        layer_inp_cpu.numpy().view(np.uint16)
+                                        layer_inp_cpu.view(torch.int16).numpy()
                                         if self.torch_dtype == torch.bfloat16
                                         else layer_inp_cpu.numpy()
                                     )
                                     targets_np = (
-                                        layer_tgt_cpu.numpy().view(np.uint16)
+                                        layer_tgt_cpu.view(torch.int16).numpy()
                                         if self.torch_dtype == torch.bfloat16
                                         else layer_tgt_cpu.numpy()
                                     )
@@ -855,16 +865,25 @@ class ActivationGenerator:
 
             elif self.cfg.output_format == "npz":
                 npz_save_dict = {}
+                # --- Use a SINGLE permutation shared across all layers (same as HDF5 path) --- #
+                if rows > 0:
+                    shared_perm = torch.randperm(rows, device=next(iter(buf_inp_gpu.values()))[0].device)
+                else:
+                    shared_perm = None
+
                 for layer_id in layer_ids:
                     with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_data_prep_npz"):
                         with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_concat_npz"):
                             layer_inp_gpu = torch.cat(buf_inp_gpu[layer_id], dim=0)
                             layer_tgt_gpu = torch.cat(buf_tgt_gpu[layer_id], dim=0)
 
-                        with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_permute_npz"):
-                            perm = torch.randperm(rows, device=layer_inp_gpu.device)
-                            layer_inp_gpu_perm = layer_inp_gpu[perm]
-                            layer_tgt_gpu_perm = layer_tgt_gpu[perm]
+                        if shared_perm is not None:
+                            with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_permute_npz"):
+                                layer_inp_gpu_perm = layer_inp_gpu[shared_perm]
+                                layer_tgt_gpu_perm = layer_tgt_gpu[shared_perm]
+                        else:
+                            layer_inp_gpu_perm = layer_inp_gpu
+                            layer_tgt_gpu_perm = layer_tgt_gpu
 
                         with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_cpu_transfer_npz"):
                             layer_inp_cpu = layer_inp_gpu_perm.cpu()
@@ -872,12 +891,12 @@ class ActivationGenerator:
 
                         with self._conditional_measure(f"chunk_{chunk_idx}_layer_{layer_id}_convert_numpy_npz"):
                             inputs_np = (
-                                layer_inp_cpu.numpy().view(np.uint16)
+                                layer_inp_cpu.view(torch.int16).numpy()
                                 if self.torch_dtype == torch.bfloat16
                                 else layer_inp_cpu.numpy()
                             )
                             targets_np = (
-                                layer_tgt_cpu.numpy().view(np.uint16)
+                                layer_tgt_cpu.view(torch.int16).numpy()
                                 if self.torch_dtype == torch.bfloat16
                                 else layer_tgt_cpu.numpy()
                             )
