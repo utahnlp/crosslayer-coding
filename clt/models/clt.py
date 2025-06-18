@@ -184,6 +184,7 @@ class CrossLayerTranscoder(BaseTranscoder):
 
     def forward(self, inputs: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
         activations = self.get_feature_activations(inputs)
+
         reconstructions = {}
         for layer_idx in range(self.config.num_layers):
             relevant_activations = {k: v for k, v in activations.items() if k <= layer_idx and v.numel() > 0}
@@ -234,7 +235,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 if self.profiler:
                     with self.profiler.timer("batchtopk_activation") as timer:
                         activations = self._apply_batch_topk(preactivations_dict)
-                    if hasattr(timer, 'elapsed'):
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("batchtopk_activation", timer.elapsed)
                 else:
                     activations = self._apply_batch_topk(preactivations_dict)
@@ -242,7 +243,7 @@ class CrossLayerTranscoder(BaseTranscoder):
                 if self.profiler:
                     with self.profiler.timer("topk_activation") as timer:
                         activations = self._apply_token_topk(preactivations_dict)
-                    if hasattr(timer, 'elapsed'):
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("topk_activation", timer.elapsed)
                 else:
                     activations = self._apply_token_topk(preactivations_dict)
