@@ -99,9 +99,42 @@ class LocalActivationStore(ManifestActivationStore):
                 logger.info(
                     f"Manifest loaded (3-field format) from {path} ({data_structured.shape[0]} chunks). Expanding to per-row entries."
                 )
+
+                # --- Consistency check against metadata --- #
+                expected_total_tokens: Optional[int] = None
+                if hasattr(self, "_meta") and isinstance(self._meta, dict):
+                    try:
+                        expected_total_tokens = int(self._meta.get("total_tokens", -1))
+                    except (ValueError, TypeError):
+                        expected_total_tokens = None
+
                 # Expand into per-row entries expected by downstream (chunk_id, row_in_chunk)
                 chunk_ids = data_structured["chunk_id"].astype(np.uint32)
                 num_tokens_arr = data_structured["num_tokens"].astype(np.uint32)
+
+                # If the sum of num_tokens does not match metadata total_tokens (when available),
+                # this file is very likely a *legacy* per-row manifest whose byte-length happens to be
+                # divisible by 16 (e.g. an even number of rows).  In that case we fall back to the
+                # legacy 2-field parsing logic.
+                if expected_total_tokens is not None and expected_total_tokens > 0:
+                    parsed_total = int(num_tokens_arr.sum())
+                    if parsed_total != expected_total_tokens:
+                        logger.warning(
+                            "3-field manifest parse produced total_rows=%d but metadata reports %d tokens. "
+                            "Falling back to legacy 2-field manifest parsing.",
+                            parsed_total,
+                            expected_total_tokens,
+                        )
+                        # Legacy 2-field format already matches expected shape
+                        data = np.fromfile(path, dtype=np.uint32).reshape(-1, 2)
+                        logger.info(
+                            "Manifest re-loaded (legacy 2-field format) from %s (%d rows).",
+                            path,
+                            data.shape[0],
+                        )
+                        return data
+
+                # --- Proceed with 3-field expansion --- #
                 # Compute total rows
                 total_rows = int(num_tokens_arr.sum())
                 logger.info(f"Expanding manifest: total rows = {total_rows}")
@@ -109,6 +142,8 @@ class LocalActivationStore(ManifestActivationStore):
                 data = np.empty((total_rows, 2), dtype=np.uint32)
                 row_ptr = 0
                 for cid, ntok in zip(chunk_ids, num_tokens_arr):
+                    if ntok == 0:
+                        continue  # Skip empty chunks to avoid broadcast errors
                     data[row_ptr : row_ptr + ntok, 0] = cid  # chunk_id column
                     data[row_ptr : row_ptr + ntok, 1] = np.arange(ntok, dtype=np.uint32)  # row index within chunk
                     row_ptr += ntok
