@@ -1,11 +1,12 @@
 import torch
-from typing import Dict, Optional, Union, Tuple, List
+from typing import Dict, Optional, Union, Tuple, List, Any
 import logging
 
 from clt.config import CLTConfig
 from clt.models.base import BaseTranscoder
 
 from clt.models.activations import _apply_batch_topk_helper, _apply_token_topk_helper
+from clt.models.activations_local_global import _apply_batch_topk_local_global
 from clt.models.encoder import Encoder
 from clt.models.decoder import Decoder
 from clt.models.theta import ThetaManager
@@ -31,11 +32,13 @@ class CrossLayerTranscoder(BaseTranscoder):
         config: CLTConfig,
         process_group: Optional["ProcessGroup"],
         device: Optional[torch.device] = None,
+        profiler: Optional[Any] = None,
     ):
         super().__init__(config)
         self.process_group = process_group
         self.world_size = dist_ops.get_world_size(process_group)
         self.rank = dist_ops.get_rank(process_group)
+        self.profiler = profiler
 
         self.dtype = self._resolve_dtype(config.clt_dtype)
         if device is not None:
@@ -87,16 +90,23 @@ class CrossLayerTranscoder(BaseTranscoder):
         self,
         preactivations_dict: Dict[int, torch.Tensor],
     ) -> Dict[int, torch.Tensor]:
-        return _apply_batch_topk_helper(
-            preactivations_dict, self.config, self.device, self.dtype, self.rank, self.process_group
-        )
+        # Use optimized local-global approach for multi-GPU training
+        if self.world_size > 1:
+            return _apply_batch_topk_local_global(
+                preactivations_dict, self.config, self.device, self.dtype, self.rank, self.process_group, self.profiler
+            )
+        else:
+            # Single GPU uses original implementation
+            return _apply_batch_topk_helper(
+                preactivations_dict, self.config, self.device, self.dtype, self.rank, self.process_group, self.profiler
+            )
 
     def _apply_token_topk(
         self,
         preactivations_dict: Dict[int, torch.Tensor],
     ) -> Dict[int, torch.Tensor]:
         return _apply_token_topk_helper(
-            preactivations_dict, self.config, self.device, self.dtype, self.rank, self.process_group
+            preactivations_dict, self.config, self.device, self.dtype, self.rank, self.process_group, self.profiler
         )
 
     def encode(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
@@ -221,9 +231,21 @@ class CrossLayerTranscoder(BaseTranscoder):
                 return activations
 
             if self.config.activation_fn == "batchtopk":
-                activations = self._apply_batch_topk(preactivations_dict)
+                if self.profiler:
+                    with self.profiler.timer("batchtopk_activation") as timer:
+                        activations = self._apply_batch_topk(preactivations_dict)
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("batchtopk_activation", timer.elapsed)
+                else:
+                    activations = self._apply_batch_topk(preactivations_dict)
             elif self.config.activation_fn == "topk":
-                activations = self._apply_token_topk(preactivations_dict)
+                if self.profiler:
+                    with self.profiler.timer("topk_activation") as timer:
+                        activations = self._apply_token_topk(preactivations_dict)
+                    if hasattr(timer, 'elapsed'):
+                        self.profiler.record("topk_activation", timer.elapsed)
+                else:
+                    activations = self._apply_token_topk(preactivations_dict)
             else:
                 raise ValueError(f"Unexpected activation_fn '{self.config.activation_fn}' in BatchTopK/TokenTopK path.")
             return activations

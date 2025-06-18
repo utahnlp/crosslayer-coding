@@ -100,7 +100,7 @@ class CLTEvaluator:
             Metrics are organized into 'reconstruction', 'sparsity', 'dead_features',
             'layerwise'.
         """
-        mem_before_eval = 0
+        mem_before_eval = 0.0
         if torch.cuda.is_available() and self.device.type == "cuda":
             mem_before_eval = torch.cuda.memory_allocated(self.device) / (1024**2)
             elapsed_str = _format_elapsed_time(time.time() - self.start_time)
@@ -267,9 +267,9 @@ class CLTEvaluator:
                 recon_act_denorm = recon_act * std + mean
             # --- End De-normalisation ---
 
-            # Ensure shapes match (flatten if necessary)
-            target_flat = target_act_denorm.view(-1, target_act_denorm.shape[-1])
-            recon_flat = recon_act_denorm.view(-1, recon_act_denorm.shape[-1])
+            # Ensure shapes match (flatten if necessary) and up-cast to float32 for numerically stable metrics
+            target_flat = target_act_denorm.view(-1, target_act_denorm.shape[-1]).float()
+            recon_flat = recon_act_denorm.view(-1, recon_act_denorm.shape[-1]).float()
 
             if target_flat.shape != recon_flat.shape or target_flat.numel() == 0:
                 continue
