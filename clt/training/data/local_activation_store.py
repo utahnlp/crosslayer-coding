@@ -15,6 +15,13 @@ from .manifest_activation_store import ManifestActivationStore, _open_h5
 
 logger = logging.getLogger(__name__)
 
+# Helper to map torch dtypes to numpy dtypes for conversion
+TORCH_TO_NUMPY_DTYPE_MAP = {
+    torch.float32: np.float32,
+    torch.float16: np.float16,
+    torch.bfloat16: np.float32,  # NumPy doesn't have bfloat16, so we use float32 as an intermediate
+}
+
 
 class LocalActivationStore(ManifestActivationStore):
     """
@@ -182,7 +189,7 @@ class LocalActivationStore(ManifestActivationStore):
             return None
 
     @lru_cache(maxsize=64)
-    def _load_chunk(self, chunk_path: str, layer_key: str, data_type: str):
+    def _load_chunk(self, chunk_path: str, layer_key: str, data_type: str) -> np.ndarray:
         """Loads entire HDF5 chunk from disk and caches"""
 
         logger.debug(f"Fetching chunk {chunk_path} / {layer_key} / {data_type}")
@@ -240,11 +247,26 @@ class LocalActivationStore(ManifestActivationStore):
             else:
                 row_indices_h5 = row_indices
 
+            # PyTorch doesn't support from_buffer for bfloat16, so we can't create bfloat16 bytes.
+            # The conversion to bfloat16 must happen after the tensor is created.
+            # If the requested dtype is bfloat16, we'll load the data as float32 bytes.
+            if self.dtype == torch.bfloat16:
+                target_np_dtype = np.float32
+            else:
+                # e.g., str(torch.float32) -> "torch.float32" -> "float32"
+                dtype_str = str(self.dtype).split(".")[-1]
+                target_np_dtype = np.dtype(dtype_str)
+
             for i, lk in enumerate(layer_keys):
                 input_data = self._load_chunk(chunk_path, lk, "inputs")[row_indices_h5, :]
                 target_data = self._load_chunk(chunk_path, lk, "targets")[row_indices_h5, :]
-                bufs.append(input_data.tobytes())
-                bufs.append(target_data.tobytes())
+
+                # Convert to the target numpy dtype before getting bytes
+                input_data_converted = input_data.astype(target_np_dtype)
+                target_data_converted = target_data.astype(target_np_dtype)
+
+                bufs.append(input_data_converted.tobytes())
+                bufs.append(target_data_converted.tobytes())
             return b"".join(bufs)
         except KeyError as e:
             logger.error(f"Error accessing data within chunk {chunk_id} at {chunk_path}: Missing key {e}")

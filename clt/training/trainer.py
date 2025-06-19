@@ -160,22 +160,20 @@ class CLTTrainer:
 
         # Initialize profilers early (before model creation)
         self.profiler = TrainingProfiler(
-            enabled=self.training_config.enable_profiling,
-            log_interval=self.training_config.log_interval
+            enabled=self.training_config.enable_profiling, log_interval=self.training_config.log_interval
         )
         self.memory_profiler = CUDAMemoryProfiler(
             enabled=self.training_config.enable_profiling and torch.cuda.is_available()
         )
         self.dist_profiler = DistributedProfiler(
-            enabled=self.training_config.enable_profiling and self.distributed,
-            rank=self.rank
+            enabled=self.training_config.enable_profiling and self.distributed, rank=self.rank
         )
-        
+
         self.model = CrossLayerTranscoder(
-            clt_config, 
-            process_group=self.process_group, 
+            clt_config,
+            process_group=self.process_group,
             device=self.device,
-            profiler=self.profiler if self.training_config.enable_profiling else None
+            profiler=self.profiler if self.training_config.enable_profiling else None,
         )
 
         # --- Optionally convert model to FP16 (Step 8) ---
@@ -342,6 +340,7 @@ class CLTTrainer:
             (clt_config.num_layers, clt_config.num_features),
             device=self.device,
             dtype=torch.long,
+            requires_grad=False,  # Explicitly disable gradient tracking
         )
 
         # ------------------------------------------------------------------
@@ -448,7 +447,8 @@ class CLTTrainer:
                 dtype=torch.bool,
                 device=self.device,
             )
-        return self.n_forward_passes_since_fired > self.training_config.dead_feature_window
+        # Detach to prevent any computation graph references
+        return (self.n_forward_passes_since_fired > self.training_config.dead_feature_window).detach()
 
     def train(self, eval_every: int = 1000) -> CrossLayerTranscoder:
         """Train the CLT model.
@@ -589,7 +589,10 @@ class CLTTrainer:
                     # Get batch directly from the iterator (handles distributed sampling internally)
                     with self.profiler.timer("data_loading") as timer:
                         inputs, targets = next(self.activation_store)
-                    if hasattr(timer, 'elapsed'):
+                        # Detach inputs and targets to ensure no computation graph from previous iterations
+                        inputs = {k: v.detach() for k, v in inputs.items()}
+                        targets = {k: v.detach() for k, v in targets.items()}
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("data_loading", timer.elapsed)
                         logger.debug(f"Rank {self.rank} Step {step}: Getting batch took {timer.elapsed:.4f}s")
 
@@ -656,9 +659,9 @@ class CLTTrainer:
                     # Profile forward pass
                     with self.profiler.timer("forward_pass") as timer:
                         feature_activations_batch = self.model.get_feature_activations(inputs)
-                    if hasattr(timer, 'elapsed'):
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("forward_pass", timer.elapsed)
-                    
+
                     # Profile loss computation
                     with self.profiler.timer("loss_computation") as timer:
                         loss, loss_dict = self.loss_manager.compute_total_loss(
@@ -670,8 +673,13 @@ class CLTTrainer:
                             precomputed_activations=feature_activations_batch,
                             dead_neuron_mask=self.dead_neurons_mask,
                         )
-                    if hasattr(timer, 'elapsed'):
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("loss_computation", timer.elapsed)
+
+                # Detach loss components for logging to prevent retaining graph
+                loss_dict_detached = {
+                    k: v.detach().item() if isinstance(v, torch.Tensor) else v for k, v in loss_dict.items()
+                }
 
                 # --- Update Dead Neuron Counters --- (All ranks, counter is replicated)
                 # We need *full* feature activations *after* non-linearity
@@ -679,6 +687,9 @@ class CLTTrainer:
                     with self.profiler.timer("dead_neuron_update") as timer:
                         with torch.no_grad():
                             for layer_idx, layer_acts in feature_activations_batch.items():
+                                # Detach the activations to prevent retaining the computation graph
+                                layer_acts = layer_acts.detach()
+
                                 # Ensure layer index is within bounds of the counter tensor
                                 if layer_idx < self.n_forward_passes_since_fired.shape[0]:
                                     if layer_acts.numel() > 0:
@@ -686,7 +697,10 @@ class CLTTrainer:
                                         fired_mask_per_token = layer_acts > 1e-6
                                         fired_features_this_layer = fired_mask_per_token.any(dim=0)
 
-                                        if fired_features_this_layer.shape[0] == self.n_forward_passes_since_fired.shape[1]:
+                                        if (
+                                            fired_features_this_layer.shape[0]
+                                            == self.n_forward_passes_since_fired.shape[1]
+                                        ):
                                             self.n_forward_passes_since_fired[layer_idx] += 1
                                             self.n_forward_passes_since_fired[layer_idx][fired_features_this_layer] = 0
                                         else:
@@ -707,7 +721,7 @@ class CLTTrainer:
                                         logger.warning(
                                             f"Rank {self.rank}: layer_idx {layer_idx} out of bounds for n_forward_passes_since_fired (shape {self.n_forward_passes_since_fired.shape}). Skipping dead neuron update."
                                         )
-                    if hasattr(timer, 'elapsed'):
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("dead_neuron_update", timer.elapsed)
                 else:  # n_forward_passes_since_fired does not exist or is None
                     if not self.distributed or self.rank == 0:
@@ -728,7 +742,7 @@ class CLTTrainer:
                     # ---- Back-prop with gradient scaling ----
                     with self.profiler.timer("backward_pass") as timer:
                         self.scaler.scale(loss).backward()
-                    if hasattr(timer, 'elapsed'):
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("backward_pass", timer.elapsed)
 
                     # Unscale gradients before clipping and distributed averaging
@@ -739,7 +753,7 @@ class CLTTrainer:
                         with self.profiler.timer("gradient_sync") as timer:
                             with self.dist_profiler.profile_op("gradient_all_reduce"):
                                 average_shared_parameter_grads(self.model, self.world_size)
-                        if hasattr(timer, 'elapsed'):
+                        if hasattr(timer, "elapsed"):
                             self.profiler.record("gradient_sync", timer.elapsed)
 
                     # --- Gradient clipping (operates on unscaled gradients) --- #
@@ -749,21 +763,25 @@ class CLTTrainer:
                                 self.model.parameters(),
                                 self.training_config.gradient_clip_val,
                             )
-                        if hasattr(timer, 'elapsed'):
+                        if hasattr(timer, "elapsed"):
                             self.profiler.record("gradient_clipping", timer.elapsed)
 
                     # --- Optimizer step (scaler handles scaling/unscaling) ---
                     with self.profiler.timer("optimizer_step") as timer:
                         self.scaler.step(self.optimizer)
-                    if hasattr(timer, 'elapsed'):
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("optimizer_step", timer.elapsed)
 
                     # --- Update scaler for next iteration ---
                     self.scaler.update()
 
                     # --- Invalidate Caches (moved after optimizer step) --- #
-                    if hasattr(self.model, "_cached_decoder_norms"):
-                        self.model._cached_decoder_norms = None
+                    # Ensure we invalidate any cached decoder norms to avoid retaining graphs across iterations
+                    if hasattr(self.model, "decoder_module") and hasattr(
+                        self.model.decoder_module, "_cached_decoder_norms"
+                    ):
+                        # The buffer is optional; resetting to None breaks the reference to the previous graph.
+                        self.model.decoder_module._cached_decoder_norms = None  # type: ignore[assignment]
 
                 # --- Sync Dead Neuron Counters --- #
                 if (
@@ -774,8 +792,10 @@ class CLTTrainer:
                 ):
                     with self.profiler.timer("dead_neuron_sync") as timer:
                         with self.dist_profiler.profile_op("dead_neuron_all_reduce"):
-                            dist.all_reduce(self.n_forward_passes_since_fired, op=dist.ReduceOp.MIN, group=self.process_group)
-                    if hasattr(timer, 'elapsed'):
+                            dist.all_reduce(
+                                self.n_forward_passes_since_fired, op=dist.ReduceOp.MIN, group=self.process_group
+                            )
+                    if hasattr(timer, "elapsed"):
                         self.profiler.record("dead_neuron_sync", timer.elapsed)
 
                 # --- Scheduler step --- (All ranks)
@@ -785,10 +805,10 @@ class CLTTrainer:
                 # --- Update progress bar --- (Rank 0 only)
                 if isinstance(pbar, tqdm):
                     description = (
-                        f"Loss: {loss_dict.get('total', float('nan')):.4f} "
-                        f"(R: {loss_dict.get('reconstruction', float('nan')):.4f} "
-                        f"S: {loss_dict.get('sparsity', float('nan')):.4f} "
-                        f"P: {loss_dict.get('preactivation', float('nan')):.4f})"
+                        f"Loss: {loss_dict_detached.get('total', float('nan')):.4f} "
+                        f"(R: {loss_dict_detached.get('reconstruction', float('nan')):.4f} "
+                        f"S: {loss_dict_detached.get('sparsity', float('nan')):.4f} "
+                        f"P: {loss_dict_detached.get('preactivation', float('nan')):.4f})"
                     )
                     pbar.set_description(description)
                     # Force update to display progress
@@ -801,7 +821,10 @@ class CLTTrainer:
                 current_lambda_for_log = self.loss_manager.get_current_sparsity_lambda()
                 # Removed broad try-except around metric_logger.log_training_step
                 self.metric_logger.log_training_step(
-                    step, loss_dict, current_lr=current_lr_for_log, current_sparsity_lambda=current_lambda_for_log
+                    step,
+                    loss_dict_detached,
+                    current_lr=current_lr_for_log,
+                    current_sparsity_lambda=current_lambda_for_log,
                 )
 
                 step_duration = time.monotonic() - step_start_time
@@ -828,71 +851,72 @@ class CLTTrainer:
                         with self.dist_profiler.profile_op("eval_barrier"):
                             dist.barrier()  # Sync before evaluation starts so that all ranks enter together
 
-                    # Compute evaluation metrics on all ranks to keep collective ops aligned
-                    # Wrap the evaluation logic in autocast
-                    with self.profiler.timer("evaluation") as timer:
-                        with torch.autocast(
-                            device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled
-                        ):
-                            current_dead_mask = self.dead_neurons_mask.detach().clone()
-                            eval_metrics = self.evaluator.compute_metrics(
-                                inputs,  # These inputs are from the current training batch
-                                targets,  # These targets are from the current training batch
-                                dead_neuron_mask=current_dead_mask,
-                            )
-                    if hasattr(timer, 'elapsed'):
-                        self.profiler.record("evaluation", timer.elapsed)
+                    # Wrap the entire evaluation logic in no_grad to prevent graph pollution
+                    with torch.no_grad():
+                        # Compute evaluation metrics on all ranks to keep collective ops aligned
+                        # Wrap the evaluation logic in autocast
+                        with self.profiler.timer("evaluation") as timer:
+                            with torch.autocast(
+                                device_type=self.device.type, dtype=self.autocast_dtype, enabled=self.autocast_enabled
+                            ):
+                                current_dead_mask = self.dead_neurons_mask.detach().clone()
+                                # Detach inputs and targets to prevent retaining computation graph
+                                inputs_detached = {k: v.detach() for k, v in inputs.items()}
+                                targets_detached = {k: v.detach() for k, v in targets.items()}
+                                eval_metrics = self.evaluator.compute_metrics(
+                                    inputs_detached,  # These inputs are from the current training batch
+                                    targets_detached,  # These targets are from the current training batch
+                                    dead_neuron_mask=current_dead_mask,
+                                )
+                        if hasattr(timer, "elapsed"):
+                            self.profiler.record("evaluation", timer.elapsed)
 
-                        # --- Log per-layer standard deviation of pre-activations ---
-                        # This requires getting the pre-activations first.
-                        # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
-                        preactivations_eval_dict, _ = self.model._encode_all_layers(inputs)
-                        layerwise_preact_std_dev: Dict[str, float] = {}
-                        if preactivations_eval_dict:
-                            for layer_idx, preact_tensor in preactivations_eval_dict.items():
-                                if preact_tensor.numel() > 0:
-                                    # Calculate std dev of all elements in the preactivation tensor for this layer
-                                    std_dev_val = preact_tensor.std().item()
-                                    layerwise_preact_std_dev[f"layer_{layer_idx}"] = std_dev_val
-                                else:
-                                    layerwise_preact_std_dev[f"layer_{layer_idx}"] = float("nan")  # Or 0.0
+                            # --- Log per-layer standard deviation of pre-activations ---
+                            # This requires getting the pre-activations first.
+                            # _encode_all_layers returns: preactivations_dict, original_shapes_info, device, dtype
+                            preactivations_eval_dict, _ = self.model._encode_all_layers(inputs_detached)
+                            layerwise_preact_std_dev: Dict[str, float] = {}
+                            if preactivations_eval_dict:
+                                for layer_idx, preact_tensor in preactivations_eval_dict.items():
+                                    if preact_tensor.numel() > 0:
+                                        # Calculate std dev of all elements in the preactivation tensor for this layer
+                                        std_dev_val = preact_tensor.std().item()
+                                        layerwise_preact_std_dev[f"layer_{layer_idx}"] = std_dev_val
+                                    else:
+                                        layerwise_preact_std_dev[f"layer_{layer_idx}"] = float("nan")  # Or 0.0
 
-                        # Add to eval_metrics for WandB logging
-                        if layerwise_preact_std_dev:
-                            eval_metrics["layerwise/preactivation_std_dev"] = layerwise_preact_std_dev
-                        # --- End logging pre-activation std dev ---
+                            # Add to eval_metrics for WandB logging
+                            if layerwise_preact_std_dev:
+                                eval_metrics["layerwise/preactivation_std_dev"] = layerwise_preact_std_dev
+                            # --- End logging pre-activation std dev ---
 
-                        # Optionally compute and log sparsity diagnostics (can be slow).
-                        # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
-                        # internally calls `get_decoder_norms`, which performs distributed all-reduces.
-                        # We therefore compute the diagnostics on **all** ranks to keep the NCCL
-                        # collectives aligned, but we still only merge the returned values into
-                        # `eval_metrics` and log them on rank 0.
-                        if self.training_config.compute_sparsity_diagnostics:
-                            # feature_activations_batch is from the training step, might be stale or not what's desired for eval
-                            # For eval, it's better to recompute activations if needed by diagnostics, or pass inputs.
-                            # Assuming compute_sparsity_diagnostics can take `inputs` and get activations internally
-                            # or that `feature_activations_batch` is intentionally used here.
-                            # If `compute_sparsity_diagnostics` relies on activations from the autocasted `model.get_feature_activations`
-                            # it should be called *inside* this autocast block if it does its own forward pass.
-                            # The current `feature_activations_batch` was computed *outside* this specific eval autocast block
-                            # (it was for the training step loss). Let's assume `compute_sparsity_diagnostics` handles its own forward if needed.
-                            # For safety, if `compute_sparsity_diagnostics` does a forward pass, it should be inside an autocast.
-                            # The plan says "wrap the forward in the same autocast context".
-                            # `compute_sparsity_diagnostics` internally calls `model.get_decoder_norms()` which does not do a forward pass on inputs,
-                            # but it does operate on model parameters which might be .half().
-                            # `feature_activations_batch` was from the training step, it is already autocasted if AMP was on.
-                            sparsity_diag_metrics = compute_sparsity_diagnostics(
-                                model=self.model,
-                                training_config=self.training_config,
-                                feature_activations=feature_activations_batch,
-                            )
-                            # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
-                            if (not self.distributed) or (self.rank == 0):
-                                if sparsity_diag_metrics:
-                                    eval_metrics.update(sparsity_diag_metrics)
+                            # Optionally compute and log sparsity diagnostics (can be slow).
+                            # IMPORTANT: every rank must execute compute_sparsity_diagnostics because it
+                            # internally calls `get_decoder_norms`, which performs distributed all-reduces.
+                            # We therefore compute the diagnostics on **all** ranks to keep the NCCL
+                            # collectives aligned, but we still only merge the returned values into
+                            # `eval_metrics` and log them on rank 0.
+                            if self.training_config.compute_sparsity_diagnostics:
+                                # Detach the activations from the current computation graph before using them in diagnostics
+                                # to prevent the "backward through the graph a second time" error.
+                                feature_activations_batch_detached = (
+                                    {k: v.detach() for k, v in feature_activations_batch.items()}
+                                    if feature_activations_batch is not None
+                                    else None
+                                )
 
-                    # --- END of autocast block for evaluation ---
+                                if feature_activations_batch_detached is not None:
+                                    sparsity_diag_metrics = compute_sparsity_diagnostics(
+                                        model=self.model,
+                                        training_config=self.training_config,
+                                        feature_activations=feature_activations_batch_detached,
+                                    )
+                                    # Only rank 0 merges & logs the diagnostics, preventing duplicate WandB entries.
+                                    if (not self.distributed) or (self.rank == 0):
+                                        if sparsity_diag_metrics:
+                                            eval_metrics.update(sparsity_diag_metrics)
+
+                        # --- END of autocast block for evaluation ---
 
                     if not self.distributed or self.rank == 0:
                         # Store evaluation metrics (for saving to JSON) - Handled by MetricLogger
@@ -946,17 +970,17 @@ class CLTTrainer:
                     self.memory_profiler.snapshot(f"Step {step}")
                     self.profiler.step()
 
-            # --- Explicitly delete tensors at the very end of the loop iteration --- #
-            # Do this on all ranks
-            try:
-                del inputs
-                del targets
-                if "loss" in locals() and loss is not None:
-                    del loss
-                if "feature_activations_batch" in locals():
-                    del feature_activations_batch
-            except NameError:
-                pass
+                # --- Explicitly delete tensors at the very end of the loop iteration --- #
+                # Do this on all ranks
+                try:
+                    del inputs
+                    del targets
+                    if "loss" in locals() and loss is not None:
+                        del loss
+                    if "feature_activations_batch" in locals():
+                        del feature_activations_batch
+                except NameError:
+                    pass
 
         except KeyboardInterrupt:
             if not self.distributed or self.rank == 0:
@@ -1074,14 +1098,14 @@ class CLTTrainer:
 
         # Log final profiling summaries
         if not self.distributed or self.rank == 0:
-            logger.info("\n" + "="*80)
+            logger.info("\n" + "=" * 80)
             logger.info("FINAL PROFILING SUMMARY")
-            logger.info("="*80)
+            logger.info("=" * 80)
             self.profiler.log_summary()
             self.memory_profiler.log_summary()
             if self.distributed:
                 self.dist_profiler.log_summary()
-            logger.info("="*80)
+            logger.info("=" * 80)
 
         # Clean up distributed process group
         if self.distributed:

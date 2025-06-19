@@ -70,7 +70,7 @@ def _test_column_parallel_distributed_forward(rank, world_size):
 
     # Each rank has the same seed for weights
     torch.manual_seed(42)
-    layer = ColumnParallelLinear(in_features, out_features, process_group=None, device=device)
+    layer = ColumnParallelLinear(in_features, out_features, process_group=dist.group.WORLD, device=device)
 
     # Each rank gets the full input tensor
     torch.manual_seed(123)
@@ -83,12 +83,15 @@ def _test_column_parallel_distributed_forward(rank, world_size):
 
     # A more robust check would involve gathering the full weight matrix.
     # This requires gathering the full weight matrix manually.
-    full_weight = torch.zeros(out_features, in_features, device=device)
-    dist.all_gather_into_tensor(full_weight, layer.weight.data)
+    weight_slices = [torch.zeros_like(layer.weight) for _ in range(world_size)]
+    dist.all_gather(weight_slices, layer.weight.data)
+    full_weight = torch.cat(weight_slices, dim=0)
 
     full_bias = torch.zeros(out_features, device=device)
     if layer.bias_param is not None:
-        dist.all_gather_into_tensor(full_bias, layer.bias_param.data)
+        bias_slices = [torch.zeros_like(layer.bias_param) for _ in range(world_size)]
+        dist.all_gather(bias_slices, layer.bias_param.data)
+        full_bias = torch.cat(bias_slices, dim=0)
 
     manual_output = torch.matmul(input_tensor, full_weight.t()) + full_bias
     torch.testing.assert_close(output, manual_output, rtol=1e-4, atol=1e-5)
@@ -102,7 +105,7 @@ def _test_row_parallel_distributed_forward(rank, world_size):
     layer = RowParallelLinear(
         in_features,
         out_features,
-        process_group=None,
+        process_group=dist.group.WORLD,
         d_model_for_init=out_features,
         num_layers_for_init=1,
         device=device,

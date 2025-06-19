@@ -2,13 +2,14 @@ from __future__ import annotations
 import torch
 import os
 import torch.distributed as dist
-from torch.distributed.checkpoint.state_dict_saver import save_state_dict
-from torch.distributed.checkpoint.state_dict_loader import load_state_dict
-from torch.distributed.checkpoint.default_planner import DefaultSavePlanner, DefaultLoadPlanner
-from torch.distributed.checkpoint.filesystem import FileSystemWriter, FileSystemReader
-from typing import Optional, Union, Dict, Any, TYPE_CHECKING
 from safetensors.torch import save_file as save_safetensors_file, load_file as load_safetensors_file
+from torch.distributed.checkpoint.state_dict_loader import load_state_dict
+from torch.distributed.checkpoint.default_planner import DefaultLoadPlanner
+from torch.distributed.checkpoint.filesystem import FileSystemReader
+from typing import Optional, Union, Dict, Any, TYPE_CHECKING
 import logging
+import shutil
+from pathlib import Path
 
 # Import for type hinting, moved outside TYPE_CHECKING for runtime availability
 from clt.training.wandb_logger import WandBLogger, DummyWandBLogger
@@ -67,12 +68,15 @@ class CheckpointManager:
         # For example: trainer_state_to_save["step"] should be === step passed to this function.
         # We will save this entire dictionary.
 
-        if not self.distributed:  # Non-distributed save
-            os.makedirs(self.log_dir, exist_ok=True)
+        # Ensure log_dir exists
+        os.makedirs(self.log_dir, exist_ok=True)
+
+        # Non-distributed: save model, trainer state, and store state directly
+        if not self.distributed:
             model_checkpoint_path = os.path.join(self.log_dir, f"clt_checkpoint_{step}.safetensors")
             latest_model_path = os.path.join(self.log_dir, "clt_checkpoint_latest.safetensors")
-            store_checkpoint_path = os.path.join(self.log_dir, f"activation_store_checkpoint_{step}.pt")
-            latest_store_path = os.path.join(self.log_dir, "activation_store_checkpoint_latest.pt")
+            store_checkpoint_path = os.path.join(self.log_dir, f"activation_store_{step}.pt")
+            latest_store_path = os.path.join(self.log_dir, "activation_store_latest.pt")
             trainer_state_path = os.path.join(self.log_dir, f"trainer_state_{step}.pt")
             latest_trainer_state_path = os.path.join(self.log_dir, "trainer_state_latest.pt")
 
@@ -97,34 +101,36 @@ class CheckpointManager:
         # --- Distributed Save ---
         checkpoint_dir = os.path.join(self.log_dir, f"step_{step}")
         latest_checkpoint_dir = os.path.join(self.log_dir, "latest")
-        
+
         # Create directories if they don't exist (all ranks should do this)
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(latest_checkpoint_dir, exist_ok=True)
-        
+
         # Ensure all ranks see the directories before proceeding
         if self.distributed:
             dist.barrier()
 
         # Save model state dict using distributed checkpointing
         model_state_dict_for_dist_save = self.model.state_dict()
-        
-        # Option 1: Save per-rank checkpoints separately for debugging
+
+        # Save per-rank checkpoints separately (workaround for PyTorch distributed checkpoint bug)
         rank_checkpoint_path = os.path.join(checkpoint_dir, f"rank_{self.rank}_model.pt")
         latest_rank_checkpoint_path = os.path.join(latest_checkpoint_dir, f"rank_{self.rank}_model.pt")
-        
+
         try:
-            # Save individual rank files
+            # Save individual rank files (workaround for PyTorch distributed checkpoint bug)
+            # CRITICAL: Each rank must get its OWN model's state dict to avoid the weight duplication bug
+            # where all ranks would save rank 0's weights. See scripts/debug/distributed_checkpoint_bug_analysis.md
             torch.save(model_state_dict_for_dist_save, rank_checkpoint_path)
             torch.save(model_state_dict_for_dist_save, latest_rank_checkpoint_path)
             logger.info(f"Rank {self.rank}: Saved individual checkpoint to {rank_checkpoint_path}")
-            
+
             # Debug: Check what we saved
             enc_key = "encoder_module.encoders.0.weight"
             if enc_key in model_state_dict_for_dist_save:
                 checksum = torch.sum(torch.abs(model_state_dict_for_dist_save[enc_key])).item()
                 logger.info(f"Rank {self.rank}: Saved {enc_key} with checksum {checksum:.6f}")
-            
+
             # Skip saving distributed checkpoint (.distcp files) to save space
             # We're using individual rank files instead due to PyTorch bug
             pass
@@ -136,7 +142,7 @@ class CheckpointManager:
         # Wait for all ranks to save their individual checkpoints
         if self.distributed:
             dist.barrier()
-        
+
         if self.rank == 0:
             # Save activation store
             store_checkpoint_path = os.path.join(checkpoint_dir, "activation_store.pt")
@@ -146,12 +152,12 @@ class CheckpointManager:
                 torch.save(self.activation_store.state_dict(), latest_store_path)
             except Exception as e:
                 logger.warning(f"Rank 0: Warning: Failed to save activation store state at step {step}: {e}")
-            
+
             # Merge individual rank checkpoints into consolidated model
             # This is a workaround for the PyTorch distributed checkpoint bug
             try:
                 logger.info(f"Rank 0: Merging {self.world_size} rank checkpoints...")
-                
+
                 # Load all rank state dicts
                 state_dicts = []
                 for rank in range(self.world_size):
@@ -161,13 +167,13 @@ class CheckpointManager:
                         state_dicts.append(state_dict)
                     else:
                         logger.error(f"Rank 0: Missing rank checkpoint: {rank_path}")
-                        state_dicts = None
+                        state_dicts = []  # Re-initialize as empty list to break and fail gracefully
                         break
-                
+
                 if state_dicts and len(state_dicts) == self.world_size:
                     # Merge the state dicts
                     merged_state = self._merge_tensor_parallel_weights(state_dicts)
-                    
+
                     # Save as safetensors
                     model_safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
                     latest_model_safetensors_path = os.path.join(latest_checkpoint_dir, "model.safetensors")
@@ -175,7 +181,7 @@ class CheckpointManager:
                     save_safetensors_file(merged_state, latest_model_safetensors_path)
                     logger.info(f"Rank 0: Saved merged model to {model_safetensors_path}")
                 else:
-                    logger.error(f"Rank 0: Failed to merge rank checkpoints - missing files")
+                    logger.error("Rank 0: Failed to merge rank checkpoints - missing files")
                     # Fall back to single rank save
                     model_safetensors_path = os.path.join(checkpoint_dir, "model.safetensors")
                     latest_model_safetensors_path = os.path.join(latest_checkpoint_dir, "model.safetensors")
@@ -216,7 +222,7 @@ class CheckpointManager:
 
         if self.distributed:
             dist.barrier()
-        
+
         # Clean up old checkpoints to save space
         if self.rank == 0 and self.keep_n_checkpoints > 0:
             self._cleanup_old_checkpoints()
@@ -256,11 +262,11 @@ class CheckpointManager:
                 trainer_state_fname = ""
 
                 if base_name == "clt_checkpoint_latest.safetensors":
-                    store_checkpoint_fname = "activation_store_checkpoint_latest.pt"
+                    store_checkpoint_fname = "activation_store_latest.pt"
                     trainer_state_fname = "trainer_state_latest.pt"
                 elif base_name.startswith("clt_checkpoint_") and base_name.endswith(".safetensors"):
                     step_str = base_name.replace("clt_checkpoint_", "").replace(".safetensors", "")
-                    store_checkpoint_fname = f"activation_store_checkpoint_{step_str}.pt"
+                    store_checkpoint_fname = f"activation_store_{step_str}.pt"
                     trainer_state_fname = f"trainer_state_{step_str}.pt"
 
                 if not store_checkpoint_fname or not trainer_state_fname:
@@ -430,17 +436,17 @@ class CheckpointManager:
                 else:  # for older checkpoints that might not have extension in prefix string
                     store_basename_prefix = store_basename_prefix + ".pt"
 
-                # Ensure it correctly forms activation_store_checkpoint_{step}.pt
+                # Ensure it correctly forms activation_store_{step}.pt
                 if "latest" in basename:
-                    store_basename = "activation_store_checkpoint_latest.pt"
+                    store_basename = "activation_store_latest.pt"
                 else:
                     # Extract step from basename like clt_checkpoint_100.safetensors -> 100
                     step_str = basename.split("_")[-1].split(".")[0]
-                    store_basename = f"activation_store_checkpoint_{step_str}.pt"
+                    store_basename = f"activation_store_{step_str}.pt"
                 store_checkpoint_path = os.path.join(dirname, store_basename)
             # No change for clt_checkpoint_latest.pt because it's specific enough
             elif basename == "clt_checkpoint_latest.pt" or basename == "clt_checkpoint_latest.safetensors":
-                store_checkpoint_path = os.path.join(dirname, "activation_store_checkpoint_latest.pt")
+                store_checkpoint_path = os.path.join(dirname, "activation_store_latest.pt")
             else:
                 store_checkpoint_path = None
 
@@ -458,21 +464,20 @@ class CheckpointManager:
             logger.warning(
                 f"Warning: Activation store checkpoint path not found or specified: {store_checkpoint_path}. Store state not loaded."
             )
-    
+
     def _merge_tensor_parallel_weights(self, state_dicts: list) -> Dict[str, torch.Tensor]:
         """
         Merge tensor-parallel weights from multiple ranks into a single state dict.
         This is a workaround for the PyTorch distributed checkpoint bug.
         """
         merged_state = {}
-        world_size = len(state_dicts)
-        
+
         # Get all parameter names from first rank
         param_names = list(state_dicts[0].keys())
-        
+
         for name in param_names:
             tensors = [sd[name] for sd in state_dicts]
-            
+
             # Check if this is a tensor-parallel weight that needs concatenation
             if "encoder_module.encoders" in name:
                 if "weight" in name:
@@ -484,28 +489,25 @@ class CheckpointManager:
                 else:
                     # Other encoder parameters
                     merged_state[name] = tensors[0]
-                
+
             elif "decoder_module.decoders" in name and "weight" in name:
                 # Decoder weights are sharded along dim 1 (input features)
                 merged_state[name] = torch.cat(tensors, dim=1)
-                
+
             elif "log_threshold" in name:
                 # For BatchTopK threshold, concatenate the per-layer thresholds
                 merged_state[name] = torch.cat(tensors, dim=1)
-                
+
             else:
                 # For replicated parameters (biases, layer norms, etc.), use rank 0's version
                 merged_state[name] = tensors[0]
-        
+
         return merged_state
-    
+
     def _cleanup_old_checkpoints(self):
         """Remove old checkpoints to save disk space, keeping only the last N."""
-        import shutil
-        from pathlib import Path
-        
         log_path = Path(self.log_dir)
-        
+
         # Find all step directories
         step_dirs = []
         for item in log_path.iterdir():
@@ -515,14 +517,14 @@ class CheckpointManager:
                     step_dirs.append((step_num, item))
                 except ValueError:
                     continue
-        
+
         # Sort by step number
         step_dirs.sort(key=lambda x: x[0])
-        
+
         # Keep only the last N checkpoints
         if len(step_dirs) > self.keep_n_checkpoints:
-            dirs_to_remove = step_dirs[:-self.keep_n_checkpoints]
-            
+            dirs_to_remove = step_dirs[: -self.keep_n_checkpoints]
+
             for step_num, dir_path in dirs_to_remove:
                 try:
                     shutil.rmtree(dir_path)

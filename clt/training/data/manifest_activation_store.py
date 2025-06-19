@@ -149,12 +149,9 @@ class ChunkRowSampler(Sampler):
             self.batches_yielded_this_epoch = 0
 
     def __iter__(self):
-        # Reset iteration state based on strategy
-        if self.sampling_strategy == "sequential":
-            self.current_chunk_idx_in_order = 0
-            self.current_row_offset_in_chunk = 0
-        elif self.sampling_strategy == "random_chunk":
-            self.batches_yielded_this_epoch = 0
+        # The state (e.g., current position in iteration) is managed by the
+        # attributes set during __init__ or load_state_dict.
+        # This method just needs to return self so that the object is an iterator.
         return self
 
     def __next__(self):
@@ -889,24 +886,29 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         final_batch_inputs: Dict[int, torch.Tensor] = {li: torch.cat(tensors) for li, tensors in layer_inputs.items()}
         final_batch_targets: Dict[int, torch.Tensor] = {li: torch.cat(tensors) for li, tensors in layer_targets.items()}
 
-        # 5. Apply Normalization (if enabled)
+        # 5. Apply Normalization (if enabled) and Final Dtype Conversion
         if self.apply_normalization:
             log_stats_this_batch = {}
             for li in self.layer_indices:
-                if li == 0 and final_batch_inputs[li].numel() > 0:
-                    inp_before = final_batch_inputs[li]
-                    log_stats_this_batch["inp_mean_before"] = inp_before.float().mean().item()
-                    log_stats_this_batch["inp_std_before"] = inp_before.float().std().item()
+                # Always convert to float32 for normalization arithmetic
+                inputs_li = final_batch_inputs[li].float()
+                targets_li = final_batch_targets[li].float()
+
+                if li == 0 and inputs_li.numel() > 0:
+                    log_stats_this_batch["inp_mean_before"] = inputs_li.mean().item()
+                    log_stats_this_batch["inp_std_before"] = inputs_li.std().item()
                     if li in self.mean_in:
                         log_stats_this_batch["target_mean_in"] = self.mean_in[li].mean().item()
                         log_stats_this_batch["target_std_in"] = self.std_in[li].mean().item()
 
                 if li in self.mean_in and li in self.std_in:
-                    final_batch_inputs[li] = (final_batch_inputs[li].float() - self.mean_in[li]) / self.std_in[li]
-                    final_batch_inputs[li] = final_batch_inputs[li].to(self.dtype)
+                    inputs_li = (inputs_li - self.mean_in[li]) / self.std_in[li]
                 if li in self.mean_tg and li in self.std_tg:
-                    final_batch_targets[li] = (final_batch_targets[li].float() - self.mean_tg[li]) / self.std_tg[li]
-                    final_batch_targets[li] = final_batch_targets[li].to(self.dtype)
+                    targets_li = (targets_li - self.mean_tg[li]) / self.std_tg[li]
+
+                # Convert to final target dtype *after* normalization
+                final_batch_inputs[li] = inputs_li.to(self.dtype)
+                final_batch_targets[li] = targets_li.to(self.dtype)
 
                 if li == 0 and final_batch_inputs[li].numel() > 0:
                     inp_after = final_batch_inputs[li]
@@ -915,6 +917,14 @@ class ManifestActivationStore(BaseActivationStore, ABC):
 
             if log_stats_this_batch:
                 logger.debug(f"Normalization Stats (Layer 0): {log_stats_this_batch}")
+        else:
+            # If no normalization, just ensure final dtype is correct.
+            # This is where the bfloat16 conversion happens safely.
+            for li in self.layer_indices:
+                if final_batch_inputs[li].dtype != self.dtype:
+                    final_batch_inputs[li] = final_batch_inputs[li].to(self.dtype)
+                if final_batch_targets[li].dtype != self.dtype:
+                    final_batch_targets[li] = final_batch_targets[li].to(self.dtype)
 
         parse_duration = time.monotonic() - parse_start_time
         total_duration = time.monotonic() - fetch_start_time
