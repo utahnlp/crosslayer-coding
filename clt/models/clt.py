@@ -6,7 +6,7 @@ from clt.config import CLTConfig
 from clt.models.base import BaseTranscoder
 
 from clt.models.activations import _apply_batch_topk_helper, _apply_token_topk_helper
-from clt.models.activations_local_global import _apply_batch_topk_local_global
+from clt.models.activations_hierarchical import _apply_batch_topk_local_global
 from clt.models.encoder import Encoder
 from clt.models.decoder import Decoder
 from clt.models.theta import ThetaManager

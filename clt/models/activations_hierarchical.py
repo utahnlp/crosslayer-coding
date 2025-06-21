@@ -117,10 +117,12 @@ def _apply_batch_topk_local_global(
         gathered_values_norm = [torch.zeros_like(local_top_values_norm) for _ in range(world_size)]
         gathered_indices = [torch.zeros_like(local_top_indices) for _ in range(world_size)]
         
-        if hasattr(profiler, 'dist_profiler') and profiler.dist_profiler:
-            with profiler.dist_profiler.profile_op("batchtopk_allgather"):
+        if profiler:
+            with profiler.timer("batchtopk_allgather") as timer:
                 dist_ops.all_gather(gathered_values_norm, local_top_values_norm, group=process_group)
                 dist_ops.all_gather(gathered_indices, local_top_indices, group=process_group)
+            if hasattr(timer, 'elapsed'):
+                profiler.record("batchtopk_allgather", timer.elapsed)
         else:
             dist_ops.all_gather(gathered_values_norm, local_top_values_norm, group=process_group)
             dist_ops.all_gather(gathered_indices, local_top_indices, group=process_group)

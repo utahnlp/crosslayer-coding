@@ -34,6 +34,10 @@ class CLTConfig:
     tl_input_template: Optional[str] = None  # TransformerLens hook point pattern before MLP
     tl_output_template: Optional[str] = None  # TransformerLens hook point pattern after MLP
     # context_size: Optional[int] = None
+    
+    # Performance optimization parameters
+    batchtopk_oversample_factor: int = 4  # Oversampling factor for hierarchical BatchTopK
+    use_fused_batchtopk: bool = False  # Whether to use fused BatchTopK implementation
 
     def __post_init__(self):
         """Validate configuration parameters."""

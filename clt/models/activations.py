@@ -304,6 +304,9 @@ def _apply_batch_topk_helper(
 
     mask_shape = concatenated_preactivations_original.shape
     mask = torch.empty(mask_shape, dtype=torch.bool, device=device)
+    
+    # Check if we should use fused implementation (only for single GPU)
+    use_fused = getattr(config, 'use_fused_batchtopk', False) and world_size == 1
 
     if world_size > 1:
         if rank == 0:
@@ -332,19 +335,40 @@ def _apply_batch_topk_helper(
             else:
                 dist_ops.broadcast(mask, src=0, group=process_group)
     else:
-        if profiler:
-            with profiler.timer("batchtopk_compute_mask") as timer:
+        if use_fused:
+            # Import here to avoid circular dependencies
+            from clt.models.activations_fused import FusedBatchTopK
+            
+            if profiler:
+                with profiler.timer("batchtopk_fused") as timer:
+                    # Apply fused BatchTopK directly
+                    activated_concatenated = FusedBatchTopK.apply(
+                        concatenated_preactivations_original, k_val, True, concatenated_preactivations_normalized
+                    )
+                    mask = (activated_concatenated != 0)  # Create mask for compatibility
+                if hasattr(timer, 'elapsed'):
+                    profiler.record("batchtopk_fused", timer.elapsed)
+            else:
+                activated_concatenated = FusedBatchTopK.apply(
+                    concatenated_preactivations_original, k_val, True, concatenated_preactivations_normalized
+                )
+                mask = (activated_concatenated != 0)
+        else:
+            if profiler:
+                with profiler.timer("batchtopk_compute_mask") as timer:
+                    mask = BatchTopK._compute_mask(
+                        concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
+                    )
+                if hasattr(timer, 'elapsed'):
+                    profiler.record("batchtopk_compute_mask", timer.elapsed)
+            else:
                 mask = BatchTopK._compute_mask(
                     concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
                 )
-            if hasattr(timer, 'elapsed'):
-                profiler.record("batchtopk_compute_mask", timer.elapsed)
-        else:
-            mask = BatchTopK._compute_mask(
-                concatenated_preactivations_original, k_val, concatenated_preactivations_normalized
-            )
 
-    activated_concatenated = concatenated_preactivations_original * mask.to(dtype)
+    # Only apply mask if not using fused (fused already returns masked output)
+    if not use_fused:
+        activated_concatenated = concatenated_preactivations_original * mask.to(dtype)
 
     activations_dict: Dict[int, torch.Tensor] = {}
     current_total_feature_offset = 0
