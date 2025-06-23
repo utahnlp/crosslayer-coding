@@ -209,6 +209,8 @@ clt_smoke_output_remote_wandb/
 wandb/
 scripts/debug
 scripts/optimization
+sparsify/
+clt-training/
 
 # models
 *.pt

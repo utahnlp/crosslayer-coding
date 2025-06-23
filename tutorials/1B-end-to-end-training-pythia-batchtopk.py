@@ -194,6 +194,7 @@ training_config = TrainingConfig(
     max_features_for_diag_hist=1000,  # optional cap per layer
     checkpoint_interval=500,
     dead_feature_window=200,
+    p
     # WandB (Optional)
     enable_wandb=True,
     wandb_project="clt-hp-sweeps-pythia-70m",

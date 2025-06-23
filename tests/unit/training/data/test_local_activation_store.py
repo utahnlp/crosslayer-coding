@@ -1,5 +1,6 @@
 import torch
 from pathlib import Path
+import numpy as np
 
 from clt.training.data.local_activation_store import LocalActivationStore
 
@@ -112,3 +113,41 @@ class TestLocalActivationStore:
         # The batch from the resumed store should match the next batch from the original
         for i in store1.layer_indices:
             torch.testing.assert_close(batch2_inputs[i], expected_batch2_inputs[i])
+
+    def test_layer_data_integrity(self, tmp_local_dataset: Path):
+        """Test that each layer's data is distinct and not mixed up."""
+        store = LocalActivationStore(
+            dataset_path=str(tmp_local_dataset),
+            train_batch_size_tokens=16,
+            dtype="float16",
+        )
+
+        inputs, targets = store.get_batch()
+
+        # Verify each layer has distinct data
+        # The fixture creates random data: inputs in [0, 10), targets in [0, 5)
+        for layer_id in range(store.num_layers):
+            layer_inputs = inputs[layer_id].cpu().numpy()
+            layer_targets = targets[layer_id].cpu().numpy()
+
+            # Basic sanity checks on the data
+            assert layer_inputs.shape == (16, store.d_model), f"Layer {layer_id} inputs have wrong shape"
+            assert layer_targets.shape == (16, store.d_model), f"Layer {layer_id} targets have wrong shape"
+
+            # Check that values are in reasonable ranges (inputs: [0, 10), targets: [0, 5))
+            assert layer_inputs.min() >= 0, f"Layer {layer_id} inputs have negative values"
+            assert layer_inputs.max() < 15, f"Layer {layer_id} inputs have unexpectedly large values"
+            assert layer_targets.min() >= 0, f"Layer {layer_id} targets have negative values"
+            assert layer_targets.max() < 10, f"Layer {layer_id} targets have unexpectedly large values"
+
+            # Verify data is different between layers (statistically very unlikely to be identical)
+            if layer_id > 0:
+                prev_layer_inputs = inputs[layer_id - 1].cpu().numpy()
+                # Check that at least some values differ between layers
+                assert not np.array_equal(
+                    layer_inputs, prev_layer_inputs
+                ), f"Layer {layer_id} data identical to layer {layer_id - 1}"
+
+                # Additional check: mean values should differ (statistically)
+                mean_diff = abs(layer_inputs.mean() - prev_layer_inputs.mean())
+                assert mean_diff > 0.01, f"Layer {layer_id} and {layer_id - 1} have suspiciously similar means"
