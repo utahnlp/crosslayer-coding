@@ -38,9 +38,11 @@ class Decoder(nn.Module):
             self.world_size = dist_ops.get_world_size(process_group)
             self.rank = dist_ops.get_rank(process_group)
 
-        self.decoders = nn.ModuleDict(
-            {
-                f"{src_layer}->{tgt_layer}": RowParallelLinear(
+        # Initialize decoders based on tying configuration
+        if config.decoder_tying == "per_source":
+            # Tied decoders: one decoder per source layer
+            self.decoders = nn.ModuleList([
+                RowParallelLinear(
                     in_features=self.config.num_features,
                     out_features=self.config.d_model,
                     bias=True,
@@ -51,10 +53,76 @@ class Decoder(nn.Module):
                     device=self.device,
                     dtype=self.dtype,
                 )
-                for src_layer in range(self.config.num_layers)
-                for tgt_layer in range(src_layer, self.config.num_layers)
-            }
-        )
+                for _ in range(self.config.num_layers)
+            ])
+            
+            # Initialize decoder weights to zeros for tied transcoders
+            # This matches the reference implementation
+            for decoder in self.decoders:
+                nn.init.zeros_(decoder.weight)
+                if decoder.bias_param is not None:
+                    nn.init.zeros_(decoder.bias_param)
+            
+            # Initialize per-target scale and bias if enabled
+            if config.per_target_scale:
+                self.per_target_scale = nn.Parameter(
+                    torch.ones(self.config.num_layers, self.config.num_layers, self.config.d_model, 
+                              device=self.device, dtype=self.dtype)
+                )
+            else:
+                self.per_target_scale = None
+                
+            if config.per_target_bias:
+                self.per_target_bias = nn.Parameter(
+                    torch.zeros(self.config.num_layers, self.config.num_layers, self.config.d_model,
+                               device=self.device, dtype=self.dtype)
+                )
+            else:
+                self.per_target_bias = None
+        else:
+            # Original untied decoders: one decoder per (src, tgt) pair
+            self.decoders = nn.ModuleDict(
+                {
+                    f"{src_layer}->{tgt_layer}": RowParallelLinear(
+                        in_features=self.config.num_features,
+                        out_features=self.config.d_model,
+                        bias=True,
+                        process_group=self.process_group,
+                        input_is_parallel=False,
+                        d_model_for_init=self.config.d_model,
+                        num_layers_for_init=self.config.num_layers,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    for src_layer in range(self.config.num_layers)
+                    for tgt_layer in range(src_layer, self.config.num_layers)
+                }
+            )
+            self.per_target_scale = None
+            self.per_target_bias = None
+        
+        # Initialize skip connection weights if enabled
+        if config.skip_connection:
+            if config.decoder_tying == "per_source":
+                # For tied decoders, one skip connection per target layer
+                self.skip_weights = nn.ParameterList([
+                    nn.Parameter(torch.zeros(self.config.d_model, self.config.d_model, 
+                                           device=self.device, dtype=self.dtype))
+                    for _ in range(self.config.num_layers)
+                ])
+            else:
+                # For untied decoders, one skip connection per src->tgt pair
+                self.skip_weights = nn.ParameterDict({
+                    f"{src_layer}->{tgt_layer}": nn.Parameter(
+                        torch.zeros(self.config.d_model, self.config.d_model, 
+                                  device=self.device, dtype=self.dtype)
+                    )
+                    for src_layer in range(self.config.num_layers)
+                    for tgt_layer in range(src_layer, self.config.num_layers)
+                })
+        else:
+            self.skip_weights = None
+            
         self.register_buffer("_cached_decoder_norms", None, persistent=False)
 
     def decode(self, a: Dict[int, torch.Tensor], layer_idx: int) -> torch.Tensor:
@@ -99,8 +167,21 @@ class Decoder(nn.Module):
                     )
                     continue
 
-                decoder = self.decoders[f"{src_layer}->{layer_idx}"]
-                decoded = decoder(activation_tensor)
+                if self.config.decoder_tying == "per_source":
+                    # Use tied decoder for the source layer
+                    decoder = self.decoders[src_layer]
+                    decoded = decoder(activation_tensor)
+                    
+                    # Apply per-target scale and bias if enabled
+                    if self.per_target_scale is not None:
+                        decoded = decoded * self.per_target_scale[src_layer, layer_idx]
+                    if self.per_target_bias is not None:
+                        decoded = decoded + self.per_target_bias[src_layer, layer_idx]
+                else:
+                    # Use untied decoder for (src, tgt) pair
+                    decoder = self.decoders[f"{src_layer}->{layer_idx}"]
+                    decoded = decoder(activation_tensor)
+                    
                 reconstruction += decoded
         return reconstruction
 
@@ -143,10 +224,10 @@ class Decoder(nn.Module):
         for src_layer in range(self.config.num_layers):
             local_norms_sq_accum = torch.zeros(self.config.num_features, device=self.device, dtype=torch.float32)
 
-            for tgt_layer in range(src_layer, self.config.num_layers):
-                decoder_key = f"{src_layer}->{tgt_layer}"
-                decoder = self.decoders[decoder_key]
-                assert isinstance(decoder, RowParallelLinear), f"Decoder {decoder_key} is not RowParallelLinear"
+            if self.config.decoder_tying == "per_source":
+                # For tied decoders, compute norms once per source layer
+                decoder = self.decoders[src_layer]
+                assert isinstance(decoder, RowParallelLinear), f"Decoder {src_layer} is not RowParallelLinear"
 
                 current_norms_sq = torch.norm(decoder.weight, dim=0).pow(2).to(torch.float32)
 
@@ -161,7 +242,7 @@ class Decoder(nn.Module):
                     pass
                 elif local_dim_padded != actual_local_dim and local_dim_padded != features_per_rank:
                     logger.warning(
-                        f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for {decoder_key}. This might indicate an issue with RowParallelLinear partitioning."
+                        f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for decoder {src_layer}. This might indicate an issue with RowParallelLinear partitioning."
                     )
 
                 if actual_local_dim > 0:
@@ -171,9 +252,42 @@ class Decoder(nn.Module):
                         local_norms_sq_accum[global_slice] += valid_norms_sq
                     else:
                         logger.warning(
-                            f"Rank {self.rank}: Shape mismatch in decoder norm calculation for {decoder_key}. "
+                            f"Rank {self.rank}: Shape mismatch in decoder norm calculation for decoder {src_layer}. "
                             f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
                         )
+            else:
+                # For untied decoders, accumulate norms from all target layers
+                for tgt_layer in range(src_layer, self.config.num_layers):
+                    decoder_key = f"{src_layer}->{tgt_layer}"
+                    decoder = self.decoders[decoder_key]
+                    assert isinstance(decoder, RowParallelLinear), f"Decoder {decoder_key} is not RowParallelLinear"
+
+                    current_norms_sq = torch.norm(decoder.weight, dim=0).pow(2).to(torch.float32)
+
+                    full_dim = decoder.full_in_features
+                    features_per_rank = (full_dim + self.world_size - 1) // self.world_size
+                    start_idx = self.rank * features_per_rank
+                    end_idx = min(start_idx + features_per_rank, full_dim)
+                    actual_local_dim = max(0, end_idx - start_idx)
+                    local_dim_padded = decoder.local_in_features
+
+                    if local_dim_padded != features_per_rank and self.rank == self.world_size - 1:
+                        pass
+                    elif local_dim_padded != actual_local_dim and local_dim_padded != features_per_rank:
+                        logger.warning(
+                            f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for {decoder_key}. This might indicate an issue with RowParallelLinear partitioning."
+                        )
+
+                    if actual_local_dim > 0:
+                        valid_norms_sq = current_norms_sq[:actual_local_dim]
+                        if valid_norms_sq.shape[0] == actual_local_dim:
+                            global_slice = slice(start_idx, end_idx)
+                            local_norms_sq_accum[global_slice] += valid_norms_sq
+                        else:
+                            logger.warning(
+                                f"Rank {self.rank}: Shape mismatch in decoder norm calculation for {decoder_key}. "
+                                f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
+                            )
 
             if self.process_group is not None and dist_ops.is_dist_initialized_and_available():
                 dist_ops.all_reduce(local_norms_sq_accum, op=dist_ops.SUM, group=self.process_group)

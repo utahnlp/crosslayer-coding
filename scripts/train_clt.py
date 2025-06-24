@@ -245,6 +245,38 @@ def parse_args():
         default=None,
         help="Optional data type for the CLT model parameters (e.g., 'float16', 'bfloat16').",
     )
+    clt_group.add_argument(
+        "--decoder-tying",
+        type=str,
+        choices=["none", "per_source"],
+        default="none",
+        help="Decoder weight sharing strategy: 'none' (default) or 'per_source' (tied per source layer).",
+    )
+    clt_group.add_argument(
+        "--per-target-scale",
+        action="store_true",
+        help="Enable learned scale for each src->tgt path when using tied decoders.",
+    )
+    clt_group.add_argument(
+        "--per-target-bias",
+        action="store_true",
+        help="Enable learned bias for each src->tgt path when using tied decoders.",
+    )
+    clt_group.add_argument(
+        "--enable-feature-offset",
+        action="store_true",
+        help="Enable per-feature bias (theta_bias) applied after encoding.",
+    )
+    clt_group.add_argument(
+        "--enable-feature-scale",
+        action="store_true",
+        help="Enable per-feature scale (theta_scale) applied after encoding.",
+    )
+    clt_group.add_argument(
+        "--skip-connection",
+        action="store_true",
+        help="Enable skip connection from input to output.",
+    )
 
     # --- Training Hyperparameters (TrainingConfig) ---
     train_group = parser.add_argument_group("Training Hyperparameters (TrainingConfig)")
@@ -608,6 +640,12 @@ def main():
         clt_dtype=args.clt_dtype,
         topk_k=args.topk_k,
         topk_straight_through=(not args.disable_topk_straight_through),
+        decoder_tying=args.decoder_tying,
+        per_target_scale=args.per_target_scale,
+        per_target_bias=args.per_target_bias,
+        enable_feature_offset=args.enable_feature_offset,
+        enable_feature_scale=args.enable_feature_scale,
+        skip_connection=args.skip_connection,
     )
     logger.info(f"CLT Config: {clt_config}")
 
