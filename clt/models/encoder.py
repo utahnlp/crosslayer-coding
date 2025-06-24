@@ -47,6 +47,29 @@ class Encoder(nn.Module):
                 for _ in range(config.num_layers)
             ]
         )
+        
+        # Initialize theta_bias and theta_scale parameters if enabled
+        # These are per-layer, per-feature parameters
+        # Note: For tensor parallelism, each rank only holds a shard of features
+        features_per_rank = config.num_features // self.world_size
+        
+        if config.enable_feature_offset:
+            # Initialize feature_offset for each layer
+            self.feature_offset = nn.ParameterList([
+                nn.Parameter(torch.zeros(features_per_rank, device=self.device, dtype=self.dtype))
+                for _ in range(config.num_layers)
+            ])
+        else:
+            self.feature_offset = None
+            
+        if config.enable_feature_scale:
+            # Initialize feature_scale for each layer
+            self.feature_scale = nn.ParameterList([
+                nn.Parameter(torch.ones(features_per_rank, device=self.device, dtype=self.dtype))
+                for _ in range(config.num_layers)
+            ])
+        else:
+            self.feature_scale = None
 
     def get_preactivations(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Get pre-activation values (full tensor) for features at the specified layer."""
