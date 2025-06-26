@@ -6,10 +6,18 @@
 #SBATCH --qos rai-gpu-grn
 #SBATCH --nodes=1
 #SBATCH --gres=gpu:h200:8
-#SBATCH --time=2-00:00:00
+#SBATCH --time=6:00:00
 #SBATCH --mem=1000GB
 #SBATCH --requeue
 #SBATCH -o log_train_clt_%j
+
+
+# virtual environment
+export PYENV_ROOT="$SCR_DIR/.pyenv"
+command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
+eval "$(pyenv init -)"
+pyenv activate 3.12
+
 
 # add work dir to python path
 export CODE_DIR="/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding"
@@ -28,11 +36,11 @@ export BATCHTOPK_K=200
 # Reduced Precision
 export CLT_DTYPE="bfloat16"
 export PRECISION="bf16"
-export ACTIVATION_DTYPE="bfloat16"
+export ACTIVATION_DTYPE="float32"
 
 # Training Hyperparams
-export DATASET_SIZE=1000000
-export BATCH_SIZE=2048
+export DATASET_SIZE=3000000
+export BATCH_SIZE=256
 # export TRAINING_STEPS=$(($DATASET_SIZE/$BATCH_SIZE)) # set to DATASET_SIZE / BATCH_SIZE above
 export TRAINING_STEPS=5000
 export LEARNING_RATE=0.0001
@@ -45,9 +53,10 @@ export CHECKPOINT_INTERVAL=1000
 # Paths
 export DATA_DIR="$CODE_DIR/data"
 export MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
-export DATASET_NAME="olmo-mix-1124_train"
-export ACTIVATION_PATH="$DATA_DIR/activations/$MODEL_NAME/${DATASET_NAME}_${DATASET_SIZE}"
-export OUT_DIR="$DATA_DIR/clt/${DATASET_SIZE}toks_${ACTIVATION_DTYPE}_${CLT_FEATURES}feats_${BATCH_SIZE}batchsize"
+export DATASET_NAME="olmo-mix-1124"
+export DATASET_SPLIT="train"
+export ACTIVATION_PATH="$DATA_DIR/activations/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}"
+export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}/${CLT_FEATURES}feats_${BATCH_SIZE}batchsize"
 
 
 torchrun \

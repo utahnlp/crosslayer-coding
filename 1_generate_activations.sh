@@ -18,10 +18,10 @@ command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
 eval "$(pyenv init -)"
 pyenv activate 3.12
 
+
 # add work dir to python path
 export CODE_DIR="/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding"
 export PYTHONPATH="$CODE_DIR:$PYTHONPATH"
-
 
 # Params
 export DATA_DIR="$CODE_DIR/data"
@@ -33,7 +33,8 @@ export NUM_TOKENS=1000000
 export CHUNK_TOKEN_THRESHOLD=100000
 export ACTIVATION_DTYPE="float32"
 
-export DATASET_SKIP=0
+# uncomment to add dataset offset
+# export DATASET_SKIP=0
 
 
 python $CODE_DIR/scripts/generate_activations.py \
