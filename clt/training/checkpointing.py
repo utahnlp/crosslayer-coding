@@ -84,9 +84,9 @@ class CheckpointManager:
                 # Save model
                 save_safetensors_file(self.model.state_dict(), model_checkpoint_path)
                 save_safetensors_file(self.model.state_dict(), latest_model_path)
-                self.wandb_logger.log_artifact(
-                    artifact_path=model_checkpoint_path, artifact_type="model", name=f"clt_checkpoint_{step}"
-                )
+                # self.wandb_logger.log_artifact(
+                #     artifact_path=model_checkpoint_path, artifact_type="model", name=f"clt_checkpoint_{step}"
+                # )
                 # Save activation store
                 torch.save(self.activation_store.state_dict(), store_checkpoint_path)
                 torch.save(self.activation_store.state_dict(), latest_store_path)
@@ -210,15 +210,15 @@ class CheckpointManager:
                 logger.warning(f"Rank 0: Warning: Failed to save trainer state at step {step}: {e}")
 
             # Only log artifact if we successfully saved something
-            if os.path.exists(checkpoint_dir) and os.listdir(checkpoint_dir):
-                try:
-                    self.wandb_logger.log_artifact(
-                        artifact_path=checkpoint_dir,
-                        artifact_type="model_checkpoint",
-                        name=f"dist_checkpoint_{step}",
-                    )
-                except Exception as e:
-                    logger.warning(f"Rank 0: Failed to log artifact to WandB: {e}")
+            # if os.path.exists(checkpoint_dir) and os.listdir(checkpoint_dir):
+            #     try:
+            #         self.wandb_logger.log_artifact(
+            #             artifact_path=checkpoint_dir,
+            #             artifact_type="model_checkpoint",
+            #             name=f"dist_checkpoint_{step}",
+            #         )
+            #     except Exception as e:
+            #         logger.warning(f"Rank 0: Failed to log artifact to WandB: {e}")
 
         if self.distributed:
             dist.barrier()

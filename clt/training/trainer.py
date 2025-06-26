@@ -1086,7 +1086,7 @@ class CLTTrainer:
             # --- End Save CLT Config ---
 
             # Log final checkpoint directory as artifact
-            self.wandb_logger.log_artifact(artifact_path=final_checkpoint_dir, artifact_type="model", name="clt_final")
+            # self.wandb_logger.log_artifact(artifact_path=final_checkpoint_dir, artifact_type="model", name="clt_final")
 
             # Finish WandB logging
             self.wandb_logger.finish()
