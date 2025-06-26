@@ -499,7 +499,11 @@ class ActivationGenerator:
         )
         # Paths
         ds_name = os.path.basename(cfg.dataset_path)
-        self.out_dir = Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}"
+        self.out_dir = Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}_{cfg.target_total_tokens}_{cfg.activation_dtype}"
+        if cfg.dataset_skip is not None:
+            start_idx = cfg.dataset_skip
+            end_idx = cfg.dataset_skip + cfg.target_total_tokens
+            self.out_dir = self.out_dir / f"{start_idx}_{end_idx}"
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.manifest_tmp = self.out_dir / "index.tmp"
         self.manifest_final = self.out_dir / "index.bin"
@@ -536,6 +540,7 @@ class ActivationGenerator:
                 dataset_path=cfg.dataset_path,
                 dataset_split=cfg.dataset_split,
                 dataset_text_column=cfg.dataset_text_column,
+                dataset_skip=cfg.dataset_skip,
                 streaming=cfg.streaming,
                 dataset_trust_remote_code=cfg.dataset_trust_remote_code,
                 cache_path=cfg.cache_path,

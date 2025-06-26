@@ -47,6 +47,7 @@ def parse_arguments():
         default="text",
         help="Dataset text column name.",
     )
+    parser.add_argument("--dataset-skip", type=int, default=None, help="Number of dataset rows to skip.")
 
     # --- Generation Parameters ---
     parser.add_argument(
@@ -230,6 +231,7 @@ def main():
         dataset_path=args.dataset_path,
         dataset_split=args.dataset_split,
         dataset_text_column=args.dataset_text_column,
+        dataset_skip=args.dataset_skip,
         context_size=args.context_size,
         inference_batch_size=args.inference_batch_size,
         exclude_special_tokens=args.exclude_special_tokens,

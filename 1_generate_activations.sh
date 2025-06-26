@@ -33,6 +33,8 @@ export NUM_TOKENS=1000000
 export CHUNK_TOKEN_THRESHOLD=100000
 export ACTIVATION_DTYPE="float32"
 
+export DATASET_SKIP=0
+
 
 python $CODE_DIR/scripts/generate_activations.py \
     --model-name $MODEL_NAME \
@@ -47,5 +49,6 @@ python $CODE_DIR/scripts/generate_activations.py \
     --compression "gzip" \
     --chunk-token-threshold $CHUNK_TOKEN_THRESHOLD \
     --activation-dtype $ACTIVATION_DTYPE \
-    --compute-norm-stats
+    --compute-norm-stats #\
+    # --dataset-skip $DATASET_SKIP
 

@@ -20,6 +20,7 @@ class ActivationConfig:
     activation_dtype: Literal["bfloat16", "float16", "float32"] = "bfloat16"  # Precision for storing activations
     dataset_split: str = "train"  # Dataset split to use
     dataset_text_column: str = "text"  # Column containing text data
+    dataset_skip: Optional[int] = None  # Number of dataset rows to skip. Useful if running many jobs for big datasets
 
     # --- Generation Parameters ---
     context_size: int = 128  # Max sequence length for tokenization/inference
@@ -71,6 +72,7 @@ class ActivationConfig:
         assert self.context_size > 0, "Context size must be positive"
         assert self.inference_batch_size > 0, "Inference batch size must be positive"
         assert self.chunk_token_threshold > 0, "Chunk token threshold must be positive"
+        assert (self.dataset_skip is None) or (self.dataset_skip > 0), "Dataset skip must be positive if set"
         if self.output_format == "hdf5":
             try:
                 import h5py  # noqa: F401 - Check if h5py is available if format is hdf5
@@ -87,7 +89,7 @@ class ActivationConfig:
         logger.info(
             "ActivationConfig Summary:\n"
             f"  Model: {self.model_name}\n"
-            f"  Dataset: {self.dataset_path} (Split: {self.dataset_split})\n"
+            f"  Dataset: {self.dataset_path} (Split: {self.dataset_split}, Skip: {self.dataset_skip})\n"
             f"  Target Tokens: {self.target_total_tokens}\n"
             f"  Chunk Threshold: {self.chunk_token_threshold}\n"
             f"  Activation Dtype: {self.activation_dtype}\n"

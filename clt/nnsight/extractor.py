@@ -212,6 +212,7 @@ class ActivationExtractorCLT:
         dataset_path: str,
         dataset_split: str = "train",
         dataset_text_column: str = "text",
+        dataset_skip: int = None,
         streaming: bool = True,
         dataset_trust_remote_code: Optional[bool] = False,
         cache_path: Optional[str] = None,
@@ -223,6 +224,7 @@ class ActivationExtractorCLT:
             dataset_path: Path or name of the Hugging Face dataset.
             dataset_split: Dataset split to use (e.g., 'train', 'validation').
             dataset_text_column: Name of the column containing text data.
+            dataset_skip: Number of dataset examples to skip.
             streaming: Whether to use dataset streaming.
             dataset_trust_remote_code: Whether to trust remote code for the dataset.
             cache_path: Optional path to cache downloaded data (relevant if not streaming).
@@ -258,6 +260,10 @@ class ActivationExtractorCLT:
             features=features,
             data_files='data/wiki/*'
         )
+
+        if dataset_skip is not None:
+            logger.info(f'skipping first {dataset_skip:,d} lines of dataset')
+            dataset = dataset.skip(dataset_skip)
 
         if not isinstance(dataset, (Dataset, IterableDataset)):
             raise TypeError("Loaded dataset is not a Hugging Face Dataset or IterableDataset.")
