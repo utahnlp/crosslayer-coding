@@ -235,12 +235,28 @@ class ActivationExtractorCLT:
         # Handle the case where dataset_trust_remote_code is None
         trust_remote_code = False if dataset_trust_remote_code is None else dataset_trust_remote_code
 
+        features = Features({
+            'text': Value('string'),
+            'added': Value('string'),
+            'created': Value('string'),
+            'id': Value('string'),
+            'metadata': Features({
+                'length': Value('int64'),
+                'provenance': Value('string'),
+                'revid': Value('string'),
+                'url': Value('string')
+            }),
+            'source': Value('string'),
+            'version': Value('string')
+        })
         dataset = load_dataset(
             dataset_path,
             split=dataset_split,
             streaming=streaming,
             trust_remote_code=trust_remote_code,
             cache_dir=cache_path,
+            features=features,
+            data_files='data/wiki/*'
         )
 
         if not isinstance(dataset, (Dataset, IterableDataset)):
