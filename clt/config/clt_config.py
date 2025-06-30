@@ -15,7 +15,7 @@ class CLTConfig:
     num_layers: int  # Number of transformer layers
     d_model: int  # Dimension of model's hidden state
     model_name: Optional[str] = None  # Optional name for the underlying model
-    normalization_method: Literal["auto", "estimated_mean_std", "none"] = (
+    normalization_method: Literal["none", "mean_std", "sqrt_d_model"] = (
         "none"  # How activations were normalized during training
     )
     activation_fn: Literal["jumprelu", "relu", "batchtopk", "topk"] = "jumprelu"
@@ -27,6 +27,8 @@ class CLTConfig:
     topk_k: Optional[float] = None  # Number or fraction of features to keep per token for TopK.
     # If < 1, treated as fraction. If >= 1, treated as int count.
     topk_straight_through: bool = True  # Whether to use straight-through estimator for TopK.
+    # Top-K mode selection
+    topk_mode: Literal["global", "per_layer"] = "global"  # How to apply top-k selection
     clt_dtype: Optional[str] = None  # Optional dtype for the CLT model itself (e.g., "float16")
     expected_input_dtype: Optional[str] = None  # Expected dtype of input activations
     mlp_input_template: Optional[str] = None  # Module path template for MLP input activations
@@ -36,7 +38,7 @@ class CLTConfig:
     # context_size: Optional[int] = None
     
     # Tied decoder configuration
-    decoder_tying: Literal["none", "per_source"] = "none"  # Decoder weight sharing strategy
+    decoder_tying: Literal["none", "per_source", "per_target"] = "none"  # Decoder weight sharing strategy
     per_target_scale: bool = False  # Enable learned scale for each src->tgt path
     per_target_bias: bool = False  # Enable learned bias for each src->tgt path
     enable_feature_offset: bool = False  # Enable per-feature bias (feature_offset)
@@ -48,7 +50,7 @@ class CLTConfig:
         assert self.num_features > 0, "Number of features must be positive"
         assert self.num_layers > 0, "Number of layers must be positive"
         assert self.d_model > 0, "Model dimension must be positive"
-        valid_norm_methods = ["auto", "estimated_mean_std", "none"]
+        valid_norm_methods = ["none", "mean_std", "sqrt_d_model"]
         assert (
             self.normalization_method in valid_norm_methods
         ), f"Invalid normalization_method: {self.normalization_method}. Must be one of {valid_norm_methods}"
@@ -70,7 +72,7 @@ class CLTConfig:
                 raise ValueError("topk_k must be positive if specified.")
         
         # Validate decoder tying configuration
-        valid_decoder_tying = ["none", "per_source"]
+        valid_decoder_tying = ["none", "per_source", "per_target"]
         assert (
             self.decoder_tying in valid_decoder_tying
         ), f"Invalid decoder_tying: {self.decoder_tying}. Must be one of {valid_decoder_tying}"
@@ -99,6 +101,21 @@ class CLTConfig:
             config_dict["enable_feature_offset"] = False
         if "enable_feature_scale" not in config_dict:
             config_dict["enable_feature_scale"] = False
+        
+        # Handle backwards compatibility for old normalization methods
+        if "normalization_method" in config_dict:
+            old_method = config_dict["normalization_method"]
+            # Map old values to new ones
+            if old_method in ["auto", "estimated_mean_std"]:
+                config_dict["normalization_method"] = "mean_std"
+            elif old_method in ["auto_sqrt_d_model", "estimated_mean_std_sqrt_d_model"]:
+                config_dict["normalization_method"] = "sqrt_d_model"
+        
+        # Handle old sqrt_d_model_normalize flag
+        if "sqrt_d_model_normalize" in config_dict:
+            sqrt_normalize = config_dict.pop("sqrt_d_model_normalize")
+            if sqrt_normalize:
+                config_dict["normalization_method"] = "sqrt_d_model"
             
         return cls(**config_dict)
 
@@ -135,11 +152,11 @@ class TrainingConfig:
     debug_anomaly: bool = False
 
     # Normalization parameters
-    normalization_method: Literal["auto", "estimated_mean_std", "none"] = "auto"
-    # 'auto': Use pre-calculated from mapped store, or estimate for streaming store.
-    # 'estimated_mean_std': Always estimate for streaming store (ignored for mapped).
-    # 'none': Disable normalization.
-    normalization_estimation_batches: int = 50  # Batches for normalization estimation
+    normalization_method: Literal["none", "mean_std", "sqrt_d_model"] = "mean_std"
+    # 'none': No normalization.
+    # 'mean_std': Standard (x - mean) / std normalization using pre-calculated stats.
+    # 'sqrt_d_model': EleutherAI-style x * sqrt(d_model) normalization.
+    normalization_estimation_batches: int = 50  # Batches for normalization estimation (if needed)
 
     # --- Activation Store Source --- #
     activation_source: Literal["local_manifest", "remote"] = "local_manifest"

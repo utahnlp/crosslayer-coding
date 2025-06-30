@@ -229,6 +229,13 @@ def parse_args():
         help="Disable straight-through estimator for BatchTopK. (BatchTopK default is True).",
     )
     clt_group.add_argument(
+        "--topk-mode",
+        type=str,
+        choices=["global", "per_layer"],
+        default="global",
+        help="How to apply top-k selection: 'global' (across all layers) or 'per_layer' (each layer independently).",
+    )
+    clt_group.add_argument(
         "--topk-k",
         type=float,  # As per CLTConfig, topk_k can be a float (fraction) or int (count)
         default=None,
@@ -248,9 +255,9 @@ def parse_args():
     clt_group.add_argument(
         "--decoder-tying",
         type=str,
-        choices=["none", "per_source"],
+        choices=["none", "per_source", "per_target"],
         default="none",
-        help="Decoder weight sharing strategy: 'none' (default) or 'per_source' (tied per source layer).",
+        help="Decoder weight sharing strategy: 'none' (default), 'per_source' (tied per source layer), or 'per_target' (tied per target layer, EleutherAI style).",
     )
     clt_group.add_argument(
         "--per-target-scale",
@@ -313,11 +320,13 @@ def parse_args():
     train_group.add_argument(
         "--normalization-method",
         type=str,
-        choices=["auto", "none", "estimated_mean_std"],  # Added estimated_mean_std from TrainingConfig
-        default="auto",
+        choices=["none", "mean_std", "sqrt_d_model"],
+        default="mean_std",
         help=(
-            "Normalization for activation store. 'auto' expects server/local store to provide stats. "
-            "'estimated_mean_std' forces estimation (if store supports it). 'none' disables."
+            "Normalization method for activations. "
+            "'none': No normalization. "
+            "'mean_std': Standard (x - mean) / std normalization using pre-calculated stats. "
+            "'sqrt_d_model': EleutherAI-style x * sqrt(d_model) normalization."
         ),
     )
     train_group.add_argument(
@@ -646,6 +655,7 @@ def main():
         enable_feature_offset=args.enable_feature_offset,
         enable_feature_scale=args.enable_feature_scale,
         skip_connection=args.skip_connection,
+        topk_mode=args.topk_mode,
     )
     logger.info(f"CLT Config: {clt_config}")
 

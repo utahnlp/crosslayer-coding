@@ -35,6 +35,8 @@ class CLTEvaluator:
         start_time: Optional[float] = None,
         mean_tg: Optional[Dict[int, torch.Tensor]] = None,
         std_tg: Optional[Dict[int, torch.Tensor]] = None,
+        normalization_method: str = "none",
+        d_model: Optional[int] = None,
     ):
         """Initialize the evaluator.
 
@@ -44,6 +46,8 @@ class CLTEvaluator:
             start_time: The initial time.time() from the trainer for elapsed time logging.
             mean_tg: Optional dictionary of per-layer target means for de-normalising outputs.
             std_tg: Optional dictionary of per-layer target stds for de-normalising outputs.
+            normalization_method: The normalization method being used.
+            d_model: Model dimension for sqrt_d_model normalization.
         """
         self.model = model
         self.device = device
@@ -51,6 +55,8 @@ class CLTEvaluator:
         # Store normalisation stats if provided
         self.mean_tg = mean_tg or {}
         self.std_tg = std_tg or {}
+        self.normalization_method = normalization_method
+        self.d_model = d_model
         self.metrics_history: List[Dict[str, Any]] = []  # For storing metrics over time if needed
 
     @staticmethod
@@ -256,15 +262,22 @@ class CLTEvaluator:
 
             recon_act = reconstructions[layer_idx]
 
-            # --- De-normalise if stats available ---
+            # --- De-normalise based on normalization method ---
             target_act_denorm = target_act
             recon_act_denorm = recon_act
-            if layer_idx in self.mean_tg and layer_idx in self.std_tg:
+            
+            if self.normalization_method == "mean_std" and layer_idx in self.mean_tg and layer_idx in self.std_tg:
+                # Standard denormalization: x * std + mean
                 mean = self.mean_tg[layer_idx].to(recon_act.device, recon_act.dtype)
                 std = self.std_tg[layer_idx].to(recon_act.device, recon_act.dtype)
                 # Ensure broadcast shape
                 target_act_denorm = target_act * std + mean
                 recon_act_denorm = recon_act * std + mean
+            elif self.normalization_method == "sqrt_d_model" and self.d_model is not None:
+                # sqrt_d_model denormalization: x / sqrt(d_model)
+                sqrt_d_model = (self.d_model ** 0.5)
+                target_act_denorm = target_act / sqrt_d_model
+                recon_act_denorm = recon_act / sqrt_d_model
             # --- End De-normalisation ---
 
             # Ensure shapes match (flatten if necessary) and up-cast to float32 for numerically stable metrics
