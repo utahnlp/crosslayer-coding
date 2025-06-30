@@ -179,57 +179,6 @@ class CrossLayerTranscoder(BaseTranscoder):
             )
             return torch.zeros((expected_batch_dim, self.config.num_features), device=self.device, dtype=self.dtype)
 
-    def _apply_feature_affine(self, activations: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
-        """Apply per-feature offset and scale to activations if enabled.
-        
-        This function applies feature_offset and feature_scale only to non-zero activations.
-        This matches the reference implementation which applies post_enc only to selected features.
-        
-        Args:
-            activations: Dictionary mapping layer indices to activation tensors
-            
-        Returns:
-            Modified activations dictionary with affine transformations applied
-        """
-        if not self.config.enable_feature_offset and not self.config.enable_feature_scale:
-            return activations
-            
-        transformed_activations = {}
-        
-        for layer_idx, acts in activations.items():
-            if acts.numel() == 0:
-                transformed_activations[layer_idx] = acts
-                continue
-                
-            # Get non-zero positions (selected features)
-            nonzero_mask = acts != 0
-            
-            if not nonzero_mask.any():
-                transformed_activations[layer_idx] = acts
-                continue
-                
-            # Work with a copy to avoid in-place operations  
-            transformed_acts = acts.clone()
-            
-            if acts.dim() == 2:  # [batch, features]
-                # Get indices of non-zero elements
-                batch_indices, feature_indices = nonzero_mask.nonzero(as_tuple=True)
-                
-                if self.config.enable_feature_offset and self.encoder_module.feature_offset is not None:
-                    # Apply offset only to selected features
-                    offset_values = self.encoder_module.feature_offset[layer_idx][feature_indices]
-                    transformed_acts[batch_indices, feature_indices] += offset_values
-                    
-                if self.config.enable_feature_scale and self.encoder_module.feature_scale is not None:
-                    # Apply scale only to selected features
-                    scale_values = self.encoder_module.feature_scale[layer_idx][feature_indices]
-                    transformed_acts[batch_indices, feature_indices] *= scale_values
-            else:
-                raise ValueError(f"Unexpected activation dimension: {acts.dim()}")
-                
-            transformed_activations[layer_idx] = transformed_acts
-                
-        return transformed_activations
 
     def decode(self, a: Dict[int, torch.Tensor], layer_idx: int) -> torch.Tensor:
         return self.decoder_module.decode(a, layer_idx)
@@ -256,8 +205,8 @@ class CrossLayerTranscoder(BaseTranscoder):
             input_2d = input_tensor
             
         # Apply skip connection weight
-        if self.config.decoder_tying == "per_source":
-            # Use skip weight for this target layer
+        if self.config.decoder_tying in ["per_source", "per_target"]:
+            # For tied decoders, use skip weight for this target layer
             skip_weight = self.decoder_module.skip_weights[layer_idx]
         else:
             # For untied, we need to sum contributions from all source layers
@@ -280,8 +229,7 @@ class CrossLayerTranscoder(BaseTranscoder):
     def forward(self, inputs: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
         activations = self.get_feature_activations(inputs)
         
-        # Apply feature affine transformation if enabled
-        activations = self._apply_feature_affine(activations)
+        # Note: feature affine transformations are now applied in the decoder
 
         reconstructions = {}
         for layer_idx in range(self.config.num_layers):
@@ -321,6 +269,17 @@ class CrossLayerTranscoder(BaseTranscoder):
             processed_inputs[layer_idx] = x_orig.to(device=self.device, dtype=self.dtype)
 
         if self.config.activation_fn == "batchtopk" or self.config.activation_fn == "topk":
+            # Check if we should use per-layer mode
+            if self.config.topk_mode == "per_layer":
+                # Use per-layer top-k by calling encode on each layer
+                activations = {}
+                for layer_idx in sorted(processed_inputs.keys()):
+                    x_input = processed_inputs[layer_idx]
+                    act = self.encode(x_input, layer_idx)
+                    activations[layer_idx] = act
+                return activations
+            
+            # Otherwise use global top-k
             preactivations_dict, _ = self._encode_all_layers(processed_inputs)
             if not preactivations_dict:
                 activations = {}
@@ -471,26 +430,41 @@ class CrossLayerTranscoder(BaseTranscoder):
                     new_state_dict[key] = value
             state_dict = new_state_dict
         
-        # Handle missing feature affine parameters
-        if self.config.enable_feature_offset and self.encoder_module.feature_offset is not None:
+        # Handle feature affine parameters migration from encoder to decoder module
+        # (for backward compatibility with old checkpoints)
+        for i in range(self.config.num_layers):
+            old_offset_key = f"encoder_module.feature_offset.{i}"
+            new_offset_key = f"decoder_module.feature_offset.{i}"
+            if old_offset_key in state_dict and new_offset_key not in state_dict:
+                logger.info(f"Migrating {old_offset_key} to {new_offset_key}")
+                state_dict[new_offset_key] = state_dict.pop(old_offset_key)
+                
+            old_scale_key = f"encoder_module.feature_scale.{i}"
+            new_scale_key = f"decoder_module.feature_scale.{i}"
+            if old_scale_key in state_dict and new_scale_key not in state_dict:
+                logger.info(f"Migrating {old_scale_key} to {new_scale_key}")
+                state_dict[new_scale_key] = state_dict.pop(old_scale_key)
+        
+        # Handle missing feature affine parameters (now in decoder module)
+        if self.config.enable_feature_offset and hasattr(self.decoder_module, 'feature_offset') and self.decoder_module.feature_offset is not None:
             for i in range(self.config.num_layers):
-                key = f"encoder_module.feature_offset.{i}"
+                key = f"decoder_module.feature_offset.{i}"
                 if key not in state_dict:
                     logger.info(f"Initializing missing {key} to zeros")
                     # Don't add to state_dict to let it be initialized by the module
                     
-        if self.config.enable_feature_scale and self.encoder_module.feature_scale is not None:
+        if self.config.enable_feature_scale and hasattr(self.decoder_module, 'feature_scale') and self.decoder_module.feature_scale is not None:
             for i in range(self.config.num_layers):
-                key = f"encoder_module.feature_scale.{i}"
+                key = f"decoder_module.feature_scale.{i}"
                 if key not in state_dict:
-                    logger.info(f"Initializing missing {key} to ones")
+                    logger.info(f"Initializing missing {key} (first target layer to ones, rest to zeros)")
                     # Don't add to state_dict to let it be initialized by the module
         
         # Handle missing per-target parameters
         if self.config.per_target_scale and hasattr(self.decoder_module, 'per_target_scale'):
             key = "decoder_module.per_target_scale"
             if key not in state_dict:
-                logger.info(f"Initializing missing {key} to ones")
+                logger.info(f"Initializing missing {key} (diagonal to ones, off-diagonal to zeros)")
                 
         if self.config.per_target_bias and hasattr(self.decoder_module, 'per_target_bias'):
             key = "decoder_module.per_target_bias"

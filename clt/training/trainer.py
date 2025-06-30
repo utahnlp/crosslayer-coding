@@ -324,6 +324,7 @@ class CLTTrainer:
             training_config,
             mean_tg=mean_tg_stats,
             std_tg=std_tg_stats,
+            clt_config=clt_config,
         )
 
         # Initialize Evaluator - Pass norm stats here too
@@ -333,6 +334,8 @@ class CLTTrainer:
             start_time=self.start_time,
             mean_tg=mean_tg_stats,  # Pass the same stats
             std_tg=std_tg_stats,  # Pass the same stats
+            normalization_method=training_config.normalization_method,
+            d_model=clt_config.d_model,
         )
 
         # Initialize dead neuron counters (replicated for now, consider sharding later if needed)
@@ -472,11 +475,15 @@ class CLTTrainer:
                 logger.info(f"Distributed training with {self.world_size} processes (Tensor Parallelism)")
 
             # Check if using normalization and notify user
-            if self.training_config.normalization_method == "estimated_mean_std":
-                logger.info("\n>>> NORMALIZATION PHASE <<<")
-                logger.info("Normalization statistics are being estimated from dataset activations.")
-                logger.info("This may take some time, but happens only once before training begins.")
-                logger.info(f"Using {self.training_config.normalization_estimation_batches} batches for estimation.\n")
+            if self.training_config.normalization_method == "mean_std":
+                logger.info("\n>>> NORMALIZATION CONFIGURATION <<<")
+                logger.info("Using mean/std normalization with pre-calculated statistics from norm_stats.json")
+            elif self.training_config.normalization_method == "sqrt_d_model":
+                logger.info("\n>>> NORMALIZATION CONFIGURATION <<<")
+                logger.info("Using sqrt(d_model) normalization (EleutherAI-style)")
+            elif self.training_config.normalization_method == "none":
+                logger.info("\n>>> NORMALIZATION CONFIGURATION <<<")
+                logger.info("No normalization will be applied to activations")
 
             # Make sure we flush stdout to ensure prints appear immediately,
             # especially important in Jupyter/interactive environments

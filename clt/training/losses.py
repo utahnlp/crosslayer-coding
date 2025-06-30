@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 
-from clt.config import TrainingConfig
+from clt.config import TrainingConfig, CLTConfig
 from clt.models.clt import CrossLayerTranscoder
 
 
@@ -15,6 +15,7 @@ class LossManager:
         config: TrainingConfig,
         mean_tg: Optional[Dict[int, torch.Tensor]] = None,
         std_tg: Optional[Dict[int, torch.Tensor]] = None,
+        clt_config: Optional['CLTConfig'] = None,
     ):
         """Initialize the loss manager.
 
@@ -22,6 +23,7 @@ class LossManager:
             config: Training configuration
             mean_tg: Optional dictionary of per-layer target means for de-normalising outputs
             std_tg: Optional dictionary of per-layer target stds for de-normalising outputs
+            clt_config: Optional CLT configuration for accessing d_model
         """
         self.config = config
         self.reconstruction_loss_fn = nn.MSELoss()
@@ -29,6 +31,7 @@ class LossManager:
         # Store normalisation stats if provided
         self.mean_tg = mean_tg or {}
         self.std_tg = std_tg or {}
+        self.clt_config = clt_config
         self.aux_loss_factor = config.aux_loss_factor  # New: coefficient for auxiliary loss
         self.apply_sparsity_penalty_to_batchtopk = config.apply_sparsity_penalty_to_batchtopk
 
@@ -69,13 +72,19 @@ class LossManager:
             pred_layer = predicted[layer_idx]
             tgt_layer = target[layer_idx]
 
-            # De-normalise if stats available for this layer
-            if layer_idx in self.mean_tg and layer_idx in self.std_tg:
+            # De-normalise based on normalization method
+            if self.config.normalization_method == "mean_std" and layer_idx in self.mean_tg and layer_idx in self.std_tg:
+                # Standard denormalization: x * std + mean
                 mean = self.mean_tg[layer_idx].to(pred_layer.device, pred_layer.dtype)
                 std = self.std_tg[layer_idx].to(pred_layer.device, pred_layer.dtype)
                 # mean/std were stored with an added batch dim – ensure broadcast shape
                 pred_layer = pred_layer * std + mean
                 tgt_layer = tgt_layer * std + mean
+            elif self.config.normalization_method == "sqrt_d_model" and self.clt_config is not None:
+                # sqrt_d_model denormalization: x / sqrt(d_model)
+                sqrt_d_model = (self.clt_config.d_model ** 0.5)
+                pred_layer = pred_layer / sqrt_d_model
+                tgt_layer = tgt_layer / sqrt_d_model
 
             layer_loss = self.reconstruction_loss_fn(pred_layer, tgt_layer)
             total_loss += layer_loss
@@ -360,10 +369,25 @@ class LossManager:
         preactivation_loss = self.compute_preactivation_loss(model, inputs)
 
         # Compute residuals for auxiliary loss if needed
+        # Important: Compute residuals in denormalized (original) space for consistent auxiliary loss scale
         residuals = {}
         for layer_idx in predictions:
             if layer_idx in targets:
-                residuals[layer_idx] = targets[layer_idx] - predictions[layer_idx]
+                pred_layer = predictions[layer_idx]
+                tgt_layer = targets[layer_idx]
+                
+                # Denormalize before computing residuals
+                if self.config.normalization_method == "mean_std" and layer_idx in self.mean_tg and layer_idx in self.std_tg:
+                    mean = self.mean_tg[layer_idx].to(pred_layer.device, pred_layer.dtype)
+                    std = self.std_tg[layer_idx].to(pred_layer.device, pred_layer.dtype)
+                    pred_layer = pred_layer * std + mean
+                    tgt_layer = tgt_layer * std + mean
+                elif self.config.normalization_method == "sqrt_d_model" and self.clt_config is not None:
+                    sqrt_d_model = (self.clt_config.d_model ** 0.5)
+                    pred_layer = pred_layer / sqrt_d_model
+                    tgt_layer = tgt_layer / sqrt_d_model
+                
+                residuals[layer_idx] = tgt_layer - pred_layer
 
         # Compute auxiliary loss (only if configured and using BatchTopK)
         aux_loss = torch.tensor(0.0, device=reconstruction_loss.device)
