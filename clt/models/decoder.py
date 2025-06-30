@@ -81,26 +81,8 @@ class Decoder(nn.Module):
                 elif hasattr(decoder, 'bias') and decoder.bias is not None:
                     nn.init.zeros_(decoder.bias)
             
-            # Initialize per-target scale and bias if enabled
-            if config.per_target_scale:
-                # Initialize scale: diagonal gets ones, off-diagonal gets small values for gradient flow
-                # Small non-zero values allow gradients to flow even without skip connections
-                scale_init = torch.full((self.config.num_layers, self.config.num_layers, self.config.d_model), 
-                                       0.1, device=self.device, dtype=self.dtype)
-                # Set diagonal (same src->tgt layer) scales to 1.0
-                for i in range(self.config.num_layers):
-                    scale_init[i, i, :] = 1.0
-                self.per_target_scale = nn.Parameter(scale_init)
-            else:
-                self.per_target_scale = None
-                
-            if config.per_target_bias:
-                self.per_target_bias = nn.Parameter(
-                    torch.zeros(self.config.num_layers, self.config.num_layers, self.config.d_model,
-                               device=self.device, dtype=self.dtype)
-                )
-            else:
-                self.per_target_bias = None
+            # Note: EleutherAI doesn't have per-target scale/bias parameters
+            # These have been removed to match their architecture exactly
         else:
             # Original untied decoders: one decoder per (src, tgt) pair
             self.decoders = nn.ModuleDict(
@@ -120,8 +102,7 @@ class Decoder(nn.Module):
                     for tgt_layer in range(src_layer, self.config.num_layers)
                 }
             )
-            self.per_target_scale = None
-            self.per_target_bias = None
+            # Note: EleutherAI doesn't have per-target scale/bias parameters
         
         # Initialize skip connection weights if enabled
         if config.skip_connection:
@@ -226,24 +207,25 @@ class Decoder(nn.Module):
                         continue
 
                     # Apply feature affine transformations (indexed by target layer)
-                    # Note: EleutherAI applies these to ALL selected features, not just non-zero
+                    # EleutherAI only applies these to non-zero (selected) features
                     if self.feature_offset is not None or self.feature_scale is not None:
-                        activation_tensor = activation_tensor.clone()
+                        # Get non-zero positions (selected features)
+                        nonzero_mask = activation_tensor != 0
                         
-                        if self.feature_offset is not None:
-                            # Apply offset to all features (not just non-zero)
-                            activation_tensor += self.feature_offset[layer_idx]
+                        if nonzero_mask.any():
+                            # Apply transformations only to selected features
+                            activation_tensor = activation_tensor.clone()
+                            batch_indices, feature_indices = nonzero_mask.nonzero(as_tuple=True)
                             
-                        if self.feature_scale is not None:
-                            # Apply scale to all features (not just non-zero)
-                            activation_tensor *= self.feature_scale[layer_idx]
-                    
-                    # Apply per-target scale and bias if enabled (before summing)
-                    # Note: EleutherAI doesn't have these parameters
-                    if self.per_target_scale is not None:
-                        activation_tensor = activation_tensor * self.per_target_scale[src_layer, layer_idx]
-                    if self.per_target_bias is not None:
-                        activation_tensor = activation_tensor + self.per_target_bias[src_layer, layer_idx]
+                            if self.feature_offset is not None:
+                                # Apply offset only to non-zero features
+                                offset_values = self.feature_offset[layer_idx][feature_indices]
+                                activation_tensor[batch_indices, feature_indices] += offset_values
+                                
+                            if self.feature_scale is not None:
+                                # Apply scale only to non-zero features
+                                scale_values = self.feature_scale[layer_idx][feature_indices]
+                                activation_tensor[batch_indices, feature_indices] *= scale_values
                     
                     summed_activation += activation_tensor
             
@@ -290,11 +272,7 @@ class Decoder(nn.Module):
                         decoder = self.decoders[src_layer]
                         decoded = decoder(activation_tensor)
                         
-                        # Apply per-target scale and bias if enabled
-                        if self.per_target_scale is not None:
-                            decoded = decoded * self.per_target_scale[src_layer, layer_idx]
-                        if self.per_target_bias is not None:
-                            decoded = decoded + self.per_target_bias[src_layer, layer_idx]
+                        # Note: EleutherAI doesn't have per-target scale/bias
                     else:
                         # Use untied decoder for (src, tgt) pair
                         decoder = self.decoders[f"{src_layer}->{layer_idx}"]

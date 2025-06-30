@@ -39,8 +39,6 @@ class CLTConfig:
     
     # Tied decoder configuration
     decoder_tying: Literal["none", "per_source", "per_target"] = "none"  # Decoder weight sharing strategy
-    per_target_scale: bool = False  # Enable learned scale for each src->tgt path
-    per_target_bias: bool = False  # Enable learned bias for each src->tgt path
     enable_feature_offset: bool = False  # Enable per-feature bias (feature_offset)
     enable_feature_scale: bool = False  # Enable per-feature scale (feature_scale)
     skip_connection: bool = False  # Enable skip connection from input to output
@@ -93,10 +91,6 @@ class CLTConfig:
         # Handle backward compatibility for old configs
         if "decoder_tying" not in config_dict:
             config_dict["decoder_tying"] = "none"  # Default to original behavior
-        if "per_target_scale" not in config_dict:
-            config_dict["per_target_scale"] = False
-        if "per_target_bias" not in config_dict:
-            config_dict["per_target_bias"] = False
         if "enable_feature_offset" not in config_dict:
             config_dict["enable_feature_offset"] = False
         if "enable_feature_scale" not in config_dict:
