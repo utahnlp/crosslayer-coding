@@ -160,7 +160,7 @@ class Decoder(nn.Module):
             
         self.register_buffer("_cached_decoder_norms", None, persistent=False)
 
-    def decode(self, a: Dict[int, torch.Tensor], layer_idx: int) -> torch.Tensor:
+    def decode(self, a: Dict[int, torch.Tensor], layer_idx: int, source_inputs: Optional[Dict[int, torch.Tensor]] = None) -> torch.Tensor:
         """Decode the feature activations to reconstruct outputs at the specified layer.
 
         Input activations `a` are expected to be the *full* tensors.
@@ -233,6 +233,26 @@ class Decoder(nn.Module):
             decoder = self.decoders[layer_idx]
             reconstruction = decoder(summed_activation)
             
+            # Apply skip connections from source inputs if enabled
+            if self.skip_weights is not None and source_inputs is not None:
+                skip_weight = self.skip_weights[layer_idx]
+                # Add skip connections from each source layer that contributed
+                for src_layer in range(layer_idx + 1):
+                    if src_layer in source_inputs:
+                        source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
+                        # Flatten if needed
+                        original_shape = source_input.shape
+                        if source_input.dim() == 3:
+                            source_input_2d = source_input.view(-1, source_input.shape[-1])
+                        else:
+                            source_input_2d = source_input
+                        # Apply skip: source @ W_skip^T
+                        skip_contribution = source_input_2d @ skip_weight.T
+                        # Reshape back if needed
+                        if source_input.dim() == 3:
+                            skip_contribution = skip_contribution.view(original_shape)
+                        reconstruction += skip_contribution
+            
         else:
             # Original logic for per_source and untied decoders
             for src_layer in range(layer_idx + 1):
@@ -272,11 +292,45 @@ class Decoder(nn.Module):
                         decoder = self.decoders[src_layer]
                         decoded = decoder(activation_tensor)
                         
-                        # Note: EleutherAI doesn't have per-target scale/bias
+                        # Apply skip connection from this source input if enabled
+                        if self.skip_weights is not None and source_inputs is not None and src_layer in source_inputs:
+                            skip_weight = self.skip_weights[layer_idx]
+                            source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
+                            # Flatten if needed
+                            original_shape = source_input.shape
+                            if source_input.dim() == 3:
+                                source_input_2d = source_input.view(-1, source_input.shape[-1])
+                            else:
+                                source_input_2d = source_input
+                            # Apply skip: source @ W_skip^T
+                            skip_contribution = source_input_2d @ skip_weight.T
+                            # Reshape back if needed
+                            if source_input.dim() == 3:
+                                skip_contribution = skip_contribution.view(original_shape)
+                            decoded += skip_contribution
                     else:
                         # Use untied decoder for (src, tgt) pair
                         decoder = self.decoders[f"{src_layer}->{layer_idx}"]
                         decoded = decoder(activation_tensor)
+                        
+                        # Apply skip connection from this source input if enabled
+                        if self.skip_weights is not None and source_inputs is not None and src_layer in source_inputs:
+                            skip_key = f"{src_layer}->{layer_idx}"
+                            if skip_key in self.skip_weights:
+                                skip_weight = self.skip_weights[skip_key]
+                                source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
+                                # Flatten if needed
+                                original_shape = source_input.shape
+                                if source_input.dim() == 3:
+                                    source_input_2d = source_input.view(-1, source_input.shape[-1])
+                                else:
+                                    source_input_2d = source_input
+                                # Apply skip: source @ W_skip^T
+                                skip_contribution = source_input_2d @ skip_weight.T
+                                # Reshape back if needed
+                                if source_input.dim() == 3:
+                                    skip_contribution = skip_contribution.view(original_shape)
+                                decoded += skip_contribution
                         
                     reconstruction += decoded
                     
