@@ -259,6 +259,12 @@ class TrainingConfig:
             assert (
                 0.0 <= self.sparsity_lambda_delay_frac < 1.0
             ), "sparsity_lambda_delay_frac must be between 0.0 (inclusive) and 1.0 (exclusive)"
+        
+        # Validate normalization method
+        valid_norm_methods = ["none", "mean_std", "sqrt_d_model"]
+        assert (
+            self.normalization_method in valid_norm_methods
+        ), f"Invalid normalization_method: {self.normalization_method}. Must be one of {valid_norm_methods}"
 
 
 @dataclass

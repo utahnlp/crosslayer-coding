@@ -180,51 +180,8 @@ class CrossLayerTranscoder(BaseTranscoder):
             return torch.zeros((expected_batch_dim, self.config.num_features), device=self.device, dtype=self.dtype)
 
 
-    def decode(self, a: Dict[int, torch.Tensor], layer_idx: int) -> torch.Tensor:
-        return self.decoder_module.decode(a, layer_idx)
-    
-    def _apply_skip_connection(self, input_tensor: torch.Tensor, layer_idx: int) -> torch.Tensor:
-        """Apply skip connection transformation to input.
-        
-        Args:
-            input_tensor: Input tensor at the given layer
-            layer_idx: Target layer index
-            
-        Returns:
-            Transformed input through skip connection
-        """
-        if self.decoder_module.skip_weights is None:
-            return torch.zeros_like(input_tensor)
-            
-        # Ensure input is 2D for matrix multiplication
-        original_shape = input_tensor.shape
-        if input_tensor.dim() == 3:
-            # Flatten batch and sequence dimensions
-            input_2d = input_tensor.view(-1, input_tensor.shape[-1])
-        else:
-            input_2d = input_tensor
-            
-        # Apply skip connection weight
-        if self.config.decoder_tying in ["per_source", "per_target"]:
-            # For tied decoders, use skip weight for this target layer
-            skip_weight = self.decoder_module.skip_weights[layer_idx]
-        else:
-            # For untied, we need to sum contributions from all source layers
-            # For now, just use the diagonal skip connection (src=tgt)
-            skip_key = f"{layer_idx}->{layer_idx}"
-            if skip_key in self.decoder_module.skip_weights:
-                skip_weight = self.decoder_module.skip_weights[skip_key]
-            else:
-                return torch.zeros_like(input_tensor)
-                
-        # Apply transformation: input @ W_skip^T
-        skip_output = input_2d @ skip_weight.T
-        
-        # Reshape back to original shape
-        if input_tensor.dim() == 3:
-            skip_output = skip_output.view(original_shape)
-            
-        return skip_output
+    def decode(self, a: Dict[int, torch.Tensor], layer_idx: int, source_inputs: Optional[Dict[int, torch.Tensor]] = None) -> torch.Tensor:
+        return self.decoder_module.decode(a, layer_idx, source_inputs)
 
     def forward(self, inputs: Dict[int, torch.Tensor]) -> Dict[int, torch.Tensor]:
         activations = self.get_feature_activations(inputs)
@@ -235,12 +192,9 @@ class CrossLayerTranscoder(BaseTranscoder):
         for layer_idx in range(self.config.num_layers):
             relevant_activations = {k: v for k, v in activations.items() if k <= layer_idx and v.numel() > 0}
             if layer_idx in inputs and relevant_activations:
-                reconstruction = self.decode(relevant_activations, layer_idx)
-                
-                # Apply skip connection if enabled
-                if self.config.skip_connection and layer_idx in inputs:
-                    skip_output = self._apply_skip_connection(inputs[layer_idx], layer_idx)
-                    reconstruction = reconstruction + skip_output
+                # Pass source inputs for EleutherAI-style skip connections
+                source_inputs = {k: inputs[k] for k in range(layer_idx + 1) if k in inputs} if self.config.skip_connection else None
+                reconstruction = self.decode(relevant_activations, layer_idx, source_inputs)
                 
                 reconstructions[layer_idx] = reconstruction
             elif layer_idx in inputs:
@@ -460,16 +414,12 @@ class CrossLayerTranscoder(BaseTranscoder):
                     logger.info(f"Initializing missing {key} (first target layer to ones, rest to zeros)")
                     # Don't add to state_dict to let it be initialized by the module
         
-        # Handle missing per-target parameters
-        if self.config.per_target_scale and hasattr(self.decoder_module, 'per_target_scale'):
-            key = "decoder_module.per_target_scale"
-            if key not in state_dict:
-                logger.info(f"Initializing missing {key} (diagonal to ones, off-diagonal to zeros)")
-                
-        if self.config.per_target_bias and hasattr(self.decoder_module, 'per_target_bias'):
-            key = "decoder_module.per_target_bias"
-            if key not in state_dict:
-                logger.info(f"Initializing missing {key} to zeros")
+        # Handle missing skip weights
+        if self.config.skip_connection and hasattr(self.decoder_module, 'skip_weights'):
+            for i in range(self.config.num_layers):
+                key = f"decoder_module.skip_weights.{i}"
+                if key not in state_dict:
+                    logger.info(f"Initializing missing {key} to identity matrix")
         
         # Call parent's load_state_dict
         return super().load_state_dict(state_dict, strict=strict)

@@ -11,6 +11,10 @@ This library is intended for the training and analysis of cross-layer sparse cod
 
 A Cross-Layer Transcoder (CLT) is a multi-layer dictionary learning model designed to extract sparse, interpretable features from transformers, using an encoder for each layer and a decoder for each (source layer, destination layer) pair (e.g., 12 encoders and 78 decoders for `gpt2-small`). This implementation focuses on the core functionality needed to train and use CLTs, leveraging `nnsight` for model introspection and `datasets` for data handling.
 
+The library now supports **tied decoders**, which can significantly reduce the number of parameters by sharing decoder weights across layers. Instead of training separate decoders for each (source, destination) pair, tied decoders use either:
+- **Per-source tying**: One decoder per source layer, shared across all destination layers
+- **Per-target tying**: One decoder per destination layer, shared across all source layers
+
 Training a CLT involves the following steps:
 1.  Pre-generate activations with `scripts/generate_activations` (though an implementation of `StreamingActivationStore` is on the way).
 2.  Train a CLT (start with an expansion factor of at least `32`) using this data. Metrics can be logged to WandB. NMSE should get below `0.25`, or ideally even below `0.10`. As mentioned above, I recommend `BatchTopK` training, and suggest keeping `K` low--`200` is a good place to start.
@@ -85,6 +89,16 @@ Key configuration parameters are mapped to config classes via script arguments:
     - `relu`: Standard ReLU activation.
     - `batchtopk`: Selects a global top K features across all tokens in a batch, based on pre-activation values. The 'k' can be an absolute number or a fraction. This is often used as a training-time differentiable approximation that can later be converted to `jumprelu`.
     - `topk`: Selects top K features per token (row-wise top-k).
+    
+  **Decoder Tying Options** (`--decoder-tying`):
+    - `none` (default): Traditional untied decoders - separate decoder for each (source, destination) layer pair
+    - `per_source`: Share decoder weights per source layer - each source layer has one decoder used for all destinations
+    - `per_target`: Share decoder weights per destination layer - each destination layer has one decoder that combines features from all source layers
+    
+  **Additional Tied Decoder Features**:
+    - `--enable-feature-offset`: Add learnable per-feature bias terms
+    - `--enable-feature-scale`: Add learnable per-feature scaling
+    - `--skip-connection`: Enable skip connections from source inputs to decoder outputs
 - **TrainingConfig**: `--learning-rate`, `--training-steps`, `--train-batch-size-tokens`, `--activation-source`, `--activation-path` (for `local_manifest`), remote config fields (for `remote`, e.g. `--server-url`, `--dataset-id`), `--normalization-method`, `--sparsity-lambda`, `--preactivation-coef`, `--optimizer`, `--lr-scheduler`, `--log-interval`, `--eval-interval`, `--checkpoint-interval`, `--dead-feature-window`, WandB settings (`--enable-wandb`, `--wandb-project`, etc.).
 
 ### Single GPU Training Examples
@@ -138,6 +152,38 @@ python scripts/train_clt.py \\
     --enable-wandb --wandb-project clt_training_remote
     # Add other arguments as needed
 ```
+
+**Example: Training with Tied Decoders**
+
+Tied decoders can significantly reduce the parameter count while maintaining performance. Here's an example using per-source tying:
+
+```bash
+python scripts/train_clt.py \
+    --activation-source local_manifest \
+    --activation-path ./tutorial_activations/gpt2/pile-uncopyrighted_train \
+    --output-dir ./clt_output_tied \
+    --model-name gpt2 \
+    --num-features 6144 \
+    --decoder-tying per_source \
+    --enable-feature-scale \
+    --skip-connection \
+    --activation-fn batchtopk \
+    --batchtopk-k 256 \
+    --learning-rate 3e-4 \
+    --training-steps 100000 \
+    --train-batch-size-tokens 8192 \
+    --sparsity-lambda 1e-3 \
+    --log-interval 100 \
+    --eval-interval 1000 \
+    --checkpoint-interval 5000 \
+    --enable-wandb --wandb-project clt_tied_training
+```
+
+This configuration:
+- Uses `per_source` tying: 12 decoders instead of 78 for gpt2-small
+- Enables feature scaling for better expressiveness
+- Includes skip connections to preserve input information
+- Uses BatchTopK with k=256 for training (can be converted to JumpReLU later)
 
 ### Multi-GPU Training (Tensor Parallelism)
 

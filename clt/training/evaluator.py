@@ -55,6 +55,14 @@ class CLTEvaluator:
         # Store normalisation stats if provided
         self.mean_tg = mean_tg or {}
         self.std_tg = std_tg or {}
+        
+        # Validate normalization method
+        valid_norm_methods = ["none", "mean_std", "sqrt_d_model"]
+        if normalization_method not in valid_norm_methods:
+            raise ValueError(
+                f"Invalid normalization_method: {normalization_method}. "
+                f"Must be one of {valid_norm_methods}"
+            )
         self.normalization_method = normalization_method
         self.d_model = d_model
         self.metrics_history: List[Dict[str, Any]] = []  # For storing metrics over time if needed
@@ -255,6 +263,10 @@ class CLTEvaluator:
         total_explained_variance = 0.0
         total_nmse = 0.0
         num_layers = 0
+        
+        # For layerwise metrics
+        layerwise_nmse = {}
+        layerwise_explained_variance = {}
 
         for layer_idx, target_act in targets.items():
             if layer_idx not in reconstructions:
@@ -312,6 +324,10 @@ class CLTEvaluator:
             else:  # Target variance is zero but MSE is non-zero (implies error, NMSE is effectively infinite)
                 nmse_layer = float("inf")  # Or a large number, or handle as NaN depending on preference
             total_nmse += nmse_layer
+            
+            # Store layerwise metrics
+            layerwise_nmse[f"layer_{layer_idx}"] = nmse_layer
+            layerwise_explained_variance[f"layer_{layer_idx}"] = explained_variance_layer
 
             num_layers += 1
 
@@ -327,6 +343,8 @@ class CLTEvaluator:
         return {
             "reconstruction/explained_variance": avg_explained_variance,
             "reconstruction/normalized_mean_reconstruction_error": avg_normalized_mean_reconstruction_error,
+            "layerwise/normalized_mse": layerwise_nmse,
+            "layerwise/explained_variance": layerwise_explained_variance,
         }
 
     def _compute_feature_density(self, activations: Dict[int, torch.Tensor]) -> Dict[str, Any]:

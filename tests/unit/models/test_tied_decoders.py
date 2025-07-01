@@ -72,48 +72,33 @@ class TestTiedDecoders:
         for layer in range(tied_config.num_layers):
             assert isinstance(decoder.decoders[layer], nn.Module)
     
-    def test_per_target_parameters(self, tied_config):
-        """Test per-target scale and bias parameters."""
-        # Test with per-target scale
-        config_with_scale = CLTConfig(
-            **{**tied_config.__dict__, "per_target_scale": True}
+    def test_skip_connections(self, tied_config):
+        """Test skip connection functionality."""
+        # Test with skip connections enabled
+        config_with_skip = CLTConfig(
+            **{**tied_config.__dict__, "skip_connection": True}
         )
         decoder = Decoder(
-            config=config_with_scale,
+            config=config_with_skip,
             process_group=None,
             device=torch.device("cpu"),
             dtype=torch.float32,
         )
         
-        assert decoder.per_target_scale is not None
-        assert decoder.per_target_scale.shape == (
-            config_with_scale.num_layers,
-            config_with_scale.num_layers,
-            config_with_scale.d_model,
-        )
-        assert torch.allclose(decoder.per_target_scale, torch.ones_like(decoder.per_target_scale))
+        # Skip weights should be initialized
+        assert decoder.skip_weights is not None
+        assert len(decoder.skip_weights) == config_with_skip.num_layers
         
-        # Test with per-target bias
-        config_with_bias = CLTConfig(
-            **{**tied_config.__dict__, "per_target_bias": True}
-        )
-        decoder = Decoder(
-            config=config_with_bias,
-            process_group=None,
-            device=torch.device("cpu"),
-            dtype=torch.float32,
-        )
-        
-        assert decoder.per_target_bias is not None
-        assert decoder.per_target_bias.shape == (
-            config_with_bias.num_layers,
-            config_with_bias.num_layers,
-            config_with_bias.d_model,
-        )
-        assert torch.allclose(decoder.per_target_bias, torch.zeros_like(decoder.per_target_bias))
+        # Each skip weight should have correct shape
+        for layer_idx in range(config_with_skip.num_layers):
+            skip_weight = decoder.skip_weights[layer_idx]
+            assert skip_weight.shape == (config_with_skip.d_model, config_with_skip.d_model)
+            # Should be initialized to zeros
+            expected = torch.zeros(config_with_skip.d_model, config_with_skip.d_model, dtype=torch.float32)
+            assert torch.allclose(skip_weight, expected)
     
     def test_feature_affine_parameters(self):
-        """Test feature offset and scale parameters in encoder."""
+        """Test feature offset and scale parameters in decoder."""
         config = CLTConfig(
             num_features=128,
             num_layers=4,
@@ -121,9 +106,10 @@ class TestTiedDecoders:
             activation_fn="relu",
             enable_feature_offset=True,
             enable_feature_scale=True,
+            decoder_tying="per_source",  # Feature affine only works with tied decoders
         )
         
-        encoder = Encoder(
+        decoder = Decoder(
             config=config,
             process_group=None,
             device=torch.device("cpu"),
@@ -131,18 +117,23 @@ class TestTiedDecoders:
         )
         
         # Check feature_offset initialization
-        assert encoder.feature_offset is not None
-        assert len(encoder.feature_offset) == config.num_layers
-        for layer_offset in encoder.feature_offset:
-            assert layer_offset.shape == (config.num_features,)
-            assert torch.allclose(layer_offset, torch.zeros_like(layer_offset))
+        assert decoder.feature_offset is not None
+        assert len(decoder.feature_offset) == config.num_layers
+        for layer_idx in range(config.num_layers):
+            assert decoder.feature_offset[layer_idx].shape == (config.num_features,)
+            assert torch.allclose(decoder.feature_offset[layer_idx], torch.zeros_like(decoder.feature_offset[layer_idx]))
         
         # Check feature_scale initialization
-        assert encoder.feature_scale is not None
-        assert len(encoder.feature_scale) == config.num_layers
-        for layer_scale in encoder.feature_scale:
-            assert layer_scale.shape == (config.num_features,)
-            assert torch.allclose(layer_scale, torch.ones_like(layer_scale))
+        assert decoder.feature_scale is not None
+        assert len(decoder.feature_scale) == config.num_layers
+        for layer_idx in range(config.num_layers):
+            assert decoder.feature_scale[layer_idx].shape == (config.num_features,)
+            # First layer should be ones, rest should be 0.1 for tied decoders
+            if layer_idx == 0:
+                assert torch.allclose(decoder.feature_scale[layer_idx], torch.ones_like(decoder.feature_scale[layer_idx]))
+            else:
+                expected = torch.full_like(decoder.feature_scale[layer_idx], 0.1)
+                assert torch.allclose(decoder.feature_scale[layer_idx], expected)
     
     def test_decode_with_tied_decoders(self, tied_config):
         """Test decoding with tied decoders."""
@@ -192,7 +183,7 @@ class TestTiedDecoders:
         assert torch.all(norms >= 0)
     
     def test_feature_affine_transformation(self):
-        """Test feature affine transformation in forward pass."""
+        """Test feature affine transformation in decoder."""
         config = CLTConfig(
             num_features=128,
             num_layers=2,
@@ -200,32 +191,32 @@ class TestTiedDecoders:
             activation_fn="relu",
             enable_feature_offset=True,
             enable_feature_scale=True,
+            decoder_tying="per_source",
         )
         
-        model = CrossLayerTranscoder(
+        decoder = Decoder(
             config=config,
             process_group=None,
             device=torch.device("cpu"),
+            dtype=torch.float32,
         )
         
-        # Create test inputs
+        # Create test activations
         batch_size = 4
-        seq_len = 16
-        inputs = {
-            0: torch.randn(batch_size, seq_len, config.d_model),
-            1: torch.randn(batch_size, seq_len, config.d_model),
+        test_activations = {
+            0: torch.randn(batch_size, config.num_features),
+            1: torch.randn(batch_size, config.num_features),
         }
         
-        # Get activations
-        activations = model.get_feature_activations(inputs)
+        # Set some specific values for testing
+        decoder.feature_offset[0].data.fill_(0.5)
+        decoder.feature_scale[0].data.fill_(2.0)
         
-        # Apply affine transformation
-        transformed = model._apply_feature_affine(activations)
+        # Decode at layer 1 (should use features from layers 0 and 1)
+        result = decoder.decode(test_activations, layer_idx=1)
         
-        # The transformation should preserve zeros
-        for layer_idx in transformed:
-            zero_mask = activations[layer_idx] == 0
-            assert torch.all(transformed[layer_idx][zero_mask] == 0)
+        # Result should have correct shape
+        assert result.shape == (batch_size, config.d_model)
     
     def test_backward_compatibility_config(self):
         """Test loading old config without new fields."""
@@ -234,8 +225,7 @@ class TestTiedDecoders:
             "num_layers": 4,
             "d_model": 64,
             "activation_fn": "relu",
-            # Missing: decoder_tying, per_target_scale, per_target_bias, 
-            # enable_feature_offset, enable_feature_scale
+            # Missing: decoder_tying, enable_feature_offset, enable_feature_scale, skip_connection
         }
         
         # Should not raise an error
@@ -243,10 +233,9 @@ class TestTiedDecoders:
         
         # Should have default values
         assert config.decoder_tying == "none"
-        assert config.per_target_scale == False
-        assert config.per_target_bias == False
         assert config.enable_feature_offset == False
         assert config.enable_feature_scale == False
+        assert config.skip_connection == False
     
     def test_checkpoint_compatibility(self, base_config, tied_config):
         """Test loading old untied checkpoint into tied model."""

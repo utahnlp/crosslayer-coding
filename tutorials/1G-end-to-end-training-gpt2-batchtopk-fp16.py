@@ -1,12 +1,12 @@
 # %% [markdown]
-# # Tutorial 2: End-to-End CLT Training with BatchTopK Activation
+# # Tutorial: End-to-End CLT Training with GPT-2, BatchTopK, and FP16
 #
 # This tutorial demonstrates training a Cross-Layer Transcoder (CLT)
-# using the **BatchTopK** activation function. We will:
-# 1. Configure the CLT model for BatchTopK, activation generation, and training parameters.
-# 2. Generate activations locally (with manifest) using the ActivationGenerator.
-# 3. Configure the trainer to use the locally stored activations via the manifest.
-# 4. Train the CLT model using BatchTopK activation.
+# on **GPT-2** using the **BatchTopK** activation function and **FP16** precision. We will:
+# 1. Configure the CLT model for GPT-2, BatchTopK, and FP16 training.
+# 2. Generate FP16 activations locally (with manifest) using the ActivationGenerator.
+# 3. Configure the trainer to use the locally stored FP16 activations.
+# 4. Train the CLT model using BatchTopK activation in mixed precision.
 # 5. Save and load the final trained model (which will be JumpReLU if converted).
 # 6. Load a model from a distributed checkpoint.
 # 7. Perform a post-hoc conversion sweep (θ scaling) on a BatchTopK checkpoint.
@@ -68,7 +68,7 @@ else:
 print(f"Using device: {device}")
 
 # Base model for activation extraction
-BASE_MODEL_NAME = "EleutherAI/pythia-70m"
+BASE_MODEL_NAME = "gpt2"
 
 # For post-hoc sweep N(0,1) assumption
 std_normal = Normal(0, 1)
@@ -76,15 +76,15 @@ std_normal = Normal(0, 1)
 # %% [markdown]
 # ## 2. Configuration
 #
-# We configure the CLT, Activation Generation, and Training.
-# Key change: `CLTConfig.activation_fn` is set to `"batchtopk"`.
+# We configure the CLT, Activation Generation, and Training for GPT-2 with FP16.
+# Key changes: `CLTConfig` matches GPT-2 dims, `ActivationConfig` and `TrainingConfig` use FP16.
 
 # %%
 # --- CLT Architecture Configuration ---
-num_layers = 6
-d_model = 512
+num_layers = 12  # GPT-2 small
+d_model = 768  # GPT-2 small
 expansion_factor = 32
-clt_num_features = d_model * expansion_factor
+clt_num_features = 16384  # d_model * expansion_factor
 
 batchtopk_k = 200
 
@@ -97,19 +97,18 @@ clt_config = CLTConfig(
     batchtopk_straight_through=True,  # Use STE for gradients
     # jumprelu_threshold is not used for batchtopk
 )
-print("CLT Configuration (BatchTopK):")
+print("CLT Configuration (BatchTopK for GPT-2):")
 print(clt_config)
 
 # --- Activation Generation Configuration ---
-# Same as before - generate activations to train on
-# Use the same directory as the first tutorial, since generation is independent of CLT activation fn
-activation_dir = "./tutorial_activations_local_1M_pythia"  # Point back to original activations
+# Generate FP16 activations from GPT-2
+activation_dir = "./tutorial_activations_local_1M_fp16"
 dataset_name = "monology/pile-uncopyrighted"
 activation_config = ActivationConfig(
     # Model Source
     model_name=BASE_MODEL_NAME,
-    mlp_input_module_path_template="gpt_neox.layers.{}.mlp.input",
-    mlp_output_module_path_template="gpt_neox.layers.{}.mlp.output",
+    mlp_input_module_path_template="transformer.h.{}.ln_2.input",
+    mlp_output_module_path_template="transformer.h.{}.mlp.output",
     model_dtype=None,
     # Dataset Source
     dataset_path=dataset_name,
@@ -130,8 +129,8 @@ activation_config = ActivationConfig(
     activation_dir=activation_dir,
     output_format="hdf5",
     compression="gzip",
-    chunk_token_threshold=8_000,
-    activation_dtype="float32",
+    chunk_token_threshold=16_000,
+    activation_dtype="float16",  # Store activations in FP16
     # Normalization
     compute_norm_stats=True,
     # NNsight args
@@ -151,14 +150,10 @@ expected_activation_path = os.path.join(
 # --- Determine WandB Run Name (using config values) ---
 _lr = 1e-4
 _batch_size = 1024
-_k_int = clt_config.batchtopk_k  # ADDED: Use k for name
+_k_int = clt_config.batchtopk_k
 
 wdb_run_name = (
-    f"{clt_config.num_features}-width-"
-    f"batchtopk-k{_k_int}-"  # ADDED: Indicate BatchTopK and k
-    f"{_batch_size}-batch-"
-    f"{_lr:.1e}-lr"
-    # Sparsity lambda/c less relevant when apply_sparsity_penalty_to_batchtopk=False
+    f"gpt2-{clt_config.num_features}-width-" f"batchtopk-k{_k_int}-" f"{_batch_size}-batch-" f"{_lr:.1e}-lr-fp16"
 )
 print("\nGenerated WandB run name: " + wdb_run_name)
 
@@ -170,10 +165,11 @@ training_config = TrainingConfig(
     # Activation source
     activation_source="local_manifest",
     activation_path=expected_activation_path,
-    activation_dtype="float32",
+    activation_dtype="float16",  # Load activations in FP16
     # Training batch size
     train_batch_size_tokens=_batch_size,
     sampling_strategy="sequential",
+    precision="fp16",  # Enable mixed-precision training
     # Normalization
     normalization_method="mean_std",  # Use pre-calculated stats
     # Loss function coefficients
@@ -196,18 +192,17 @@ training_config = TrainingConfig(
     dead_feature_window=200,
     # WandB (Optional)
     enable_wandb=True,
-    wandb_project="clt-hp-sweeps-pythia-70m",
+    wandb_project="clt-debug-gpt2",
     wandb_run_name=wdb_run_name,
 )
-print("\nTraining Configuration (BatchTopK):")
+print("\nTraining Configuration (BatchTopK, FP16):")
 print(training_config)
 
 
 # %% [markdown]
 # ## 3. Generate Activations (One-Time Step)
 #
-# Generate the activation dataset, including the manifest file (`index.bin`). This step is the same
-# as in the previous tutorial, just saving to a different directory (`activation_dir`).
+# Generate the activation dataset for GPT-2 in FP16, including the manifest file.
 
 # %%
 print("Step 1: Generating/Verifying Activations (including manifest)...")
@@ -235,16 +230,14 @@ else:
         raise
 
 # %% [markdown]
-# ## 4. Training the CLT with BatchTopK Activation
+# ## 4. Training the CLT with BatchTopK Activation and FP16
 #
-# Instantiate the `CLTTrainer` using the configurations defined above.
-# The trainer will use the `LocalActivationStore` (driven by the manifest) and the CLT model
-# will use the BatchTopK activation function internally based on `clt_config`.
+# Instantiate the `CLTTrainer` for FP16 training.
 
 # %%
-print("Initializing CLTTrainer for training with BatchTopK...")
+print("Initializing CLTTrainer for training with BatchTopK and FP16...")
 
-log_dir = f"clt_training_logs/clt_pythia_batchtopk_train_{int(time.time())}"
+log_dir = f"clt_training_logs/clt_gpt2_batchtopk_fp16_train_{int(time.time())}"
 os.makedirs(log_dir, exist_ok=True)
 print(f"Logs and checkpoints will be saved to: {log_dir}")
 
@@ -254,6 +247,7 @@ try:
     print(f"- CLT config (BatchTopK): {vars(clt_config)}")
     print(f"- Activation Source: {training_config.activation_source}")
     print(f"- Reading activations from: {training_config.activation_path}")
+    print(f"- Training precision: {training_config.precision}")
 
     trainer = CLTTrainer(
         clt_config=clt_config,
@@ -269,7 +263,7 @@ except Exception as e:
     raise
 
 # Start training
-print("Beginning training using BatchTopK activation...")
+print("Beginning training using BatchTopK activation and FP16...")
 print(f"Training for {training_config.training_steps} steps.")
 print(f"Normalization method set to: {training_config.normalization_method}")
 print(
@@ -406,11 +400,11 @@ else:
 
 # Path to a BatchTopK checkpoint (e.g., one saved mid-training)
 # Ensure this checkpoint was saved when the model was still BatchTopK.
-# The tutorial saves clt_checkpoint_500.pt and clt_checkpoint_latest.pt
 # The trainer converts to JumpReLU only at the very end of training if the original was BatchTopK.
 # So, a checkpoint from step 500 should be BatchTopK.
-log_dir = "clt_training_logs/clt_pythia_batchtopk_train_1746852317"
-batchtopk_checkpoint_path = os.path.join(log_dir, "clt_checkpoint_900.pt")
+# Note: This part uses the log_dir defined in Section 4. If you are running this
+# section independently, you'll need to set log_dir to a valid path.
+batchtopk_checkpoint_path = os.path.join(log_dir, "clt_checkpoint_500.pt")
 
 if not os.path.exists(batchtopk_checkpoint_path):
     print(f"WARNING: BatchTopK checkpoint {batchtopk_checkpoint_path} not found. Skipping sweep.")
@@ -487,7 +481,7 @@ else:
     print("Initializing LocalActivationStore for theta estimation sweep...")
     posthoc_activation_store: Optional[BaseActivationStore] = None
     try:
-        from clt.training.local_activation_store import LocalActivationStore  # Ensure import
+        from clt.training.data.local_activation_store import LocalActivationStore  # Ensure import
 
         if training_config.activation_path is None:  # This check is still good practice
             raise ValueError("training_config.activation_path is None. Cannot initialize activation store for sweep.")
@@ -525,9 +519,9 @@ else:
             # Define clt_config_for_batchtopk_load INSIDE the loop
             # to ensure a fresh BatchTopK config for each iteration.
             clt_config_for_sweep = CLTConfig(
-                num_features=16384,
-                num_layers=6,
-                d_model=512,
+                num_features=clt_num_features,
+                num_layers=num_layers,
+                d_model=d_model,
                 activation_fn="batchtopk",  # Start with BatchTopK config
                 batchtopk_k=batchtopk_k,  # Specify k directly
                 batchtopk_straight_through=True,
@@ -592,17 +586,9 @@ else:
 # %% [markdown]
 # ## 8. Next Steps
 #
-# This tutorial showed how to train a CLT using the global BatchTopK activation,
-# save/load models in various formats, and perform a post-hoc analysis of
-# converting a BatchTopK model to JumpReLU with different scaling factors for the threshold.
+# This tutorial showed how to train a CLT for GPT-2 using BatchTopK activation and FP16,
+# save/load models, and perform a post-hoc analysis.
 
 # %%
-print("\nBatchTopK Tutorial Complete!")
-print(f"Logs and checkpoints will be saved to: {log_dir}")
-
-# %%
-weights = torch.load(batchtopk_checkpoint_path)
-
-# %%
-weights.keys()
-# %%
+print("\nGPT-2 FP16 BatchTopK Tutorial Complete!")
+print(f"Logs and checkpoints are saved in: {log_dir}")

@@ -165,7 +165,7 @@ training_config = TrainingConfig(
     train_batch_size_tokens=_batch_size,
     sampling_strategy="sequential",
     # Normalization
-    normalization_method="none",
+    normalization_method="sqrt_d_model",
     # Loss function coefficients (same as Tutorial 1B)
     sparsity_lambda=0.0,
     sparsity_lambda_schedule="linear",

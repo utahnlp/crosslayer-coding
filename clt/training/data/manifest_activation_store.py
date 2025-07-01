@@ -491,6 +491,11 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         elif normalization_method == "sqrt_d_model":
             # sqrt_d_model doesn't need norm stats, just applies scaling
             self.apply_normalization = True
+        else:
+            raise ValueError(
+                f"Invalid normalization_method: {normalization_method}. "
+                f"Must be one of ['none', 'mean_std', 'sqrt_d_model']"
+            )
 
         if self.apply_normalization:
             self._prep_norm()
