@@ -38,9 +38,11 @@ class Decoder(nn.Module):
             self.world_size = dist_ops.get_world_size(process_group)
             self.rank = dist_ops.get_rank(process_group)
 
-        self.decoders = nn.ModuleDict(
-            {
-                f"{src_layer}->{tgt_layer}": RowParallelLinear(
+        # Initialize decoders based on tying configuration
+        if config.decoder_tying == "per_source":
+            # Tied decoders: one decoder per source layer
+            self.decoders = nn.ModuleList([
+                RowParallelLinear(
                     in_features=self.config.num_features,
                     out_features=self.config.d_model,
                     bias=True,
@@ -51,13 +53,114 @@ class Decoder(nn.Module):
                     device=self.device,
                     dtype=self.dtype,
                 )
-                for src_layer in range(self.config.num_layers)
-                for tgt_layer in range(src_layer, self.config.num_layers)
-            }
-        )
+                for _ in range(self.config.num_layers)
+            ])
+        elif config.decoder_tying == "per_target":
+            # Tied decoders: one decoder per target layer (EleutherAI style)
+            self.decoders = nn.ModuleList([
+                RowParallelLinear(
+                    in_features=self.config.num_features,
+                    out_features=self.config.d_model,
+                    bias=True,
+                    process_group=self.process_group,
+                    input_is_parallel=False,
+                    d_model_for_init=self.config.d_model,
+                    num_layers_for_init=self.config.num_layers,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+                for _ in range(self.config.num_layers)
+            ])
+        
+        # Initialize decoder weights to zeros for tied decoders (both per_source and per_target)
+        if config.decoder_tying in ["per_source", "per_target"]:
+            for decoder in self.decoders:
+                nn.init.zeros_(decoder.weight)
+                if hasattr(decoder, 'bias_param') and decoder.bias_param is not None:
+                    nn.init.zeros_(decoder.bias_param)
+                elif hasattr(decoder, 'bias') and decoder.bias is not None:
+                    nn.init.zeros_(decoder.bias)
+            
+            # Note: EleutherAI doesn't have per-target scale/bias parameters
+            # These have been removed to match their architecture exactly
+        else:
+            # Original untied decoders: one decoder per (src, tgt) pair
+            self.decoders = nn.ModuleDict(
+                {
+                    f"{src_layer}->{tgt_layer}": RowParallelLinear(
+                        in_features=self.config.num_features,
+                        out_features=self.config.d_model,
+                        bias=True,
+                        process_group=self.process_group,
+                        input_is_parallel=False,
+                        d_model_for_init=self.config.d_model,
+                        num_layers_for_init=self.config.num_layers,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    for src_layer in range(self.config.num_layers)
+                    for tgt_layer in range(src_layer, self.config.num_layers)
+                }
+            )
+            # Note: EleutherAI doesn't have per-target scale/bias parameters
+        
+        # Initialize skip connection weights if enabled
+        if config.skip_connection:
+            if config.decoder_tying in ["per_source", "per_target"]:
+                # For tied decoders, one skip connection per target layer
+                self.skip_weights = nn.ParameterList([
+                    nn.Parameter(torch.zeros(self.config.d_model, self.config.d_model, 
+                                           device=self.device, dtype=self.dtype))
+                    for _ in range(self.config.num_layers)
+                ])
+            else:
+                # For untied decoders, one skip connection per src->tgt pair
+                self.skip_weights = nn.ParameterDict({
+                    f"{src_layer}->{tgt_layer}": nn.Parameter(
+                        torch.zeros(self.config.d_model, self.config.d_model, 
+                                  device=self.device, dtype=self.dtype)
+                    )
+                    for src_layer in range(self.config.num_layers)
+                    for tgt_layer in range(src_layer, self.config.num_layers)
+                })
+        else:
+            self.skip_weights = None
+            
+        # Initialize feature_offset and feature_scale (indexed by target layer)
+        # These match EleutherAI's post_enc and post_enc_scale
+        # Note: Currently only implemented for tied decoders to match EleutherAI
+        # For per_source tying, these would need to be indexed differently
+        if config.decoder_tying in ["per_source", "per_target"]:
+            features_per_rank = config.num_features // self.world_size if self.world_size > 1 else config.num_features
+            
+            if config.enable_feature_offset:
+                # Initialize feature_offset for each target layer
+                self.feature_offset = nn.ParameterList([
+                    nn.Parameter(torch.zeros(features_per_rank, device=self.device, dtype=self.dtype))
+                    for _ in range(config.num_layers)
+                ])
+            else:
+                self.feature_offset = None
+                
+            if config.enable_feature_scale:
+                # Initialize feature_scale for each target layer
+                # First target layer gets ones, rest get small non-zero values to allow gradient flow
+                self.feature_scale = nn.ParameterList([
+                    nn.Parameter(
+                        torch.ones(features_per_rank, device=self.device, dtype=self.dtype) if i == 0
+                        else torch.full((features_per_rank,), 0.1, device=self.device, dtype=self.dtype)
+                    )
+                    for i in range(config.num_layers)
+                ])
+            else:
+                self.feature_scale = None
+        else:
+            self.feature_offset = None
+            self.feature_scale = None
+            
         self.register_buffer("_cached_decoder_norms", None, persistent=False)
 
-    def decode(self, a: Dict[int, torch.Tensor], layer_idx: int) -> torch.Tensor:
+    def decode(self, a: Dict[int, torch.Tensor], layer_idx: int, source_inputs: Optional[Dict[int, torch.Tensor]] = None) -> torch.Tensor:
         """Decode the feature activations to reconstruct outputs at the specified layer.
 
         Input activations `a` are expected to be the *full* tensors.
@@ -87,21 +190,150 @@ class Decoder(nn.Module):
 
         reconstruction = torch.zeros((batch_dim_size, self.config.d_model), device=self.device, dtype=self.dtype)
 
-        for src_layer in range(layer_idx + 1):
-            if src_layer in a:
-                activation_tensor = a[src_layer].to(device=self.device, dtype=self.dtype)
+        if self.config.decoder_tying == "per_target":
+            # EleutherAI style: sum activations first, then decode once
+            summed_activation = torch.zeros((batch_dim_size, self.config.num_features), device=self.device, dtype=self.dtype)
+            
+            for src_layer in range(layer_idx + 1):
+                if src_layer in a:
+                    activation_tensor = a[src_layer].to(device=self.device, dtype=self.dtype)
 
-                if activation_tensor.numel() == 0:
-                    continue
-                if activation_tensor.shape[-1] != self.config.num_features:
-                    logger.warning(
-                        f"Rank {self.rank}: Activation tensor for layer {src_layer} has incorrect feature dimension {activation_tensor.shape[-1]}, expected {self.config.num_features}. Skipping decode contribution."
-                    )
-                    continue
+                    if activation_tensor.numel() == 0:
+                        continue
+                    if activation_tensor.shape[-1] != self.config.num_features:
+                        logger.warning(
+                            f"Rank {self.rank}: Activation tensor for layer {src_layer} has incorrect feature dimension {activation_tensor.shape[-1]}, expected {self.config.num_features}. Skipping decode contribution."
+                        )
+                        continue
 
-                decoder = self.decoders[f"{src_layer}->{layer_idx}"]
-                decoded = decoder(activation_tensor)
-                reconstruction += decoded
+                    # Apply feature affine transformations (indexed by target layer)
+                    # EleutherAI only applies these to non-zero (selected) features
+                    if self.feature_offset is not None or self.feature_scale is not None:
+                        # Get non-zero positions (selected features)
+                        nonzero_mask = activation_tensor != 0
+                        
+                        if nonzero_mask.any():
+                            # Apply transformations only to selected features
+                            activation_tensor = activation_tensor.clone()
+                            batch_indices, feature_indices = nonzero_mask.nonzero(as_tuple=True)
+                            
+                            if self.feature_offset is not None:
+                                # Apply offset only to non-zero features
+                                offset_values = self.feature_offset[layer_idx][feature_indices]
+                                activation_tensor[batch_indices, feature_indices] += offset_values
+                                
+                            if self.feature_scale is not None:
+                                # Apply scale only to non-zero features
+                                scale_values = self.feature_scale[layer_idx][feature_indices]
+                                activation_tensor[batch_indices, feature_indices] *= scale_values
+                    
+                    summed_activation += activation_tensor
+            
+            # Now decode ONCE with the summed activation
+            decoder = self.decoders[layer_idx]
+            reconstruction = decoder(summed_activation)
+            
+            # Apply skip connections from source inputs if enabled
+            if self.skip_weights is not None and source_inputs is not None:
+                skip_weight = self.skip_weights[layer_idx]
+                # Add skip connections from each source layer that contributed
+                for src_layer in range(layer_idx + 1):
+                    if src_layer in source_inputs:
+                        source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
+                        # Flatten if needed
+                        original_shape = source_input.shape
+                        if source_input.dim() == 3:
+                            source_input_2d = source_input.view(-1, source_input.shape[-1])
+                        else:
+                            source_input_2d = source_input
+                        # Apply skip: source @ W_skip^T
+                        skip_contribution = source_input_2d @ skip_weight.T
+                        # Reshape back if needed
+                        if source_input.dim() == 3:
+                            skip_contribution = skip_contribution.view(original_shape)
+                        reconstruction += skip_contribution
+            
+        else:
+            # Original logic for per_source and untied decoders
+            for src_layer in range(layer_idx + 1):
+                if src_layer in a:
+                    activation_tensor = a[src_layer].to(device=self.device, dtype=self.dtype)
+
+                    if activation_tensor.numel() == 0:
+                        continue
+                    if activation_tensor.shape[-1] != self.config.num_features:
+                        logger.warning(
+                            f"Rank {self.rank}: Activation tensor for layer {src_layer} has incorrect feature dimension {activation_tensor.shape[-1]}, expected {self.config.num_features}. Skipping decode contribution."
+                        )
+                        continue
+
+                    # Apply feature affine transformations for per_source
+                    if self.config.decoder_tying == "per_source":
+                        # Get non-zero positions (selected features)
+                        nonzero_mask = activation_tensor != 0
+                        
+                        if nonzero_mask.any():
+                            # Apply transformations only to selected features
+                            activation_tensor = activation_tensor.clone()
+                            batch_indices, feature_indices = nonzero_mask.nonzero(as_tuple=True)
+                            
+                            if self.feature_offset is not None:
+                                # Apply offset indexed by target layer
+                                offset_values = self.feature_offset[layer_idx][feature_indices]
+                                activation_tensor[batch_indices, feature_indices] += offset_values
+                                
+                            if self.feature_scale is not None:
+                                # Apply scale indexed by target layer
+                                scale_values = self.feature_scale[layer_idx][feature_indices]
+                                activation_tensor[batch_indices, feature_indices] *= scale_values
+
+                    if self.config.decoder_tying == "per_source":
+                        # Use tied decoder for the source layer
+                        decoder = self.decoders[src_layer]
+                        decoded = decoder(activation_tensor)
+                        
+                        # Apply skip connection from this source input if enabled
+                        if self.skip_weights is not None and source_inputs is not None and src_layer in source_inputs:
+                            skip_weight = self.skip_weights[layer_idx]
+                            source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
+                            # Flatten if needed
+                            original_shape = source_input.shape
+                            if source_input.dim() == 3:
+                                source_input_2d = source_input.view(-1, source_input.shape[-1])
+                            else:
+                                source_input_2d = source_input
+                            # Apply skip: source @ W_skip^T
+                            skip_contribution = source_input_2d @ skip_weight.T
+                            # Reshape back if needed
+                            if source_input.dim() == 3:
+                                skip_contribution = skip_contribution.view(original_shape)
+                            decoded += skip_contribution
+                    else:
+                        # Use untied decoder for (src, tgt) pair
+                        decoder = self.decoders[f"{src_layer}->{layer_idx}"]
+                        decoded = decoder(activation_tensor)
+                        
+                        # Apply skip connection from this source input if enabled
+                        if self.skip_weights is not None and source_inputs is not None and src_layer in source_inputs:
+                            skip_key = f"{src_layer}->{layer_idx}"
+                            if skip_key in self.skip_weights:
+                                skip_weight = self.skip_weights[skip_key]
+                                source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
+                                # Flatten if needed
+                                original_shape = source_input.shape
+                                if source_input.dim() == 3:
+                                    source_input_2d = source_input.view(-1, source_input.shape[-1])
+                                else:
+                                    source_input_2d = source_input
+                                # Apply skip: source @ W_skip^T
+                                skip_contribution = source_input_2d @ skip_weight.T
+                                # Reshape back if needed
+                                if source_input.dim() == 3:
+                                    skip_contribution = skip_contribution.view(original_shape)
+                                decoded += skip_contribution
+                        
+                    reconstruction += decoded
+                    
         return reconstruction
 
     def get_decoder_norms(self) -> torch.Tensor:
@@ -143,10 +375,10 @@ class Decoder(nn.Module):
         for src_layer in range(self.config.num_layers):
             local_norms_sq_accum = torch.zeros(self.config.num_features, device=self.device, dtype=torch.float32)
 
-            for tgt_layer in range(src_layer, self.config.num_layers):
-                decoder_key = f"{src_layer}->{tgt_layer}"
-                decoder = self.decoders[decoder_key]
-                assert isinstance(decoder, RowParallelLinear), f"Decoder {decoder_key} is not RowParallelLinear"
+            if self.config.decoder_tying == "per_source":
+                # For tied decoders, compute norms once per source layer
+                decoder = self.decoders[src_layer]
+                assert isinstance(decoder, RowParallelLinear), f"Decoder {src_layer} is not RowParallelLinear"
 
                 current_norms_sq = torch.norm(decoder.weight, dim=0).pow(2).to(torch.float32)
 
@@ -161,7 +393,7 @@ class Decoder(nn.Module):
                     pass
                 elif local_dim_padded != actual_local_dim and local_dim_padded != features_per_rank:
                     logger.warning(
-                        f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for {decoder_key}. This might indicate an issue with RowParallelLinear partitioning."
+                        f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for decoder {src_layer}. This might indicate an issue with RowParallelLinear partitioning."
                     )
 
                 if actual_local_dim > 0:
@@ -171,9 +403,75 @@ class Decoder(nn.Module):
                         local_norms_sq_accum[global_slice] += valid_norms_sq
                     else:
                         logger.warning(
-                            f"Rank {self.rank}: Shape mismatch in decoder norm calculation for {decoder_key}. "
+                            f"Rank {self.rank}: Shape mismatch in decoder norm calculation for decoder {src_layer}. "
                             f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
                         )
+            elif self.config.decoder_tying == "per_target":
+                # For per_target tying, each decoder corresponds to a target layer
+                # We accumulate decoder norms from all target layers >= src_layer
+                for tgt_layer in range(src_layer, self.config.num_layers):
+                    decoder = self.decoders[tgt_layer]
+                    assert isinstance(decoder, RowParallelLinear), f"Decoder {tgt_layer} is not RowParallelLinear"
+
+                    current_norms_sq = torch.norm(decoder.weight, dim=0).pow(2).to(torch.float32)
+
+                    full_dim = decoder.full_in_features
+                    features_per_rank = (full_dim + self.world_size - 1) // self.world_size
+                    start_idx = self.rank * features_per_rank
+                    end_idx = min(start_idx + features_per_rank, full_dim)
+                    actual_local_dim = max(0, end_idx - start_idx)
+                    local_dim_padded = decoder.local_in_features
+
+                    if local_dim_padded != features_per_rank and self.rank == self.world_size - 1:
+                        pass
+                    elif local_dim_padded != actual_local_dim and local_dim_padded != features_per_rank:
+                        logger.warning(
+                            f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for decoder {tgt_layer}. This might indicate an issue with RowParallelLinear partitioning."
+                        )
+
+                    if actual_local_dim > 0:
+                        valid_norms_sq = current_norms_sq[:actual_local_dim]
+                        if valid_norms_sq.shape[0] == actual_local_dim:
+                            global_slice = slice(start_idx, end_idx)
+                            local_norms_sq_accum[global_slice] += valid_norms_sq
+                        else:
+                            logger.warning(
+                                f"Rank {self.rank}: Shape mismatch in decoder norm calculation for decoder {tgt_layer}. "
+                                f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
+                            )
+            else:
+                # For untied decoders, accumulate norms from all target layers
+                for tgt_layer in range(src_layer, self.config.num_layers):
+                    decoder_key = f"{src_layer}->{tgt_layer}"
+                    decoder = self.decoders[decoder_key]
+                    assert isinstance(decoder, RowParallelLinear), f"Decoder {decoder_key} is not RowParallelLinear"
+
+                    current_norms_sq = torch.norm(decoder.weight, dim=0).pow(2).to(torch.float32)
+
+                    full_dim = decoder.full_in_features
+                    features_per_rank = (full_dim + self.world_size - 1) // self.world_size
+                    start_idx = self.rank * features_per_rank
+                    end_idx = min(start_idx + features_per_rank, full_dim)
+                    actual_local_dim = max(0, end_idx - start_idx)
+                    local_dim_padded = decoder.local_in_features
+
+                    if local_dim_padded != features_per_rank and self.rank == self.world_size - 1:
+                        pass
+                    elif local_dim_padded != actual_local_dim and local_dim_padded != features_per_rank:
+                        logger.warning(
+                            f"Rank {self.rank}: Padded local dim ({local_dim_padded}) doesn't match calculated actual local dim ({actual_local_dim}) or features_per_rank ({features_per_rank}) for {decoder_key}. This might indicate an issue with RowParallelLinear partitioning."
+                        )
+
+                    if actual_local_dim > 0:
+                        valid_norms_sq = current_norms_sq[:actual_local_dim]
+                        if valid_norms_sq.shape[0] == actual_local_dim:
+                            global_slice = slice(start_idx, end_idx)
+                            local_norms_sq_accum[global_slice] += valid_norms_sq
+                        else:
+                            logger.warning(
+                                f"Rank {self.rank}: Shape mismatch in decoder norm calculation for {decoder_key}. "
+                                f"Valid norms shape {valid_norms_sq.shape}, expected size {actual_local_dim}."
+                            )
 
             if self.process_group is not None and dist_ops.is_dist_initialized_and_available():
                 dist_ops.all_reduce(local_norms_sq_accum, op=dist_ops.SUM, group=self.process_group)

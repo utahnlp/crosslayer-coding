@@ -68,21 +68,41 @@ class WandBLogger:
             entity_name = os.environ.get("WANDB_ENTITY", training_config.wandb_entity)
             run_name = training_config.wandb_run_name  # Can be None
 
+            # Prepare config for both new and resumed runs
+            wandb_config = self._create_wandb_config(training_config, clt_config)
+            
             if self.resume_wandb_id:
                 logger.info(f"Attempting to resume WandB run with ID: {self.resume_wandb_id}")
-                # When resuming, wandb.init will use the passed id. Do not pass project/entity/name again if resuming.
-                self.wandb_run = wandb.init(id=self.resume_wandb_id, resume="allow")
+                # When resuming, we need to update the config after init
+                self.wandb_run = wandb.init(
+                    id=self.resume_wandb_id, 
+                    resume="allow",
+                    project=project_name,
+                    entity=entity_name,
+                    tags=training_config.wandb_tags,
+                )
+                # Update config after resuming
+                if self.wandb_run:
+                    wandb.config.update(wandb_config, allow_val_change=True)
             else:
                 self.wandb_run = wandb.init(
                     project=project_name,
                     entity=entity_name,
                     name=run_name,
-                    config=self._create_wandb_config(training_config, clt_config),
-                    reinit=True,  # Allow re-initialization in the same process if needed
+                    config=wandb_config,
+                    tags=training_config.wandb_tags,
                 )
 
             if self.wandb_run:
+                self._run_id = self.wandb_run.id
                 logger.info(f"WandB logging initialized: {self.wandb_run.name} (ID: {self.wandb_run.id})")
+                # Log config keys to verify they were set (only in debug mode)
+                if logger.isEnabledFor(logging.DEBUG):
+                    if hasattr(wandb, 'config') and wandb.config:
+                        config_keys = list(wandb.config.keys())
+                        logger.debug(f"WandB config keys: {config_keys}")
+                    else:
+                        logger.debug("WandB config appears to be empty or not accessible")
             else:
                 logger.warning("Warning: WandB run initialization failed but no exception was raised.")
 

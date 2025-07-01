@@ -193,7 +193,7 @@ class TestDataIntegrity:
         store = LocalActivationStore(
             dataset_path=output_dir,
             train_batch_size_tokens=100,
-            normalization_method="standard",  # Enable normalization
+            normalization_method="mean_std",  # Enable normalization
             dtype="float32",
             device="cpu",
         )

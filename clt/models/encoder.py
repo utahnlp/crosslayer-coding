@@ -47,6 +47,9 @@ class Encoder(nn.Module):
                 for _ in range(config.num_layers)
             ]
         )
+        
+        # Note: feature_offset and feature_scale have been moved to Decoder module
+        # to match EleutherAI's architecture where they are indexed by target layer
 
     def get_preactivations(self, x: torch.Tensor, layer_idx: int) -> torch.Tensor:
         """Get pre-activation values (full tensor) for features at the specified layer."""
