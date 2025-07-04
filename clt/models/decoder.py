@@ -41,46 +41,50 @@ class Decoder(nn.Module):
         # Initialize decoders based on tying configuration
         if config.decoder_tying == "per_source":
             # Tied decoders: one decoder per source layer
-            self.decoders = nn.ModuleList([
-                RowParallelLinear(
-                    in_features=self.config.num_features,
-                    out_features=self.config.d_model,
-                    bias=True,
-                    process_group=self.process_group,
-                    input_is_parallel=False,
-                    d_model_for_init=self.config.d_model,
-                    num_layers_for_init=self.config.num_layers,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                for _ in range(self.config.num_layers)
-            ])
+            self.decoders = nn.ModuleList(
+                [
+                    RowParallelLinear(
+                        in_features=self.config.num_features,
+                        out_features=self.config.d_model,
+                        bias=True,
+                        process_group=self.process_group,
+                        input_is_parallel=False,
+                        d_model_for_init=self.config.d_model,
+                        num_layers_for_init=self.config.num_layers,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    for _ in range(self.config.num_layers)
+                ]
+            )
         elif config.decoder_tying == "per_target":
             # Tied decoders: one decoder per target layer (EleutherAI style)
-            self.decoders = nn.ModuleList([
-                RowParallelLinear(
-                    in_features=self.config.num_features,
-                    out_features=self.config.d_model,
-                    bias=True,
-                    process_group=self.process_group,
-                    input_is_parallel=False,
-                    d_model_for_init=self.config.d_model,
-                    num_layers_for_init=self.config.num_layers,
-                    device=self.device,
-                    dtype=self.dtype,
-                )
-                for _ in range(self.config.num_layers)
-            ])
-        
+            self.decoders = nn.ModuleList(
+                [
+                    RowParallelLinear(
+                        in_features=self.config.num_features,
+                        out_features=self.config.d_model,
+                        bias=True,
+                        process_group=self.process_group,
+                        input_is_parallel=False,
+                        d_model_for_init=self.config.d_model,
+                        num_layers_for_init=self.config.num_layers,
+                        device=self.device,
+                        dtype=self.dtype,
+                    )
+                    for _ in range(self.config.num_layers)
+                ]
+            )
+
         # Initialize decoder weights to zeros for tied decoders (both per_source and per_target)
         if config.decoder_tying in ["per_source", "per_target"]:
             for decoder in self.decoders:
                 nn.init.zeros_(decoder.weight)
-                if hasattr(decoder, 'bias_param') and decoder.bias_param is not None:
+                if hasattr(decoder, "bias_param") and decoder.bias_param is not None:
                     nn.init.zeros_(decoder.bias_param)
-                elif hasattr(decoder, 'bias') and decoder.bias is not None:
+                elif hasattr(decoder, "bias") and decoder.bias is not None:
                     nn.init.zeros_(decoder.bias)
-            
+
             # Note: EleutherAI doesn't have per-target scale/bias parameters
             # These have been removed to match their architecture exactly
         else:
@@ -103,64 +107,75 @@ class Decoder(nn.Module):
                 }
             )
             # Note: EleutherAI doesn't have per-target scale/bias parameters
-        
+
         # Initialize skip connection weights if enabled
         if config.skip_connection:
             if config.decoder_tying in ["per_source", "per_target"]:
                 # For tied decoders, one skip connection per target layer
-                self.skip_weights = nn.ParameterList([
-                    nn.Parameter(torch.zeros(self.config.d_model, self.config.d_model, 
-                                           device=self.device, dtype=self.dtype))
-                    for _ in range(self.config.num_layers)
-                ])
+                self.skip_weights = nn.ParameterList(
+                    [
+                        nn.Parameter(
+                            torch.zeros(self.config.d_model, self.config.d_model, device=self.device, dtype=self.dtype)
+                        )
+                        for _ in range(self.config.num_layers)
+                    ]
+                )
             else:
                 # For untied decoders, one skip connection per src->tgt pair
-                self.skip_weights = nn.ParameterDict({
-                    f"{src_layer}->{tgt_layer}": nn.Parameter(
-                        torch.zeros(self.config.d_model, self.config.d_model, 
-                                  device=self.device, dtype=self.dtype)
-                    )
-                    for src_layer in range(self.config.num_layers)
-                    for tgt_layer in range(src_layer, self.config.num_layers)
-                })
+                self.skip_weights = nn.ParameterDict(
+                    {
+                        f"{src_layer}->{tgt_layer}": nn.Parameter(
+                            torch.zeros(self.config.d_model, self.config.d_model, device=self.device, dtype=self.dtype)
+                        )
+                        for src_layer in range(self.config.num_layers)
+                        for tgt_layer in range(src_layer, self.config.num_layers)
+                    }
+                )
         else:
             self.skip_weights = None
-            
+
         # Initialize feature_offset and feature_scale (indexed by target layer)
         # These match EleutherAI's post_enc and post_enc_scale
         # Note: Currently only implemented for tied decoders to match EleutherAI
         # For per_source tying, these would need to be indexed differently
         if config.decoder_tying in ["per_source", "per_target"]:
             features_per_rank = config.num_features // self.world_size if self.world_size > 1 else config.num_features
-            
+
             if config.enable_feature_offset:
                 # Initialize feature_offset for each target layer
-                self.feature_offset = nn.ParameterList([
-                    nn.Parameter(torch.zeros(features_per_rank, device=self.device, dtype=self.dtype))
-                    for _ in range(config.num_layers)
-                ])
+                self.feature_offset = nn.ParameterList(
+                    [
+                        nn.Parameter(torch.zeros(features_per_rank, device=self.device, dtype=self.dtype))
+                        for _ in range(config.num_layers)
+                    ]
+                )
             else:
                 self.feature_offset = None
-                
+
             if config.enable_feature_scale:
                 # Initialize feature_scale for each target layer
                 # First target layer gets ones, rest get small non-zero values to allow gradient flow
-                self.feature_scale = nn.ParameterList([
-                    nn.Parameter(
-                        torch.ones(features_per_rank, device=self.device, dtype=self.dtype) if i == 0
-                        else torch.full((features_per_rank,), 0.1, device=self.device, dtype=self.dtype)
-                    )
-                    for i in range(config.num_layers)
-                ])
+                self.feature_scale = nn.ParameterList(
+                    [
+                        nn.Parameter(
+                            torch.ones(features_per_rank, device=self.device, dtype=self.dtype)
+                            if i == 0
+                            else torch.full((features_per_rank,), 0.1, device=self.device, dtype=self.dtype)
+                        )
+                        for i in range(config.num_layers)
+                    ]
+                )
             else:
                 self.feature_scale = None
         else:
             self.feature_offset = None
             self.feature_scale = None
-            
+
         self.register_buffer("_cached_decoder_norms", None, persistent=False)
 
-    def decode(self, a: Dict[int, torch.Tensor], layer_idx: int, source_inputs: Optional[Dict[int, torch.Tensor]] = None) -> torch.Tensor:
+    def decode(
+        self, a: Dict[int, torch.Tensor], layer_idx: int, source_inputs: Optional[Dict[int, torch.Tensor]] = None
+    ) -> torch.Tensor:
         """Decode the feature activations to reconstruct outputs at the specified layer.
 
         Input activations `a` are expected to be the *full* tensors.
@@ -192,8 +207,10 @@ class Decoder(nn.Module):
 
         if self.config.decoder_tying == "per_target":
             # EleutherAI style: sum activations first, then decode once
-            summed_activation = torch.zeros((batch_dim_size, self.config.num_features), device=self.device, dtype=self.dtype)
-            
+            summed_activation = torch.zeros(
+                (batch_dim_size, self.config.num_features), device=self.device, dtype=self.dtype
+            )
+
             for src_layer in range(layer_idx + 1):
                 if src_layer in a:
                     activation_tensor = a[src_layer].to(device=self.device, dtype=self.dtype)
@@ -211,48 +228,28 @@ class Decoder(nn.Module):
                     if self.feature_offset is not None or self.feature_scale is not None:
                         # Get non-zero positions (selected features)
                         nonzero_mask = activation_tensor != 0
-                        
+
                         if nonzero_mask.any():
                             # Apply transformations only to selected features
                             activation_tensor = activation_tensor.clone()
                             batch_indices, feature_indices = nonzero_mask.nonzero(as_tuple=True)
-                            
+
                             if self.feature_offset is not None:
                                 # Apply offset only to non-zero features
                                 offset_values = self.feature_offset[layer_idx][feature_indices]
                                 activation_tensor[batch_indices, feature_indices] += offset_values
-                                
+
                             if self.feature_scale is not None:
                                 # Apply scale only to non-zero features
                                 scale_values = self.feature_scale[layer_idx][feature_indices]
                                 activation_tensor[batch_indices, feature_indices] *= scale_values
-                    
+
                     summed_activation += activation_tensor
-            
+
             # Now decode ONCE with the summed activation
             decoder = self.decoders[layer_idx]
             reconstruction = decoder(summed_activation)
-            
-            # Apply skip connections from source inputs if enabled
-            if self.skip_weights is not None and source_inputs is not None:
-                skip_weight = self.skip_weights[layer_idx]
-                # Add skip connections from each source layer that contributed
-                for src_layer in range(layer_idx + 1):
-                    if src_layer in source_inputs:
-                        source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
-                        # Flatten if needed
-                        original_shape = source_input.shape
-                        if source_input.dim() == 3:
-                            source_input_2d = source_input.view(-1, source_input.shape[-1])
-                        else:
-                            source_input_2d = source_input
-                        # Apply skip: source @ W_skip^T
-                        skip_contribution = source_input_2d @ skip_weight.T
-                        # Reshape back if needed
-                        if source_input.dim() == 3:
-                            skip_contribution = skip_contribution.view(original_shape)
-                        reconstruction += skip_contribution
-            
+
         else:
             # Original logic for per_source and untied decoders
             for src_layer in range(layer_idx + 1):
@@ -271,17 +268,17 @@ class Decoder(nn.Module):
                     if self.config.decoder_tying == "per_source":
                         # Get non-zero positions (selected features)
                         nonzero_mask = activation_tensor != 0
-                        
+
                         if nonzero_mask.any():
                             # Apply transformations only to selected features
                             activation_tensor = activation_tensor.clone()
                             batch_indices, feature_indices = nonzero_mask.nonzero(as_tuple=True)
-                            
+
                             if self.feature_offset is not None:
                                 # Apply offset indexed by target layer
                                 offset_values = self.feature_offset[layer_idx][feature_indices]
                                 activation_tensor[batch_indices, feature_indices] += offset_values
-                                
+
                             if self.feature_scale is not None:
                                 # Apply scale indexed by target layer
                                 scale_values = self.feature_scale[layer_idx][feature_indices]
@@ -291,10 +288,17 @@ class Decoder(nn.Module):
                         # Use tied decoder for the source layer
                         decoder = self.decoders[src_layer]
                         decoded = decoder(activation_tensor)
-                        
-                        # Apply skip connection from this source input if enabled
-                        if self.skip_weights is not None and source_inputs is not None and src_layer in source_inputs:
-                            skip_weight = self.skip_weights[layer_idx]
+
+                    else:
+                        # Use untied decoder for (src, tgt) pair
+                        decoder = self.decoders[f"{src_layer}->{layer_idx}"]
+                        decoded = decoder(activation_tensor)
+
+                    # Apply skip connection from this source input if enabled
+                    if self.skip_weights is not None and source_inputs is not None and src_layer in source_inputs:
+                        skip_key = f"{src_layer}->{layer_idx}"
+                        if skip_key in self.skip_weights:
+                            skip_weight = self.skip_weights[skip_key]
                             source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
                             # Flatten if needed
                             original_shape = source_input.shape
@@ -308,32 +312,31 @@ class Decoder(nn.Module):
                             if source_input.dim() == 3:
                                 skip_contribution = skip_contribution.view(original_shape)
                             decoded += skip_contribution
-                    else:
-                        # Use untied decoder for (src, tgt) pair
-                        decoder = self.decoders[f"{src_layer}->{layer_idx}"]
-                        decoded = decoder(activation_tensor)
-                        
-                        # Apply skip connection from this source input if enabled
-                        if self.skip_weights is not None and source_inputs is not None and src_layer in source_inputs:
-                            skip_key = f"{src_layer}->{layer_idx}"
-                            if skip_key in self.skip_weights:
-                                skip_weight = self.skip_weights[skip_key]
-                                source_input = source_inputs[src_layer].to(device=self.device, dtype=self.dtype)
-                                # Flatten if needed
-                                original_shape = source_input.shape
-                                if source_input.dim() == 3:
-                                    source_input_2d = source_input.view(-1, source_input.shape[-1])
-                                else:
-                                    source_input_2d = source_input
-                                # Apply skip: source @ W_skip^T
-                                skip_contribution = source_input_2d @ skip_weight.T
-                                # Reshape back if needed
-                                if source_input.dim() == 3:
-                                    skip_contribution = skip_contribution.view(original_shape)
-                                decoded += skip_contribution
-                        
+
                     reconstruction += decoded
-                    
+
+        # For tied decoders, apply a single skip connection from the target layer's own input
+        if self.config.decoder_tying in ["per_source", "per_target"]:
+            if self.skip_weights is not None and source_inputs is not None and layer_idx in source_inputs:
+                skip_weight = self.skip_weights[layer_idx]
+                source_input = source_inputs[layer_idx].to(device=self.device, dtype=self.dtype)
+
+                # Flatten if needed
+                original_shape = source_input.shape
+                if source_input.dim() == 3:
+                    source_input_2d = source_input.view(-1, source_input.shape[-1])
+                else:
+                    source_input_2d = source_input
+
+                # Apply skip: source @ W_skip^T
+                skip_contribution = source_input_2d @ skip_weight.T
+
+                # Reshape back if needed
+                if source_input.dim() == 3:
+                    skip_contribution = skip_contribution.view(original_shape)
+
+                reconstruction += skip_contribution
+
         return reconstruction
 
     def get_decoder_norms(self) -> torch.Tensor:

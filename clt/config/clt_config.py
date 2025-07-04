@@ -182,6 +182,8 @@ class TrainingConfig:
     optimizer: Literal["adam", "adamw"] = "adamw"
     optimizer_beta1: Optional[float] = None  # Beta1 for Adam/AdamW (default: 0.9)
     optimizer_beta2: Optional[float] = None  # Beta2 for Adam/AdamW (default: 0.999)
+    optimizer_states_dtype: Literal["fp32", "model_dtype"] = "model_dtype"  # Dtype for optimizer states
+    enable_stochastic_rounding: bool = False  # Enable stochastic rounding for bf16 (requires optimizer_states_dtype="fp32")
     # Learning rate scheduler type. "linear_final20" keeps LR constant for the first 80% of
     # training and then linearly decays it to 0 for the final 20% (configurable via lr_scheduler_params).
     lr_scheduler: Optional[Literal["linear", "cosine", "linear_final20"]] = "linear"
