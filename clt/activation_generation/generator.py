@@ -499,7 +499,7 @@ class ActivationGenerator:
         )
         # Paths
         ds_name = os.path.basename(cfg.dataset_path)
-        self.out_dir = Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}_{cfg.target_total_tokens}_{cfg.activation_dtype}"
+        self.out_dir = Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}_{cfg.activation_dtype}_{cfg.target_total_tokens}toks_{cfg.chunk_token_threshold}chunk"
         if cfg.dataset_skip is not None:
             start_idx = cfg.dataset_skip
             end_idx = cfg.dataset_skip + cfg.target_total_tokens
