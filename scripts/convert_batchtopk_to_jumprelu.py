@@ -31,7 +31,16 @@ logger = logging.getLogger(__name__)
 
 
 def _remap_checkpoint_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-    """Remaps old state_dict keys to the new format with module prefixes."""
+    """Remaps old state_dict keys to the new format with module prefixes.
+    
+    Handles both old-style keys (encoders.*, decoders.*) and new tied decoder parameters:
+    - encoder_module.feature_offset.{layer_idx}: ParameterList for per-feature bias
+    - encoder_module.feature_scale.{layer_idx}: ParameterList for per-feature scale  
+    - decoder_module.skip_weights.{layer_idx}: ParameterList for tied decoders
+    - decoder_module.skip_weights.{src}->{tgt}: ParameterDict for untied decoders
+    - decoder_module.per_target_scale: Tensor for per src->tgt scale (tied decoders)
+    - decoder_module.per_target_bias: Tensor for per src->tgt bias (tied decoders)
+    """
     new_state_dict = {}
     for key, value in state_dict.items():
         if key.startswith("encoders."):
@@ -41,6 +50,23 @@ def _remap_checkpoint_keys(state_dict: Dict[str, torch.Tensor]) -> Dict[str, tor
         else:
             new_key = key
         new_state_dict[new_key] = value
+        
+    # Handle new parameter names that might not have the correct module prefix
+    # Create a list of keys to avoid modifying dict during iteration
+    keys_to_check = list(new_state_dict.keys())
+    for key in keys_to_check:
+        # Handle feature_offset/feature_scale that might be saved without module prefix
+        if key.startswith("feature_offset.") and not key.startswith("encoder_module."):
+            new_state_dict[f"encoder_module.{key}"] = new_state_dict.pop(key)
+        elif key.startswith("feature_scale.") and not key.startswith("encoder_module."):
+            new_state_dict[f"encoder_module.{key}"] = new_state_dict.pop(key)
+        # Handle skip_weights that might be saved without module prefix
+        elif key.startswith("skip_weights.") and not key.startswith("decoder_module."):
+            new_state_dict[f"decoder_module.{key}"] = new_state_dict.pop(key)
+        # Handle per_target parameters
+        elif key in ["per_target_scale", "per_target_bias"] and not key.startswith("decoder_module."):
+            new_state_dict[f"decoder_module.{key}"] = new_state_dict.pop(key)
+    
     if not any(k.startswith("encoder_module.") or k.startswith("decoder_module.") for k in new_state_dict.keys()):
         if any(k.startswith("encoders.") or k.startswith("decoders.") for k in state_dict.keys()):
             logger.warning(

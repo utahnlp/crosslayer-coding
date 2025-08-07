@@ -35,6 +35,8 @@ class CLTEvaluator:
         start_time: Optional[float] = None,
         mean_tg: Optional[Dict[int, torch.Tensor]] = None,
         std_tg: Optional[Dict[int, torch.Tensor]] = None,
+        normalization_method: str = "none",
+        d_model: Optional[int] = None,
     ):
         """Initialize the evaluator.
 
@@ -44,6 +46,8 @@ class CLTEvaluator:
             start_time: The initial time.time() from the trainer for elapsed time logging.
             mean_tg: Optional dictionary of per-layer target means for de-normalising outputs.
             std_tg: Optional dictionary of per-layer target stds for de-normalising outputs.
+            normalization_method: The normalization method being used.
+            d_model: Model dimension for sqrt_d_model normalization.
         """
         self.model = model
         self.device = device
@@ -51,6 +55,16 @@ class CLTEvaluator:
         # Store normalisation stats if provided
         self.mean_tg = mean_tg or {}
         self.std_tg = std_tg or {}
+        
+        # Validate normalization method
+        valid_norm_methods = ["none", "mean_std", "sqrt_d_model"]
+        if normalization_method not in valid_norm_methods:
+            raise ValueError(
+                f"Invalid normalization_method: {normalization_method}. "
+                f"Must be one of {valid_norm_methods}"
+            )
+        self.normalization_method = normalization_method
+        self.d_model = d_model
         self.metrics_history: List[Dict[str, Any]] = []  # For storing metrics over time if needed
 
     @staticmethod
@@ -249,6 +263,10 @@ class CLTEvaluator:
         total_explained_variance = 0.0
         total_nmse = 0.0
         num_layers = 0
+        
+        # For layerwise metrics
+        layerwise_nmse = {}
+        layerwise_explained_variance = {}
 
         for layer_idx, target_act in targets.items():
             if layer_idx not in reconstructions:
@@ -256,15 +274,22 @@ class CLTEvaluator:
 
             recon_act = reconstructions[layer_idx]
 
-            # --- De-normalise if stats available ---
+            # --- De-normalise based on normalization method ---
             target_act_denorm = target_act
             recon_act_denorm = recon_act
-            if layer_idx in self.mean_tg and layer_idx in self.std_tg:
+            
+            if self.normalization_method == "mean_std" and layer_idx in self.mean_tg and layer_idx in self.std_tg:
+                # Standard denormalization: x * std + mean
                 mean = self.mean_tg[layer_idx].to(recon_act.device, recon_act.dtype)
                 std = self.std_tg[layer_idx].to(recon_act.device, recon_act.dtype)
                 # Ensure broadcast shape
                 target_act_denorm = target_act * std + mean
                 recon_act_denorm = recon_act * std + mean
+            elif self.normalization_method == "sqrt_d_model" and self.d_model is not None:
+                # sqrt_d_model denormalization: x / sqrt(d_model)
+                sqrt_d_model = (self.d_model ** 0.5)
+                target_act_denorm = target_act / sqrt_d_model
+                recon_act_denorm = recon_act / sqrt_d_model
             # --- End De-normalisation ---
 
             # Ensure shapes match (flatten if necessary) and up-cast to float32 for numerically stable metrics
@@ -299,6 +324,10 @@ class CLTEvaluator:
             else:  # Target variance is zero but MSE is non-zero (implies error, NMSE is effectively infinite)
                 nmse_layer = float("inf")  # Or a large number, or handle as NaN depending on preference
             total_nmse += nmse_layer
+            
+            # Store layerwise metrics
+            layerwise_nmse[f"layer_{layer_idx}"] = nmse_layer
+            layerwise_explained_variance[f"layer_{layer_idx}"] = explained_variance_layer
 
             num_layers += 1
 
@@ -314,6 +343,8 @@ class CLTEvaluator:
         return {
             "reconstruction/explained_variance": avg_explained_variance,
             "reconstruction/normalized_mean_reconstruction_error": avg_normalized_mean_reconstruction_error,
+            "layerwise/normalized_mse": layerwise_nmse,
+            "layerwise/explained_variance": layerwise_explained_variance,
         }
 
     def _compute_feature_density(self, activations: Dict[int, torch.Tensor]) -> Dict[str, Any]:
