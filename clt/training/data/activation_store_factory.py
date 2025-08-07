@@ -1,10 +1,12 @@
 import logging
 import torch
 
-from clt.config import TrainingConfig, CLTConfig
+from clt.config import TrainingConfig, CLTConfig, ActivationConfig
+from clt.nnsight.extractor import ActivationExtractorCLT
 from clt.training.data.base_store import BaseActivationStore
 from clt.training.data.local_activation_store import LocalActivationStore
 from clt.training.data.remote_activation_store import RemoteActivationStore
+from clt.training.data.streaming_activation_store import StreamingActivationStore
 
 logger = logging.getLogger(__name__)
 
@@ -16,6 +18,7 @@ def create_activation_store(
     rank: int,
     world_size: int,
     start_time: float,
+    activation_config: ActivationConfig = None,
     shard_data: bool = True,
 ) -> BaseActivationStore:
     """Create the appropriate activation store based on training config.
@@ -97,6 +100,37 @@ def create_activation_store(
                 logger.warning(
                     f"Rank {rank}:   Normalization DISABLED (norm_stats.json not found on server or failed to load)."
                 )
+    elif activation_source == "streaming":
+        logger.info(f"Rank {rank}: Using StreamingActivationStore.")
+
+        cfg = activation_config
+        extractor = ActivationExtractorCLT(
+            model_name=cfg.model_name,
+            mlp_input_module_path_template=cfg.mlp_input_module_path_template,
+            mlp_output_module_path_template=cfg.mlp_output_module_path_template,
+            device=device,
+            model_dtype=cfg.model_dtype,
+            context_size=cfg.context_size,
+            inference_batch_size=cfg.inference_batch_size,
+            exclude_special_tokens=cfg.exclude_special_tokens,
+            prepend_bos=cfg.prepend_bos,
+            nnsight_tracer_kwargs=cfg.nnsight_tracer_kwargs,
+            nnsight_invoker_args=cfg.nnsight_invoker_args
+        )
+        store = StreamingActivationStore(
+            activation_cfg=activation_config,
+            activation_extractor=extractor,
+            train_batch_size_tokens=training_config.train_batch_size_tokens,
+            device=device,
+            dtype=training_config.activation_dtype,
+            rank=rank,
+            world=world_size,
+            seed=training_config.seed,
+            sampling_strategy=sampling_strategy,
+            normalization_method=training_config.normalization_method,
+            shard_data=shard_data,
+        )
+        
     else:
         raise ValueError(f"Unknown activation_source: {activation_source}. Valid options: 'local_manifest', 'remote'.")
     return store

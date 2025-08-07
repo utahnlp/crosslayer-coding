@@ -10,7 +10,7 @@ Replaces the old stateless random‑batch client.  The workflow is:
 3.  For each batch:
     * Group the next `B` manifest entries by `chunk_id`.
     * For each chunk request `/slice?chunk=X&rows=i,j,k`.
-    * Parse the raw bf16 bytes into tensors: \[layers\] → inputs, targets.
+    * Parse the raw bf16 bytes into tensors: [layers] → inputs, targets.
 4.  Apply normalization and return `Dict[layer → Tensor]`.
 
 This module requires the server refactor (`/slice` endpoint).

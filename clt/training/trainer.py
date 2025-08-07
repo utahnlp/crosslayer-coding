@@ -50,6 +50,7 @@ class CLTTrainer:
         self,
         clt_config: CLTConfig,
         training_config: TrainingConfig,
+        activation_config = None,
         log_dir: Optional[str] = None,
         device: Optional[Union[str, torch.device]] = None,
         distributed: bool = False,  # Add distributed flag
@@ -308,6 +309,7 @@ class CLTTrainer:
         self.activation_store = create_activation_store(
             training_config=self.training_config,
             clt_config=self.clt_config,
+            activation_config=activation_config,
             device=self.device,
             rank=activation_store_rank,  # Pass the actual rank
             world_size=activation_store_world,  # Pass the actual world size
