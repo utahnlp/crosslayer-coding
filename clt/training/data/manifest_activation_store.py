@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 import threading
 import queue
+import math
 
 # import json # Unused
 from abc import ABC, abstractmethod
@@ -367,6 +368,7 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         self.epoch = 0
         self.prefetch_batches = max(1, prefetch_batches)
         self.sampling_strategy = sampling_strategy
+        self.normalization_method = normalization_method
         self.shard_data = shard_data
 
         # Device setup
@@ -483,8 +485,17 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         self.apply_normalization = False
         if normalization_method == "none":
             self.apply_normalization = False
-        else:
+        elif normalization_method == "mean_std":
+            # mean_std requires normalization stats
             self.apply_normalization = bool(self.norm_stats_data)
+        elif normalization_method == "sqrt_d_model":
+            # sqrt_d_model doesn't need norm stats, just applies scaling
+            self.apply_normalization = True
+        else:
+            raise ValueError(
+                f"Invalid normalization_method: {normalization_method}. "
+                f"Must be one of ['none', 'mean_std', 'sqrt_d_model']"
+            )
 
         if self.apply_normalization:
             self._prep_norm()
@@ -556,9 +567,14 @@ class ManifestActivationStore(BaseActivationStore, ABC):
         self.mean_tg: Dict[int, torch.Tensor] = {}
         self.std_tg: Dict[int, torch.Tensor] = {}
 
-        if not self.norm_stats_data:
-            logger.warning("Normalization prep called but no stats data loaded.")
-            self.apply_normalization = False
+        # Only need to load stats for mean_std normalization
+        if self.normalization_method == "mean_std":
+            if not self.norm_stats_data:
+                logger.warning("mean_std normalization requested but no stats data loaded.")
+                self.apply_normalization = False
+                return
+        elif self.normalization_method == "sqrt_d_model":
+            # sqrt_d_model doesn't need stats, just return
             return
 
         missing_layers = set(self.layer_indices)
@@ -901,10 +917,17 @@ class ManifestActivationStore(BaseActivationStore, ABC):
                         log_stats_this_batch["target_mean_in"] = self.mean_in[li].mean().item()
                         log_stats_this_batch["target_std_in"] = self.std_in[li].mean().item()
 
-                if li in self.mean_in and li in self.std_in:
-                    inputs_li = (inputs_li - self.mean_in[li]) / self.std_in[li]
-                if li in self.mean_tg and li in self.std_tg:
-                    targets_li = (targets_li - self.mean_tg[li]) / self.std_tg[li]
+                if self.normalization_method == "mean_std":
+                    # Standard normalization: (x - mean) / std
+                    if li in self.mean_in and li in self.std_in:
+                        inputs_li = (inputs_li - self.mean_in[li]) / self.std_in[li]
+                    if li in self.mean_tg and li in self.std_tg:
+                        targets_li = (targets_li - self.mean_tg[li]) / self.std_tg[li]
+                elif self.normalization_method == "sqrt_d_model":
+                    # EleutherAI-style normalization: x * sqrt(d_model)
+                    sqrt_d_model = math.sqrt(self.d_model)
+                    inputs_li = inputs_li * sqrt_d_model
+                    targets_li = targets_li * sqrt_d_model
 
                 # Convert to final target dtype *after* normalization
                 final_batch_inputs[li] = inputs_li.to(self.dtype)
