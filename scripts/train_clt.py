@@ -25,7 +25,7 @@ except ImportError:
 
 # Import necessary CLT components
 try:
-    from clt.config import CLTConfig, TrainingConfig
+    from clt.config import CLTConfig, TrainingConfig, ActivationConfig
     from clt.training.trainer import CLTTrainer
 except ImportError as e:
     print(
@@ -105,7 +105,7 @@ def parse_args():
     core_group.add_argument(
         "--activation-source",
         type=str,
-        choices=["local_manifest", "remote"],
+        choices=["local_manifest", "remote", "streaming"],
         required=True,
         help="Source of activations: 'local_manifest' or 'remote' server.",
     )
@@ -761,6 +761,23 @@ def main():
     )
     logger.info(f"Training Config: {training_config}")
 
+    activation_cfg = None
+    if args.activation_source == 'streaming':
+        activation_cfg = ActivationConfig(
+            model_name="allenai/OLMo-2-0425-1B-Instruct",
+            mlp_input_module_path_template="model.layers.{}.mlp.input",
+            mlp_output_module_path_template="model.layers.{}.mlp.output",
+            activation_dtype="bfloat16",
+            dataset_path="allenai/olmo-mix-1124",
+            context_size=4096,
+            inference_batch_size=2,
+            prepend_bos=True,
+            target_total_tokens=1000000,
+            activation_dir=None,
+            compression=None,
+            chunk_token_threshold=1,
+            compute_norm_stats=True)
+
     # --- Initialize Trainer ---
     logger.info(f"Initializing CLTTrainer for {args.activation_source} training...")
     try:
@@ -770,6 +787,7 @@ def main():
             log_dir=str(output_dir_path),  # Use the resolved output_dir_path
             device=device_str,
             distributed=args.distributed,
+            activation_config=activation_cfg,
             resume_from_checkpoint_path=actual_checkpoint_path_to_load if resuming_run else None,
         )
     except Exception as e:
