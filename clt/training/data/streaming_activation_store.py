@@ -17,7 +17,7 @@ from ...nnsight.extractor import ActivationExtractorCLT
 
 logger = logging.getLogger(__name__)
 
-DIR = '/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding/data/activations/allenai/OLMo-2-0425-1B-Instruct/olmo-mix-1124_train_float32_1000000toks_1000chunks'
+DIR = '/scratch/general/vast/u1472283/crosslayer-coding/data/activations/allenai/OLMo-2-0425-1B-Instruct/olmo-mix-1124_train_float32_1000000toks_1000chunks'
 DIR = Path(DIR)
 
 class StreamingActivationStore(ManifestActivationStore):
@@ -197,7 +197,6 @@ class StreamingActivationStore(ManifestActivationStore):
     def __next__(self):
         batch_size = self.train_batch_size_tokens
 
-        logger.critical('HELLO')
         logger.info(f'{batch_size=}')
 
         # 1 easy
