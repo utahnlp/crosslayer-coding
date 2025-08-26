@@ -472,6 +472,55 @@ def parse_args():
     )
     log_group.add_argument("--wandb-tags", nargs="+", default=None, help="List of tags for the WandB run.")
 
+    # --- Streaming ---
+    streaming_group = parser.add_argument_group("Streaming")
+    streaming_group.add_argument(
+        "--mlp-input-template",
+        type=str,
+        required=True,
+        help="NNsight path template for MLP inputs.",
+    )
+    streaming_group.add_argument(
+        "--mlp-output-template",
+        type=str,
+        required=True,
+        help="NNsight path template for MLP outputs.",
+    )
+    streaming_group.add_argument(
+        "--model-dtype",
+        type=str,
+        default=None,
+        help="Optional model dtype (e.g., 'float16').",
+    )
+    streaming_group.add_argument("--dataset-path", type=str, required=True, help="Dataset name or path.")
+    streaming_group.add_argument("--dataset-split", type=str, default="train", help="Dataset split.")
+    streaming_group.add_argument(
+        "--dataset-text-column",
+        type=str,
+        default="text",
+        help="Dataset text column name.",
+    )
+    streaming_group.add_argument(
+        "--context-size",
+        type=int,
+        default=128,
+        help="Context size for tokenization/inference.",
+    )
+    streaming_group.add_argument("--inference-batch-size", type=int, default=512, help="Inference batch size.")
+    streaming_group.add_argument(
+        "--exclude-special-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude special tokens.",
+    )
+    streaming_group.add_argument(
+        "--prepend-bos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Prepend BOS token.",
+    )
+
+
     args = parser.parse_args()
 
     # --- Validate conditional arguments ---
@@ -764,14 +813,18 @@ def main():
     activation_cfg = None
     if args.activation_source == 'streaming':
         activation_cfg = ActivationConfig(
-            model_name="allenai/OLMo-2-0425-1B-Instruct",
-            mlp_input_module_path_template="model.layers.{}.mlp.input",
-            mlp_output_module_path_template="model.layers.{}.mlp.output",
-            activation_dtype="bfloat16",
-            dataset_path="allenai/olmo-mix-1124",
-            context_size=4096,
-            inference_batch_size=2,
-            prepend_bos=True,
+            model_name=args.model_name,
+            mlp_input_module_path_template=args.mlp_input_template,
+            mlp_output_module_path_template=args.mlp_output_template,
+            model_dtype=args.model_dtype,
+            exclude_special_tokens=args.exclude_special_tokens,
+            dataset_split=args.dataset_split,
+            dataset_text_column=args.dataset_text_column,
+            activation_dtype=args.activation_dtype,
+            dataset_path=args.dataset_path,
+            context_size=args.context_size,
+            inference_batch_size=args.inference_batch_size,
+            prepend_bos=args.prepend_bos,
             target_total_tokens=1000000,
             activation_dir=None,
             compression=None,

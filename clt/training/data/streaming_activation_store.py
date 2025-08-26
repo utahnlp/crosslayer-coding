@@ -38,6 +38,7 @@ class StreamingActivationStore(ManifestActivationStore):
     ):
         
         self.extractor = activation_extractor
+        self.activation_cfg = activation_cfg
         cfg = activation_cfg
         self.stream = self.extractor.stream_activations(
             dataset_path=cfg.dataset_path,
@@ -48,8 +49,20 @@ class StreamingActivationStore(ManifestActivationStore):
             dataset_trust_remote_code=cfg.dataset_trust_remote_code,
             cache_path=cfg.cache_path,
         )
+
+        # buffer
         self.idx = 0
-        # self.inps, self.tgts = next(self.stream)
+        self.inp = None
+        self.tgt = None
+        
+        if cfg.activation_dtype == 'float32':
+            self.act_dtype = torch.float32
+        elif cfg.activation_dtype == 'float16':
+            self.act_dtype = torch.float16
+        elif cfg.activation_dtype == 'bfloat16':
+            self.act_dtype = torch.bfloat16
+        else:
+            raise ValueError(f"Unsupported activation_dtype: {cfg.activation_dtype}")
 
         super().__init__(
             train_batch_size_tokens=train_batch_size_tokens,
@@ -196,31 +209,53 @@ class StreamingActivationStore(ManifestActivationStore):
 
     def __next__(self):
         batch_size = self.train_batch_size_tokens
+        def need_to_replenish_buffer():
+            return (self.inp is None) or (self.idx + batch_size > self.inp[0].shape[0])
 
-        logger.info(f'{batch_size=}')
+        def replenish_buffer():
+            buffer_size = 0
+            if self.inp is None:
+                logger.info('replenish buffer')
+            else:
+                buffer_size = self.inp[0].shape[0] - self.idx
+                logger.info(f'replenish buffer, buffer size {buffer_size}, less than batch size {batch_size}')
 
-        # 1 easy
-        inps, tgts = next(self.stream)
-        logger.info(f'before slicing {inps[0].shape=} {tgts[0].shape=}')
-        inps = {li: acts[:batch_size, :] for li, acts in inps.items()}
-        tgts = {li: acts[:batch_size, :] for li, acts in tgts.items()}
-        logger.info(f'after slicing {inps[0].shape=} {tgts[0].shape=}')
-        return inps, tgts
+            # get new batch from stream
+            new_inp, new_tgt = next(self.stream)
+            new_stream_size = new_inp[0].shape[0]
+            
+            # concat new batch to remaining buffer, reset index
+            if self.inp is None: # first iteration
+                self.inp = {li: x.to(self.act_dtype) for li, x in new_inp.items()}
+                self.tgt = {li: x.to(self.act_dtype) for li, x in new_tgt.items()}
+            else: # all other iterations, inp maps layer idx to tensor
+                for li in new_inp.keys():
+                    self.inp[li] = torch.cat((self.inp[li][self.idx:], new_inp[li].to(self.act_dtype)), dim=0)
+                    self.tgt[li] = torch.cat((self.tgt[li][self.idx:], new_tgt[li].to(self.act_dtype)), dim=0)
+            self.idx = 0
 
-        # 2 
-        # if self.idx + batch_size > len(self.activations):
-        #     inp, tgt = next(self.stream)
-        #     self.activations = next(self.stream)
-        # return self.activations[self.idx: self.idx + batch_size]
-
-        # 3
-        # if self.idx + batch_size > len(self.activations):
-        #     # get more activations
-        #     inp, tgt = next(self.stream)
-        #     self.activations = torch.concatenate(self.activations[self.idx:], )
-        #     pass
+            new_buffer_size = self.inp[0].shape[0]
+            logger.info(f'new buffer size is {buffer_size} (old) + {new_stream_size} (new) = {new_buffer_size}')
 
 
-        # self.idx += batch_size
-        # return self.activations[self.idx: self.idx + batch_size]
+        # replenish buffer until large enough to retrieve next batch
+        while need_to_replenish_buffer():
+            replenish_buffer()
+        
+        # set start and end indices
+        start = self.idx
+        end = self.idx + batch_size
+        logger.info(f'buffer size {self.inp[0].shape[0]}, batch size {batch_size}, retrieving idxs {start}-{end}')
+        
+        # get batch from buffer
+        batch_inp = {}
+        batch_tgt = {}
+        for li in self.inp.keys():
+            batch_inp[li] = self.inp[li][start:end]
+            batch_tgt[li] = self.tgt[li][start:end]
+        
+        # update index for next iteration
+        self.idx = self.idx + batch_size
+
+        return batch_inp, batch_tgt
 
