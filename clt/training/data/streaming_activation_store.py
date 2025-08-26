@@ -41,22 +41,17 @@ class StreamingActivationStore(ManifestActivationStore):
         self.extractor = activation_extractor
         self.activation_cfg = activation_cfg
         cfg = activation_cfg
-        # Only rank 0 needs the extractor/stream; other ranks just receive tensors.
-        if rank == 0:
-            assert self.extractor is not None, "Rank 0 must receive an activation_extractor."
-            self.stream = self.extractor.stream_activations(
-                dataset_path=cfg.dataset_path,
-                dataset_split=cfg.dataset_split,
-                dataset_text_column=cfg.dataset_text_column,
-                dataset_skip=cfg.dataset_skip,
-                streaming=cfg.streaming,
-                dataset_trust_remote_code=cfg.dataset_trust_remote_code,
-                cache_path=cfg.cache_path,
-                pbar=False
-            )
-        else:
-            self.stream = None
+        self.stream = self.extractor.stream_activations(
+            dataset_path=cfg.dataset_path,
+            dataset_split=cfg.dataset_split,
+            dataset_text_column=cfg.dataset_text_column,
+            dataset_skip=cfg.dataset_skip,
+            streaming=cfg.streaming,
+            dataset_trust_remote_code=cfg.dataset_trust_remote_code,
+            cache_path=cfg.cache_path,
+        )
 
+        # buffer
         self.idx = 0
         self.inp = None
         self.tgt = None
@@ -227,118 +222,53 @@ class StreamingActivationStore(ManifestActivationStore):
             group = dist.group.WORLD
 
         batch_size = self.train_batch_size_tokens
+        def need_to_replenish_buffer():
+            return (self.inp is None) or (self.idx + batch_size > self.inp[0].shape[0])
 
-        # -------------------------
-        # Rank 0: manage CPU-side stream buffer (remote logic)
-        # -------------------------
-        if self.rank == 0:
-            assert self.stream is not None, "Rank 0 must own the activation stream."
+        def replenish_buffer():
+            buffer_size = 0
+            if self.inp is None:
+                logger.info('replenish buffer')
+            else:
+                buffer_size = self.inp[0].shape[0] - self.idx
+                logger.info(f'replenish buffer, buffer size {buffer_size}, less than batch size {batch_size}')
 
-            def need_to_replenish_buffer():
-                if getattr(self, "inp", None) is None:
-                    return True
-                # pick any key for shape checks
-                any_li = next(iter(self.inp.keys()))
-                return (self.idx + batch_size > self.inp[any_li].shape[0])
+            # get new batch from stream
+            new_inp, new_tgt = next(self.stream)
+            new_stream_size = new_inp[0].shape[0]
+            
+            # concat new batch to remaining buffer, reset index
+            if self.inp is None: # first iteration
+                self.inp = {li: x.to(self.act_dtype) for li, x in new_inp.items()}
+                self.tgt = {li: x.to(self.act_dtype) for li, x in new_tgt.items()}
+            else: # all other iterations, inp maps layer idx to tensor
+                for li in new_inp.keys():
+                    self.inp[li] = torch.cat((self.inp[li][self.idx:], new_inp[li].to(self.act_dtype)), dim=0)
+                    self.tgt[li] = torch.cat((self.tgt[li][self.idx:], new_tgt[li].to(self.act_dtype)), dim=0)
+            self.idx = 0
 
-            def replenish_buffer():
-                # debug only
-                if getattr(self, "inp", None) is None:
-                    logger.debug("replenish buffer (first fill)")
-                    current_rem = 0
-                else:
-                    any_li = next(iter(self.inp.keys()))
-                    current_rem = self.inp[any_li].shape[0] - self.idx
-                    logger.debug(f"replenish buffer, buffer size {current_rem}, less than batch size {batch_size}")
+            new_buffer_size = self.inp[0].shape[0]
+            logger.info(f'new buffer size is {buffer_size} (old) + {new_stream_size} (new) = {new_buffer_size}')
 
-                # pull a fresh chunk from the stream (likely CPU tensors)
-                new_inp, new_tgt = next(self.stream)
-                any_new = next(iter(new_inp.keys()))
-                new_stream_size = new_inp[any_new].shape[0]
 
-                # cast to the activation dtype on CPU first (keeps VRAM down until broadcast)
-                new_inp = {li: x.to(self.act_dtype) for li, x in new_inp.items()}
-                new_tgt = {li: x.to(self.act_dtype) for li, x in new_tgt.items()}
+        # replenish buffer until large enough to retrieve next batch
+        while need_to_replenish_buffer():
+            replenish_buffer()
+        
+        # set start and end indices
+        start = self.idx
+        end = self.idx + batch_size
+        logger.info(f'buffer size {self.inp[0].shape[0]}, batch size {batch_size}, retrieving idxs {start}-{end}')
+        
+        # get batch from buffer
+        batch_inp = {}
+        batch_tgt = {}
+        for li in self.inp.keys():
+            batch_inp[li] = self.inp[li][start:end]
+            batch_tgt[li] = self.tgt[li][start:end]
+        
+        # update index for next iteration
+        self.idx = self.idx + batch_size
 
-                if getattr(self, "inp", None) is None:
-                    # first fill: take the whole new chunk
-                    self.inp = new_inp
-                    self.tgt = new_tgt
-                else:
-                    # concatenate remaining tail of old buffer with the new chunk
-                    # (all on CPU so far)
-                    for li in new_inp.keys():
-                        self.inp[li] = torch.cat((self.inp[li][self.idx:], new_inp[li]), dim=0)
-                        self.tgt[li] = torch.cat((self.tgt[li][self.idx:], new_tgt[li]), dim=0)
-                self.idx = 0
-
-                any_li2 = next(iter(self.inp.keys()))
-                new_buffer_size = self.inp[any_li2].shape[0]
-                logger.debug(f"new buffer size is {current_rem} (old rem) + {new_stream_size} (new) = {new_buffer_size}")
-
-            # ensure buffer has at least one batch
-            while need_to_replenish_buffer():
-                replenish_buffer()
-
-            # slice a batch (still on CPU)
-            start = self.idx
-            end   = self.idx + batch_size
-            any_li = next(iter(self.inp.keys()))
-            logger.debug(f'buffer size {self.inp[any_li].shape[0]}, batch size {batch_size}, retrieving idxs {start}-{end}')
-
-            batch_inp = {li: self.inp[li][start:end] for li in self.inp.keys()}
-            batch_tgt = {li: self.tgt[li][start:end] for li in self.tgt.keys()}
-
-            # advance the buffer index for next call
-            self.idx = end
-
-            # infer d_model (feature dim) once from the sliced batch
-            if self.d_model is None:
-                self.d_model = next(iter(batch_inp.values())).shape[1]
-
-            # broadcast d_model as a CUDA tensor for robustness with NCCL
-            d_model_t = torch.tensor([self.d_model], device='cuda', dtype=torch.int64)
-            dist.broadcast(d_model_t, src=0, group=group)
-            self.d_model = int(d_model_t.item())
-
-            # ensure the broadcast sources live on CUDA and match dtype
-            batch_inp = {li: x.to(device='cuda', dtype=self.act_dtype) for li, x in batch_inp.items()}
-            batch_tgt = {li: x.to(device='cuda', dtype=self.act_dtype) for li, x in batch_tgt.items()}
-
-            # broadcast per-layer tensors
-            for li in self.layer_indices:
-                dist.broadcast(batch_inp[li], src=0, group=group)
-                dist.broadcast(batch_tgt[li], src=0, group=group)
-
-            inps, tgts = batch_inp, batch_tgt
-
-        # -------------------------
-        # Non-zero ranks: receive shapes & tensors
-        # -------------------------
-        else:
-            # receive d_model
-            d_model_t = torch.zeros(1, device='cuda', dtype=torch.int64)
-            dist.broadcast(d_model_t, src=0, group=group)
-            self.d_model = int(d_model_t.item())
-
-            # pre-allocate CUDA buffers for this mini-batch
-            inps = {li: torch.empty((batch_size, self.d_model), dtype=self.act_dtype, device='cuda')
-                    for li in self.layer_indices}
-            tgts = {li: torch.empty((batch_size, self.d_model), dtype=self.act_dtype, device='cuda')
-                    for li in self.layer_indices}
-
-            # receive the layer tensors
-            for li in self.layer_indices:
-                dist.broadcast(inps[li], src=0, group=group)
-                dist.broadcast(tgts[li], src=0, group=group)
-
-        # Optionally move off CUDA if your trainer/device expects something else
-        if self.device is not None and str(self.device) != 'cuda':
-            inps = {li: x.to(self.device) for li, x in inps.items()}
-            tgts = {li: x.to(self.device) for li, x in tgts.items()}
-
-        any_li = self.layer_indices[0]
-        logger.debug(f'after broadcast inps[{any_li}].shape={inps[any_li].shape} tgts[{any_li}].shape={tgts[any_li].shape}')
-        return inps, tgts
-
+        return batch_inp, batch_tgt
 
