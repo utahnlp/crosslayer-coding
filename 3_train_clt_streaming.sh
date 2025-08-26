@@ -30,17 +30,21 @@ export WANDB_ARTIFACT_DIR="$WANDB_DIR/artifacts"
 export WANDB_DATA_DIR="$WANDB_DIR/data"
 
 # CLT Architecture
-export CLT_FEATURES=100000
-export BATCHTOPK_K=200
+export CLT_FEATURES=100
+export BATCHTOPK_K=10
 
 # Reduced Precision
+# export CLT_DTYPE="float32"
+# export PRECISION="fp32"
+# export ACTIVATION_DTYPE="float32"
+export MODEL_DTYPE="float32"
 export CLT_DTYPE="bfloat16"
 export PRECISION="bf16"
-export ACTIVATION_DTYPE="float32"
+export ACTIVATION_DTYPE="bfloat16"
 
 # Training Hyperparams
-export DATASET_SIZE=3000000
-export BATCH_SIZE=256
+export DATASET_SIZE=1000000
+export BATCH_SIZE=32
 # export TRAINING_STEPS=$(($DATASET_SIZE/$BATCH_SIZE)) # set to DATASET_SIZE / BATCH_SIZE above
 export TRAINING_STEPS=5000
 export LEARNING_RATE=0.0001
@@ -58,11 +62,17 @@ export DATASET_SPLIT="train"
 export ACTIVATION_PATH="$DATA_DIR/activations/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}"
 export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}/${CLT_FEATURES}feats_${BATCH_SIZE}batchsize"
 
+# Streaming
+export DATASET_NAME="allenai/olmo-mix-1124"
+export CONTEXT_SIZE=4096
+export INFERENCE_BATCH_SIZE=2
+export NUM_TOKENS=1000000
+export CHUNK_TOKEN_THRESHOLD=1000
+
 
 torchrun \
-    --nproc_per_node=auto \
-    $CODE_DIR/scripts/train_clt.py \
-    --activation-source local_manifest \
+     $CODE_DIR/scripts/train_clt.py \
+    --activation-source streaming \
     --output-dir $OUT_DIR \
     --model-name $MODEL_NAME \
     --distributed \
@@ -82,9 +92,16 @@ torchrun \
     --log-interval $LOG_INTERVAL \
     --eval-interval $EVAL_INTERVAL \
     --checkpoint-interval $CHECKPOINT_INTERVAL \
-    --enable-wandb \
-    --wandb-project "cross-layer-transcoders" \
-    --wandb-entity "utah-clt" \
+    --mlp-input-template "model.layers.{}.mlp.input" \
+    --mlp-output-template "model.layers.{}.mlp.output" \
+    --model-dtype $MODEL_DTYPE \
+    --dataset-path $DATASET_NAME \
+    --context-size $CONTEXT_SIZE \
+    --inference-batch-size $INFERENCE_BATCH_SIZE \
+    --prepend-bos \
     --debug-anomaly
+    # --enable-wandb \
+    # --wandb-project "cross-layer-transcoders" \
+    # --wandb-entity "utah-clt" \
     # --resume_from_checkpoint_dir $CHECKPOINT_DIR \
     # --resume_step 1234
