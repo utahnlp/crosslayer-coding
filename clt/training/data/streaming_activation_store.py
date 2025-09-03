@@ -9,7 +9,7 @@ from typing import Dict, Optional, Any
 
 import numpy as np
 import torch
-
+import torch.distributed as dist
 
 from .manifest_activation_store import ManifestActivationStore
 from ...activation_generation.generator import ActivationConfig, ActivationGenerator
@@ -220,9 +220,6 @@ class StreamingActivationStore(ManifestActivationStore):
         raise Exception('this shouldn\'t be called')
 
     def __next__(self):
-        import torch.distributed as dist
-        import torch
-
         # Choose the comm group (WORLD if none was provided)
         group = getattr(self, "group", None)
         if group is None:
@@ -259,8 +256,8 @@ class StreamingActivationStore(ManifestActivationStore):
                 new_stream_size = new_inp[any_new].shape[0]
 
                 # cast to the activation dtype on CPU first (keeps VRAM down until broadcast)
-                new_inp = {li: x.to(self.dtype) for li, x in new_inp.items()}
-                new_tgt = {li: x.to(self.dtype) for li, x in new_tgt.items()}
+                new_inp = {li: x.to(self.act_dtype) for li, x in new_inp.items()}
+                new_tgt = {li: x.to(self.act_dtype) for li, x in new_tgt.items()}
 
                 if getattr(self, "inp", None) is None:
                     # first fill: take the whole new chunk
@@ -304,8 +301,8 @@ class StreamingActivationStore(ManifestActivationStore):
             self.d_model = int(d_model_t.item())
 
             # ensure the broadcast sources live on CUDA and match dtype
-            batch_inp = {li: x.to(device='cuda', dtype=self.dtype) for li, x in batch_inp.items()}
-            batch_tgt = {li: x.to(device='cuda', dtype=self.dtype) for li, x in batch_tgt.items()}
+            batch_inp = {li: x.to(device='cuda', dtype=self.act_dtype) for li, x in batch_inp.items()}
+            batch_tgt = {li: x.to(device='cuda', dtype=self.act_dtype) for li, x in batch_tgt.items()}
 
             # broadcast per-layer tensors
             for li in self.layer_indices:
@@ -324,9 +321,9 @@ class StreamingActivationStore(ManifestActivationStore):
             self.d_model = int(d_model_t.item())
 
             # pre-allocate CUDA buffers for this mini-batch
-            inps = {li: torch.empty((batch_size, self.d_model), dtype=self.dtype, device='cuda')
+            inps = {li: torch.empty((batch_size, self.d_model), dtype=self.act_dtype, device='cuda')
                     for li in self.layer_indices}
-            tgts = {li: torch.empty((batch_size, self.d_model), dtype=self.dtype, device='cuda')
+            tgts = {li: torch.empty((batch_size, self.d_model), dtype=self.act_dtype, device='cuda')
                     for li in self.layer_indices}
 
             # receive the layer tensors
