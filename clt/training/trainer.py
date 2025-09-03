@@ -21,6 +21,11 @@ from clt.training.data.base_store import BaseActivationStore
 from clt.training.data.local_activation_store import LocalActivationStore
 from clt.training.data.remote_activation_store import RemoteActivationStore
 
+# Import the streaming activation store
+from clt.training.data.streaming_activation_store import StreamingActivationStore
+from clt.nnsight.extractor import ActivationExtractorCLT
+
+
 from clt.training.losses import LossManager
 
 from .evaluator import CLTEvaluator  # Import the new evaluator
@@ -305,17 +310,45 @@ class CLTTrainer:
         # Pass the actual rank and world size from the distributed setup
         activation_store_rank = self.rank
         activation_store_world = self.world_size
-
-        self.activation_store = create_activation_store(
-            training_config=self.training_config,
-            clt_config=self.clt_config,
-            activation_config=activation_config,
-            device=self.device,
-            rank=activation_store_rank,  # Pass the actual rank
-            world_size=activation_store_world,  # Pass the actual world size
-            start_time=self.start_time,
-            shard_data=not self.distributed,  # ---> ADDED: False if distributed (TP), True otherwise <----
-        )
+        if self.distributed and getattr(self.training_config, "activation_source", None) == "streaming":
+            self.activation_store = StreamingActivationStore(
+                activation_cfg=activation_config,
+                activation_extractor=ActivationExtractorCLT(
+                    model_name=activation_config.model_name,
+                    mlp_input_module_path_template=activation_config.mlp_input_module_path_template,
+                    mlp_output_module_path_template=activation_config.mlp_output_module_path_template,
+                    device=self.device,
+                    model_dtype=getattr(activation_config, "model_dtype", None),
+                    context_size=getattr(activation_config, "context_size", None),
+                    inference_batch_size=getattr(activation_config, "inference_batch_size", None),
+                    exclude_special_tokens=getattr(activation_config, "exclude_special_tokens", None),
+                    prepend_bos=getattr(activation_config, "prepend_bos", None),
+                    nnsight_tracer_kwargs=getattr(activation_config, "nnsight_tracer_kwargs", None),
+                    nnsight_invoker_args=getattr(activation_config, "nnsight_invoker_args", None),
+                ),
+                train_batch_size_tokens=self.training_config.train_batch_size_tokens,
+                device=self.device,
+                # Use the configured activation dtype for the *data*;
+                # autocast controls compute separately.
+                dtype=self.training_config.activation_dtype,
+                rank=self.rank,
+                world=self.world_size,
+                seed=self.training_config.seed or 42,
+                sampling_strategy=getattr(self.training_config, "sampling_strategy", "sequential"),
+                normalization_method=getattr(self.training_config, "normalization_method", "none"),
+                shard_data=False,
+            )
+        else:
+            self.activation_store = create_activation_store(
+                training_config=self.training_config,
+                clt_config=self.clt_config,
+                activation_config=activation_config,
+                device=self.device,
+                rank=activation_store_rank,  # Pass the actual rank
+                world_size=activation_store_world,  # Pass the actual world size
+                start_time=self.start_time,
+                shard_data=not self.distributed,  # ---> ADDED: False if distributed (TP), True otherwise <----
+            )
 
         # Pass normalisation statistics (if available) so the loss can be computed in
         # the *original* scale even when inputs/targets are stored normalised.
@@ -509,9 +542,9 @@ class CLTTrainer:
             logger.info(f"Rank {self.rank}: Batch size tokens: {self.training_config.train_batch_size_tokens}")
             logger.info(f"Rank {self.rank}: Sparsity lambda: {self.training_config.sparsity_lambda}")
 
-            # Check if activation store actually loaded correctly
-            batch_avail = next(iter(self.activation_store), None)
-            logger.info(f"Rank {self.rank}: First batch available: {batch_avail is not None}")
+            # Avoid prefetching a real batch here; it can desync the streaming iterator across ranks.
+            if self.activation_store is None:
+                logger.warning("Activation store is None (unexpected).")
 
             # Force torch to compile/execute our code by running a tiny forward/backward pass
             dummy = torch.ones(1, device=self.device, requires_grad=True)
@@ -598,7 +631,6 @@ class CLTTrainer:
                     # Get batch directly from the iterator (handles distributed sampling internally)
                     with self.profiler.timer("data_loading") as timer:
                         inputs, targets = next(self.activation_store)
-                        # Detach inputs and targets to ensure no computation graph from previous iterations
                         inputs = {k: v.detach() for k, v in inputs.items()}
                         targets = {k: v.detach() for k, v in targets.items()}
                     if hasattr(timer, "elapsed"):
