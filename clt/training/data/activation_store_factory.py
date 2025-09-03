@@ -104,19 +104,21 @@ def create_activation_store(
         logger.info(f"Rank {rank}: Using StreamingActivationStore.")
 
         cfg = activation_config
-        extractor = ActivationExtractorCLT(
-            model_name=cfg.model_name,
-            mlp_input_module_path_template=cfg.mlp_input_module_path_template,
-            mlp_output_module_path_template=cfg.mlp_output_module_path_template,
-            device=device,
-            model_dtype=cfg.model_dtype,
-            context_size=cfg.context_size,
-            inference_batch_size=cfg.inference_batch_size,
-            exclude_special_tokens=cfg.exclude_special_tokens,
-            prepend_bos=cfg.prepend_bos,
-            nnsight_tracer_kwargs=cfg.nnsight_tracer_kwargs,
-            nnsight_invoker_args=cfg.nnsight_invoker_args
-        )
+        extractor = None
+        if rank == 0:
+            extractor = ActivationExtractorCLT(
+                model_name=cfg.model_name,
+                mlp_input_module_path_template=cfg.mlp_input_module_path_template,
+                mlp_output_module_path_template=cfg.mlp_output_module_path_template,
+                device=device,
+                model_dtype=cfg.model_dtype,
+                context_size=cfg.context_size,
+                inference_batch_size=cfg.inference_batch_size,
+                exclude_special_tokens=cfg.exclude_special_tokens,
+                prepend_bos=cfg.prepend_bos,
+                nnsight_tracer_kwargs=cfg.nnsight_tracer_kwargs,
+                nnsight_invoker_args=cfg.nnsight_invoker_args
+            )
         store = StreamingActivationStore(
             activation_cfg=activation_config,
             activation_extractor=extractor,
