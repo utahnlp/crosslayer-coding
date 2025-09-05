@@ -13,15 +13,35 @@
 
 
 # virtual environment
-export PYENV_ROOT="$SCR_DIR/.pyenv"
-command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init -)"
-pyenv activate 3.12
+# export PYENV_ROOT="$SCR_DIR/.pyenv"
+# command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
+# eval "$(pyenv init -)"
+# pyenv activate 3.12
+# source ~/software/pkg/miniconda3/etc/profile.d/conda.sh
+# conda activate /uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/newclt
+
+export USER="nate"
+
+if [ "$USER" = "oliver" ]; then
+    # virtual environment for Oliver
+    export PYENV_ROOT="$SCR_DIR/.pyenv"
+    command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
+    eval "$(pyenv init -)"
+    pyenv activate 3.12
+    # add work dir to python path
+    export CODE_DIR="/uufs/chpc.utah.edu/common/home/u0879092/scr/transcoders/open-clts/crosslayer-coding"
+    export PYTHONPATH="$CODE_DIR:$PYTHONPATH"
+
+elif [ "$USER" = "nate" ]; then
+    # virtual environment for Nate
+    source ~/software/pkg/miniconda3/etc/profile.d/conda.sh
+    conda activate /uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/newclt
+    export CODE_DIR="/uufs/chpc.utah.edu/common/home/u0879092/scr/transcoders/open-clts/crosslayer-coding"
+fi
+
+# export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 
 
-# add work dir to python path
-export CODE_DIR="/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding"
-export PYTHONPATH="$CODE_DIR:$PYTHONPATH"
 
 # weights and biases will cache >100gb of artifacts, need to point to storage dir
 export WANDB_DIR="$CODE_DIR/wandb"
@@ -44,7 +64,7 @@ export ACTIVATION_DTYPE="bfloat16"
 
 # Training Hyperparams
 export DATASET_SIZE=1000000
-export BATCH_SIZE=64
+export BATCH_SIZE=1024
 # export TRAINING_STEPS=$(($DATASET_SIZE/$BATCH_SIZE)) # set to DATASET_SIZE / BATCH_SIZE above
 export TRAINING_STEPS=5000
 export LEARNING_RATE=0.0001
@@ -65,12 +85,13 @@ export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DAT
 # Streaming
 export DATASET_NAME="allenai/olmo-mix-1124"
 export CONTEXT_SIZE=4096
-export INFERENCE_BATCH_SIZE=2
+export INFERENCE_BATCH_SIZE=4
 export NUM_TOKENS=1000000
 export CHUNK_TOKEN_THRESHOLD=1000
 
 
 torchrun \
+     --nproc_per_node=auto \
      $CODE_DIR/scripts/train_clt.py \
     --activation-source streaming \
     --output-dir $OUT_DIR \
@@ -99,9 +120,9 @@ torchrun \
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
-    --debug-anomaly
-    # --enable-wandb \
-    # --wandb-project "cross-layer-transcoders" \
-    # --wandb-entity "utah-clt" \
+    --debug-anomaly \
+    --enable-wandb \
+    --wandb-project "cross-layer-transcoders" \
+    --wandb-entity "utah-clt" \
     # --resume_from_checkpoint_dir $CHECKPOINT_DIR \
     # --resume_step 1234
