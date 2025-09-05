@@ -65,7 +65,7 @@ export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DAT
 # Streaming
 export DATASET_NAME="allenai/olmo-mix-1124"
 export CONTEXT_SIZE=4096
-export INFERENCE_BATCH_SIZE=2
+export INFERENCE_BATCH_SIZE=4
 export NUM_TOKENS=1000000
 export CHUNK_TOKEN_THRESHOLD=1000
 
@@ -99,9 +99,9 @@ torchrun \
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
-    --debug-anomaly
-    # --enable-wandb \
-    # --wandb-project "cross-layer-transcoders" \
-    # --wandb-entity "utah-clt" \
+    --debug-anomaly \
+    --enable-wandb \
+    --wandb-project "cross-layer-transcoders" \
+    --wandb-entity "utah-clt" \
     # --resume_from_checkpoint_dir $CHECKPOINT_DIR \
     # --resume_step 1234
