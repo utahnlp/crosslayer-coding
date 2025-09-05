@@ -45,6 +45,9 @@ export CLT_FEATURES=100000
 export BATCHTOPK_K=200
 
 # Reduced Precision
+# export CLT_DTYPE="float32"
+# export PRECISION="fp32"
+# export ACTIVATION_DTYPE="float32"
 export MODEL_DTYPE="float32"
 export CLT_DTYPE="bfloat16"
 export PRECISION="bf16"
@@ -73,8 +76,9 @@ export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DAT
 # Streaming
 export DATASET_NAME="allenai/olmo-mix-1124"
 export CONTEXT_SIZE=4096
-export INFERENCE_BATCH_SIZE=8
-export NUM_TOKENS=1000000000
+export INFERENCE_BATCH_SIZE=4
+export NUM_TOKENS=1000000
+export CHUNK_TOKEN_THRESHOLD=1000
 
 
 torchrun \
@@ -107,6 +111,7 @@ torchrun \
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
+    --debug-anomaly \
     --enable-wandb \
     --wandb-project "cross-layer-transcoders" \
     --wandb-entity "utah-clt" \
