@@ -30,8 +30,8 @@ export WANDB_ARTIFACT_DIR="$WANDB_DIR/artifacts"
 export WANDB_DATA_DIR="$WANDB_DIR/data"
 
 # CLT Architecture
-export CLT_FEATURES=100
-export BATCHTOPK_K=10
+export CLT_FEATURES=100000
+export BATCHTOPK_K=200
 
 # Reduced Precision
 # export CLT_DTYPE="float32"
@@ -44,15 +44,15 @@ export ACTIVATION_DTYPE="bfloat16"
 
 # Training Hyperparams
 export DATASET_SIZE=1000000
-export BATCH_SIZE=32
+export BATCH_SIZE=64
 # export TRAINING_STEPS=$(($DATASET_SIZE/$BATCH_SIZE)) # set to DATASET_SIZE / BATCH_SIZE above
 export TRAINING_STEPS=5000
 export LEARNING_RATE=0.0001
 
 # Logging And Evaluation
-export LOG_INTERVAL=1000
-export EVAL_INTERVAL=1000
-export CHECKPOINT_INTERVAL=1000
+export LOG_INTERVAL=10000
+export EVAL_INTERVAL=10000
+export CHECKPOINT_INTERVAL=10000
 
 # Paths
 export DATA_DIR="$CODE_DIR/data"
