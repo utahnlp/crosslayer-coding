@@ -39,7 +39,7 @@ def parse_arguments():
     )
 
     # --- Dataset Source ---
-    parser.add_argument("--dataset-path", type=str, required=True, help="Dataset name or path.")
+    parser.add_argument("--dataset-path", type=str, required=True, nargs='+', help="One or more dataset names or paths.")
     parser.add_argument("--dataset-split", type=str, default="train", help="Dataset split.")
     parser.add_argument(
         "--dataset-text-column",
@@ -222,6 +222,10 @@ def main():
         print(f"Error decoding NNsight JSON arguments: {e}")
         print("Please provide valid JSON strings or empty dicts '{}'.")
         sys.exit(1)
+
+    #FIXME handle multiple datasets
+    if isinstance(args.dataset_path, list):
+        args.dataset_path = "+".join(args.dataset_path)
 
     activation_config = ActivationConfig(
         model_name=args.model_name,

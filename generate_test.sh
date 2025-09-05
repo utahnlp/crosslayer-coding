@@ -1,24 +1,7 @@
 #!/bin/bash
 
-#SBATCH --job-name=generate_activations
-#SBATCH --account=rai
-#SBATCH --partition=rai-gpu-grn
-#SBATCH --qos=rai-gpu-grn
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:h200:1
-#SBATCH --time=4-00:00:00
-#SBATCH --mem=264GB
-#SBATCH --requeue
-#SBATCH -o log_generate_activations_%j
-
-
-# virtual environment
-# export PYENV_ROOT="$SCR_DIR/.pyenv"
-# command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
-# eval "$(pyenv init -)"
-# pyenv activate 3.12
-# source ~/software/pkg/miniconda3/etc/profile.d/conda.sh
-# conda activate /uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clt
+#source ~/software/pkg/miniconda3/etc/profile.d/conda.sh
+#conda activate /uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clt
 
 # add work dir to python path
 # export CODE_DIR="/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding"
@@ -54,4 +37,3 @@ python $CODE_DIR/scripts/generate_activations.py \
     --activation-dtype $ACTIVATION_DTYPE \
     --compute-norm-stats #\
     # --dataset-skip $DATASET_SKIP
-
