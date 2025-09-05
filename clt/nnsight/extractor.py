@@ -1,14 +1,16 @@
 import torch
-from datasets import load_dataset, Dataset, IterableDataset, Features, Value
+from datasets import load_dataset, Dataset, IterableDataset, Features, Value, Sequence, interleave_datasets
 from nnsight import LanguageModel
 from tqdm import tqdm
 from typing import Generator, Dict, Tuple, Optional, Union, List
 import logging
 
+# manually specified features for olmo_mix since the hf dataset is not setup properly
+from clt.nnsight.olmomix_features import wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features, hf_data_files
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 class ActivationExtractorCLT:
     """
@@ -209,7 +211,8 @@ class ActivationExtractorCLT:
 
     def stream_activations(
         self,
-        dataset_path: str,
+        dataset_path: Union[str, List[str]],
+        # dataset_subset: Union[str, List[str]],
         dataset_split: str = "train",
         dataset_text_column: str = "text",
         dataset_skip: int = None,
@@ -222,7 +225,7 @@ class ActivationExtractorCLT:
         Streams paired MLP input and output activations from the model for a given dataset.
 
         Args:
-            dataset_path: Path or name of the Hugging Face dataset.
+            dataset_path(s): Path or name of the Hugging Face dataset(s).
             dataset_split: Dataset split to use (e.g., 'train', 'validation').
             dataset_text_column: Name of the column containing text data.
             dataset_skip: Number of dataset examples to skip.
@@ -238,28 +241,61 @@ class ActivationExtractorCLT:
         # Handle the case where dataset_trust_remote_code is None
         trust_remote_code = False if dataset_trust_remote_code is None else dataset_trust_remote_code
 
-        features = Features({
-            'text': Value('string'),
-            'added': Value('string'),
-            'created': Value('string'),
-            'id': Value('string'),
-            'metadata': Features({
-                'length': Value('int64'),
-                'provenance': Value('string'),
-                'revid': Value('string'),
-                'url': Value('string')
-            }),
-            'source': Value('string'),
-            'version': Value('string')
-        })
-        dataset = load_dataset(
-            dataset_path,
-            split=dataset_split,
-            streaming=streaming,
-            trust_remote_code=trust_remote_code,
-            cache_dir=cache_path,
-            features=features,
-            data_files='data/wiki/*'
+        # Normalize dataset_path to a list
+        if isinstance(dataset_path, str):
+            dataset_path = [dataset_path]
+
+        streamed_datasets = []
+        for dataset in dataset_path:
+
+            #FIXME: We need to unify the schemas in order to interleave so. I think we only need the text column so we can drop everything else and just keep the text?
+            
+            # Olmo-mix-dataset isn't setup properly on huggingface, so we need to load each subset individually and then combine the datasets.
+            if "allenai/olmo-mix-1124" in dataset_path:
+                # We have specified the fixed datapaths in a separate file.
+                # subsets
+                print('Adding the Olmomix dataset')
+                subsets = [wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features]
+                datafiles = hf_data_files
+                # store each separately loaded dataset
+                # print(subsets)
+                print(len(subsets))
+                # print(datafiles)
+                print(len(datafiles))
+                ds = []
+                for sub, df in zip(subsets[:3], datafiles):
+                    print('df=', df)
+                    olmomix_subset = load_dataset(
+                        dataset,
+                        split=dataset_split,
+                        streaming=streaming,
+                        trust_remote_code=trust_remote_code,
+                        cache_dir=cache_path,
+                        features=sub,
+                        data_files=df
+                    )
+
+                    # keep only text
+                    olmomix_subset = olmomix_subset.remove_columns(
+                        [col for col in olmomix_subset.column_names if col != "text"]
+                    )
+                    ds.append(olmomix_subset)
+                ds = interleave_datasets(ds)
+            else:
+                ds = load_dataset(
+                    dataset,
+                    split=dataset_split,
+                    streaming=streaming,
+                    trust_remote_code=trust_remote_code,
+                    cache_dir=cache_path
+                )
+            streamed_datasets.append(ds)
+            
+        # multiple datasets in streaming mode. This alternates an example from each dataset
+        #FIXME: What should be the right stopping strategy here? Should we sample with probabilities. I think this is fixed. Double check and then try with an additional dataset besides olmomix. Then push the commit.
+        dataset = interleave_datasets(
+            streamed_datasets,
+            stopping_strategy="all_exhausted"  # stops when 
         )
 
         if dataset_skip is not None:
@@ -276,6 +312,8 @@ class ActivationExtractorCLT:
 
         for item in dataset:
             text = item[dataset_text_column]
+            print('text=', text)
+            asd
             # Process potentially long texts into manageable chunks
             text_chunks = self._preprocess_text(text)
             # Add each chunk to batch_texts
