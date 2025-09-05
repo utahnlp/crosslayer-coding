@@ -1,8 +1,8 @@
 
 from datasets import Features, Value, Sequence
 
-# manually defining the schema for each of the features in the olmo-mix-datset as a workaround
-# Works
+# manually defining the schema for each of the features in the olmo-mix-datset so that we can load them individually and then combine
+
 wiki_features = Features({
     'text': Value('string'),
     'added': Value('string'),
@@ -18,7 +18,6 @@ wiki_features = Features({
     'version': Value('string')
 })
 
-# Works
 pes2o_features = Features({
     'text': Value('string'),
     'added': Value('string'),
@@ -50,7 +49,6 @@ pes2o_features = Features({
     'version': Value('string')
 })
 
-# works
 algebraicstack_features = Features({
     'text': Value('string'),
     'added': Value('string'),
@@ -74,7 +72,6 @@ algebraicstack_features = Features({
     'version': Value('string')
 })
 
-# works
 arxiv_features = Features({
     'text': Value('string'),
     'added': Value('string'),
@@ -98,7 +95,6 @@ arxiv_features = Features({
     'version': Value('string')
 })
 
-#TODO - datasetviewer not available for this split so I'll need to download and manually analyze
 dclm_features = Features({
     'text': Value('string'),
     'added': Value('string'),
@@ -114,7 +110,6 @@ dclm_features = Features({
     'version': Value('string')
 })
 
-# works
 openwebmath_features = Features({
     'text': Value('string'),
     'added': Value('string'),

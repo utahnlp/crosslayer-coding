@@ -11,7 +11,11 @@ export PYTHONPATH="$CODE_DIR:$PYTHONPATH"
 # Params
 export DATA_DIR="$CODE_DIR/data"
 export MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
-export DATASET_NAME="allenai/olmo-mix-1124"
+# export DATASET_NAME="allenai/olmo-mix-1124"
+export DATASET_NAME=(
+    "allenai/olmo-mix-1124"
+    "allenai/dolmino-mix-1124"
+)
 export CONTEXT_SIZE=4096
 export BATCH_SIZE=16
 export NUM_TOKENS=1000000
@@ -26,7 +30,7 @@ python $CODE_DIR/scripts/generate_activations.py \
     --model-name $MODEL_NAME \
     --mlp-input-template "model.layers.{}.mlp.input" \
     --mlp-output-template "model.layers.{}.mlp.output" \
-    --dataset-path $DATASET_NAME \
+    --dataset-path ${DATASET_NAME[@]}\
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $BATCH_SIZE \
     --prepend-bos \

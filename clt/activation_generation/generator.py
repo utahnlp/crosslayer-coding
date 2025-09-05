@@ -497,9 +497,13 @@ class ActivationGenerator:
             nnsight_tracer_kwargs=cfg.nnsight_tracer_kwargs,
             nnsight_invoker_args=cfg.nnsight_invoker_args,
         )
-        # Paths
-        ds_name = os.path.basename(cfg.dataset_path)
-        self.out_dir = Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}_{cfg.activation_dtype}_{cfg.target_total_tokens}toks_{cfg.chunk_token_threshold}chunk"
+        # Paths - handle multiple datasets
+        if isinstance(cfg.dataset_path, list):
+            ds_name = os.path.basename("+".join(cfg.dataset_path))
+        else:
+            ds_name = os.path.basename(cfg.dataset_path)
+            
+        self.out_dir = Path(cfg.activation_dir) / cfg.model_name / f"{ds_name}_{cfg.dataset_split}_{cfg.target_total_tokens}_{cfg.activation_dtype}"
         if cfg.dataset_skip is not None:
             start_idx = cfg.dataset_skip
             end_idx = cfg.dataset_skip + cfg.target_total_tokens

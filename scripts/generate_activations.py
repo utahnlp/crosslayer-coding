@@ -223,10 +223,6 @@ def main():
         print("Please provide valid JSON strings or empty dicts '{}'.")
         sys.exit(1)
 
-    #FIXME handle multiple datasets
-    if isinstance(args.dataset_path, list):
-        args.dataset_path = "+".join(args.dataset_path)
-
     activation_config = ActivationConfig(
         model_name=args.model_name,
         mlp_input_module_path_template=args.mlp_input_template,

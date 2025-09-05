@@ -247,24 +247,15 @@ class ActivationExtractorCLT:
 
         streamed_datasets = []
         for dataset in dataset_path:
-
-            #FIXME: We need to unify the schemas in order to interleave so. I think we only need the text column so we can drop everything else and just keep the text?
-            
-            # Olmo-mix-dataset isn't setup properly on huggingface, so we need to load each subset individually and then combine the datasets.
-            if "allenai/olmo-mix-1124" in dataset_path:
+            logger.info(f'Loading dataset {dataset}')
+            # Olmo-mix-dataset isn't setup properly on huggingface, so we need to load each subset individually and then interleave the subsets.
+            if dataset == "allenai/olmo-mix-1124":
                 # We have specified the fixed datapaths in a separate file.
-                # subsets
-                print('Adding the Olmomix dataset')
                 subsets = [wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features]
                 datafiles = hf_data_files
-                # store each separately loaded dataset
-                # print(subsets)
-                print(len(subsets))
-                # print(datafiles)
-                print(len(datafiles))
+                # get each separately loaded subset
                 ds = []
-                for sub, df in zip(subsets[:3], datafiles):
-                    print('df=', df)
+                for sub, datafiles in zip(subsets[:3], datafiles):
                     olmomix_subset = load_dataset(
                         dataset,
                         split=dataset_split,
@@ -272,10 +263,10 @@ class ActivationExtractorCLT:
                         trust_remote_code=trust_remote_code,
                         cache_dir=cache_path,
                         features=sub,
-                        data_files=df
+                        data_files=datafiles
                     )
 
-                    # keep only text
+                    # keep only text column - unifies the schemas between different subsets
                     olmomix_subset = olmomix_subset.remove_columns(
                         [col for col in olmomix_subset.column_names if col != "text"]
                     )
@@ -290,13 +281,17 @@ class ActivationExtractorCLT:
                     cache_dir=cache_path
                 )
             streamed_datasets.append(ds)
+            logger.info(f'Datasets to be interleaved: {streamed_datasets}')
             
         # multiple datasets in streaming mode. This alternates an example from each dataset
-        #FIXME: What should be the right stopping strategy here? Should we sample with probabilities. I think this is fixed. Double check and then try with an additional dataset besides olmomix. Then push the commit.
+        #FIXME: fix the shuffling
         dataset = interleave_datasets(
             streamed_datasets,
             stopping_strategy="all_exhausted"  # stops when 
         )
+
+        print('interleaved_dataset=', dataset)
+        print(dataset.shuffle(seed=1).take(10))
 
         if dataset_skip is not None:
             logger.info(f'skipping first {dataset_skip:,d} lines of dataset')
