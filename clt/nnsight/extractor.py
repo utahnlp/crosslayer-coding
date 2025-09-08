@@ -307,8 +307,6 @@ class ActivationExtractorCLT:
 
         for item in dataset:
             text = item[dataset_text_column]
-            print('text=', text)
-            asd
             # Process potentially long texts into manageable chunks
             text_chunks = self._preprocess_text(text)
             # Add each chunk to batch_texts
