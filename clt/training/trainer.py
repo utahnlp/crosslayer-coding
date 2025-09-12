@@ -36,6 +36,7 @@ from clt.training.data.activation_store_factory import create_activation_store  
 from .metric_utils import MetricLogger  # Add this import
 from .diagnostics import compute_sparsity_diagnostics  # Add this import
 from .profiler import TrainingProfiler, CUDAMemoryProfiler, DistributedProfiler  # Add profiler imports
+import datetime as dt  # For distributed init timeout
 
 # Get logger for this module
 logger = logging.getLogger(__name__)
@@ -87,7 +88,8 @@ class CLTTrainer:
         if self.distributed:
             if not dist.is_initialized():
                 # Default backend, consider NCCL for NVIDIA GPUs
-                dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo")
+                dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo", 
+                                        timeout=dt.timedelta(hours=1))
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
             self.local_rank = int(os.environ.get("LOCAL_RANK", self.rank))  # Get local rank if available
