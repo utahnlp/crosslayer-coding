@@ -89,7 +89,7 @@ class CLTTrainer:
             if not dist.is_initialized():
                 # Default backend, consider NCCL for NVIDIA GPUs
                 dist.init_process_group(backend="nccl" if torch.cuda.is_available() else "gloo", 
-                                        timeout=dt.timedelta(hours=1))
+                                        timeout=dt.timedelta(hours=2))
             self.rank = dist.get_rank()
             self.world_size = dist.get_world_size()
             self.local_rank = int(os.environ.get("LOCAL_RANK", self.rank))  # Get local rank if available
