@@ -1006,7 +1006,14 @@ class CLTTrainer:
                         "numpy_rng_state": np.random.get_state(),
                         "python_rng_state": random.getstate(),
                     }
+                    ckpt_start_time = None
+                    if not self.distributed or self.rank == 0:
+                        ckpt_start_time = time.monotonic()
                     self.checkpoint_manager._save_checkpoint(step, current_trainer_state_for_checkpoint)
+                    if not self.distributed or self.rank == 0:
+                        ckpt_end_time = time.monotonic()
+                        ckpt_duration = ckpt_end_time - ckpt_start_time if ckpt_start_time else float('nan')
+                        logger.info(f"Checkpointing time: {ckpt_duration:.2f} seconds")
 
                 # --- Profile memory and step profiler --- #
                 if not self.distributed or self.rank == 0:
