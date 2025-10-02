@@ -243,12 +243,12 @@ class StreamingActivationStore(ManifestActivationStore):
             def replenish_buffer():
                 # debug only
                 if getattr(self, "inp", None) is None:
-                    logger.info("replenish buffer (first fill)")
+                    logger.debug("replenish buffer (first fill)")
                     current_rem = 0
                 else:
                     any_li = next(iter(self.inp.keys()))
                     current_rem = self.inp[any_li].shape[0] - self.idx
-                    logger.info(f"replenish buffer, buffer size {current_rem}, less than batch size {batch_size}")
+                    logger.debug(f"replenish buffer, buffer size {current_rem}, less than batch size {batch_size}")
 
                 # pull a fresh chunk from the stream (likely CPU tensors)
                 new_inp, new_tgt = next(self.stream)
@@ -273,7 +273,7 @@ class StreamingActivationStore(ManifestActivationStore):
 
                 any_li2 = next(iter(self.inp.keys()))
                 new_buffer_size = self.inp[any_li2].shape[0]
-                logger.info(f"new buffer size is {current_rem} (old rem) + {new_stream_size} (new) = {new_buffer_size}")
+                logger.debug(f"new buffer size is {current_rem} (old rem) + {new_stream_size} (new) = {new_buffer_size}")
 
             # ensure buffer has at least one batch
             while need_to_replenish_buffer():
@@ -283,7 +283,7 @@ class StreamingActivationStore(ManifestActivationStore):
             start = self.idx
             end   = self.idx + batch_size
             any_li = next(iter(self.inp.keys()))
-            logger.info(f'buffer size {self.inp[any_li].shape[0]}, batch size {batch_size}, retrieving idxs {start}-{end}')
+            logger.debug(f'buffer size {self.inp[any_li].shape[0]}, batch size {batch_size}, retrieving idxs {start}-{end}')
 
             batch_inp = {li: self.inp[li][start:end] for li in self.inp.keys()}
             batch_tgt = {li: self.tgt[li][start:end] for li in self.tgt.keys()}
@@ -337,7 +337,7 @@ class StreamingActivationStore(ManifestActivationStore):
             tgts = {li: x.to(self.device) for li, x in tgts.items()}
 
         any_li = self.layer_indices[0]
-        logger.info(f'after broadcast inps[{any_li}].shape={inps[any_li].shape} tgts[{any_li}].shape={tgts[any_li].shape}')
+        logger.debug(f'after broadcast inps[{any_li}].shape={inps[any_li].shape} tgts[{any_li}].shape={tgts[any_li].shape}')
         return inps, tgts
 
 
