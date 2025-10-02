@@ -246,7 +246,7 @@ class TrainingConfig:
             assert (
                 "server_url" in self.remote_config and "dataset_id" in self.remote_config
             ), "remote_config must contain 'server_url' and 'dataset_id'"
-        elif self.activation_source not in ["local_manifest", "remote"]:
+        elif self.activation_source not in ["local_manifest", "remote", "streaming"]:
             raise ValueError(f"Unsupported activation_source: {self.activation_source}")
 
         # Validate sampling strategy

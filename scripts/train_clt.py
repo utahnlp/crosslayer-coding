@@ -25,7 +25,7 @@ except ImportError:
 
 # Import necessary CLT components
 try:
-    from clt.config import CLTConfig, TrainingConfig
+    from clt.config import CLTConfig, TrainingConfig, ActivationConfig
     from clt.training.trainer import CLTTrainer
 except ImportError as e:
     print(
@@ -105,7 +105,7 @@ def parse_args():
     core_group.add_argument(
         "--activation-source",
         type=str,
-        choices=["local_manifest", "remote"],
+        choices=["local_manifest", "remote", "streaming"],
         required=True,
         help="Source of activations: 'local_manifest' or 'remote' server.",
     )
@@ -472,6 +472,55 @@ def parse_args():
     )
     log_group.add_argument("--wandb-tags", nargs="+", default=None, help="List of tags for the WandB run.")
 
+    # --- Streaming ---
+    streaming_group = parser.add_argument_group("Streaming")
+    streaming_group.add_argument(
+        "--mlp-input-template",
+        type=str,
+        required=True,
+        help="NNsight path template for MLP inputs.",
+    )
+    streaming_group.add_argument(
+        "--mlp-output-template",
+        type=str,
+        required=True,
+        help="NNsight path template for MLP outputs.",
+    )
+    streaming_group.add_argument(
+        "--model-dtype",
+        type=str,
+        default=None,
+        help="Optional model dtype (e.g., 'float16').",
+    )
+    streaming_group.add_argument("--dataset-path", type=str, required=True, help="Dataset name or path.")
+    streaming_group.add_argument("--dataset-split", type=str, default="train", help="Dataset split.")
+    streaming_group.add_argument(
+        "--dataset-text-column",
+        type=str,
+        default="text",
+        help="Dataset text column name.",
+    )
+    streaming_group.add_argument(
+        "--context-size",
+        type=int,
+        default=128,
+        help="Context size for tokenization/inference.",
+    )
+    streaming_group.add_argument("--inference-batch-size", type=int, default=512, help="Inference batch size.")
+    streaming_group.add_argument(
+        "--exclude-special-tokens",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Exclude special tokens.",
+    )
+    streaming_group.add_argument(
+        "--prepend-bos",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Prepend BOS token.",
+    )
+
+
     args = parser.parse_args()
 
     # --- Validate conditional arguments ---
@@ -761,6 +810,27 @@ def main():
     )
     logger.info(f"Training Config: {training_config}")
 
+    activation_cfg = None
+    if args.activation_source == 'streaming':
+        activation_cfg = ActivationConfig(
+            model_name=args.model_name,
+            mlp_input_module_path_template=args.mlp_input_template,
+            mlp_output_module_path_template=args.mlp_output_template,
+            model_dtype=args.model_dtype,
+            exclude_special_tokens=args.exclude_special_tokens,
+            dataset_split=args.dataset_split,
+            dataset_text_column=args.dataset_text_column,
+            activation_dtype=args.activation_dtype,
+            dataset_path=args.dataset_path,
+            context_size=args.context_size,
+            inference_batch_size=args.inference_batch_size,
+            prepend_bos=args.prepend_bos,
+            target_total_tokens=1000000,
+            activation_dir=None,
+            compression=None,
+            chunk_token_threshold=1,
+            compute_norm_stats=True)
+
     # --- Initialize Trainer ---
     logger.info(f"Initializing CLTTrainer for {args.activation_source} training...")
     try:
@@ -770,6 +840,7 @@ def main():
             log_dir=str(output_dir_path),  # Use the resolved output_dir_path
             device=device_str,
             distributed=args.distributed,
+            activation_config=activation_cfg,
             resume_from_checkpoint_path=actual_checkpoint_path_to_load if resuming_run else None,
         )
     except Exception as e:
