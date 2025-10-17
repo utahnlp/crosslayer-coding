@@ -2,18 +2,21 @@
 
 #SBATCH --job-name train_clt
 #SBATCH --account rai
-#SBATCH --partition rai-gpu-grn
-#SBATCH --qos rai-gpu-grn
+##SBATCH --partition rai-gpu-grn
+##SBATCH --qos rai-gpu-grn
+#SBATCH --partition=rai-gpu-grn 
+#SBATCH --qos=rai-gpu-grn-short
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:h200:8
-#SBATCH --time=6:00:00
-#SBATCH --mem=1000GB
+#SBATCH --gres=gpu:h200:1
+#SBATCH --time=1:00:00
+#SBATCH --mem=100GB
 #SBATCH --requeue
 #SBATCH -o log_train_clt_%j
 
 
 # virtual environment
 export USER="oliver"
+export USER="nate"
 
 if [ "$USER" = "oliver" ]; then
     # virtual environment for Oliver
@@ -28,10 +31,12 @@ if [ "$USER" = "oliver" ]; then
 elif [ "$USER" = "nate" ]; then
     # virtual environment for Nate
     source ~/software/pkg/miniconda3/etc/profile.d/conda.sh
-    conda activate /uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/newclt
-    export CODE_DIR="/uufs/chpc.utah.edu/common/home/u0879092/scr/transcoders/open-clts/crosslayer-coding"
+    conda activate /scratch/rai/vast1/u0879092/envs/clt
+    
+    export CODE_DIR="/scratch/rai/vast1/u0879092/clts/crosslayer-coding"
      # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 fi
+
 
 
 # weights and biases will cache >100gb of artifacts, need to point to storage dir
