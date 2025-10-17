@@ -2,26 +2,45 @@
 
 #SBATCH --job-name train_clt
 #SBATCH --account rai
-#SBATCH --partition rai-gpu-grn
-#SBATCH --qos rai-gpu-grn
+##SBATCH --partition rai-gpu-grn
+##SBATCH --qos rai-gpu-grn
+#SBATCH --partition=rai-gpu-grn 
+#SBATCH --qos=rai-gpu-grn-short
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:h200:8
-#SBATCH --time=6:00:00
-#SBATCH --mem=1000GB
+#SBATCH --gres=gpu:h200:1
+#SBATCH --time=1:00:00
+#SBATCH --mem=100GB
 #SBATCH --requeue
 #SBATCH -o log_train_clt_%j
 
 
 # virtual environment
-export PYENV_ROOT="$SCR_DIR/.pyenv"
-command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
-eval "$(pyenv init -)"
-pyenv activate 3.12
+export USER="oliver"
+export USER="nate"
 
+if [ "$USER" = "oliver" ]; then
+    # virtual environment for Oliver
+    export PYENV_ROOT="$SCR_DIR/.pyenv"
+    command -v pyenv >/dev/null || export PATH="$PYENV_ROOT/bin:$PATH"
+    eval "$(pyenv init -)"
+    pyenv activate 3.12
+    # add work dir to python path
+    export CODE_DIR="/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding"
+    export PYTHONPATH="$CODE_DIR:$PYTHONPATH"
+
+elif [ "$USER" = "nate" ]; then
+    # virtual environment for Nate
+    source ~/software/pkg/miniconda3/etc/profile.d/conda.sh
+    conda activate /scratch/rai/vast1/u0879092/envs/clt
+    
+    export CODE_DIR="/scratch/rai/vast1/u0879092/clts/crosslayer-coding"
+     # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
+fi
 
 # add work dir to python path
 export CODE_DIR="/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding"
 export PYTHONPATH="$CODE_DIR:$PYTHONPATH"
+
 
 # weights and biases will cache >100gb of artifacts, need to point to storage dir
 export WANDB_DIR="$CODE_DIR/wandb"
