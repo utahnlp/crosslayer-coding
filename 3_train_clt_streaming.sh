@@ -101,6 +101,7 @@ torchrun \
     --log-interval $LOG_INTERVAL \
     --eval-interval $EVAL_INTERVAL \
     --checkpoint-interval $CHECKPOINT_INTERVAL \
+    --keep-n-checkpoints $KEEP_N_CHECKPOINTS
     --mlp-input-template "model.layers.{}.mlp.input" \
     --mlp-output-template "model.layers.{}.mlp.output" \
     --model-dtype $MODEL_DTYPE \

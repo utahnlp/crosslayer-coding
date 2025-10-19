@@ -456,6 +456,12 @@ def parse_args():
         default=1000,
         help="Save a training checkpoint every N steps.",
     )
+    log_group.add_argument(
+        "--keep-n-checkpoints",
+        type=int,
+        default=3,
+        help="How many checkpoints to keep, deleting oldest first",
+    )
     log_group.add_argument("--enable-wandb", action="store_true", help="Enable Weights & Biases logging.")
     log_group.add_argument("--wandb-project", type=str, default=None, help="WandB project name.")
     log_group.add_argument(
@@ -793,6 +799,7 @@ def main():
         log_interval=args.log_interval,
         eval_interval=args.eval_interval,
         checkpoint_interval=args.checkpoint_interval,
+        keep_n_checkpoints=args.keep_n_checkpoints,
         # Dead Features & Diagnostics
         dead_feature_window=args.dead_feature_window,
         compute_sparsity_diagnostics=args.compute_sparsity_diagnostics,

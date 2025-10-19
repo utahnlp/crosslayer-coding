@@ -52,6 +52,7 @@ class StreamingActivationStore(ManifestActivationStore):
                 streaming=cfg.streaming,
                 dataset_trust_remote_code=cfg.dataset_trust_remote_code,
                 cache_path=cfg.cache_path,
+                pbar=False
             )
         else:
             self.stream = None

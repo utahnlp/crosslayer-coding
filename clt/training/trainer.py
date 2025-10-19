@@ -404,6 +404,7 @@ class CLTTrainer:
             rank=self.rank,
             device=self.device,
             world_size=self.world_size,
+            keep_n_checkpoints=self.training_config.keep_n_checkpoints
         )
 
         # ------------------------------------------------------------------

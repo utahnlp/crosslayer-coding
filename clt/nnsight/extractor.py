@@ -216,6 +216,7 @@ class ActivationExtractorCLT:
         streaming: bool = True,
         dataset_trust_remote_code: Optional[bool] = False,
         cache_path: Optional[str] = None,
+        pbar: bool = True
     ) -> Generator[Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]], None, None]:
         """
         Streams paired MLP input and output activations from the model for a given dataset.
@@ -270,7 +271,10 @@ class ActivationExtractorCLT:
 
         batch_texts: List[str] = []
 
-        for item in tqdm(dataset, desc="Processing dataset"):
+        if pbar:
+            pbar = tqdm(desc="Processing dataset")
+
+        for item in dataset:
             text = item[dataset_text_column]
             # Process potentially long texts into manageable chunks
             text_chunks = self._preprocess_text(text)
@@ -374,6 +378,8 @@ class ActivationExtractorCLT:
                         f"Error processing batch: {e}. Skipping this batch.",
                         exc_info=True,
                     )
+            
+            pbar.update()
 
         # Process any remaining texts
         if batch_texts:
