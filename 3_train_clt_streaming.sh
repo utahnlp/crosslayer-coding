@@ -37,6 +37,7 @@ elif [ "$USER" = "nate" ]; then
      # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 fi
 
+# export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 
 
 # weights and biases will cache >100gb of artifacts, need to point to storage dir
