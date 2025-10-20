@@ -37,9 +37,7 @@ elif [ "$USER" = "nate" ]; then
      # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 fi
 
-# add work dir to python path
-export CODE_DIR="/uufs/chpc.utah.edu/common/home/u1472283/scr/crosslayer-coding"
-export PYTHONPATH="$CODE_DIR:$PYTHONPATH"
+# export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 
 
 # weights and biases will cache >100gb of artifacts, need to point to storage dir
