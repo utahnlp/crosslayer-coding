@@ -36,7 +36,7 @@ elif [ "$USER" = "nate" ]; then
     export CODE_DIR="/scratch/rai/vast1/u0879092/clts/crosslayer-coding"
      # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 fi
-
+date
 # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 
 
@@ -88,6 +88,8 @@ export CHUNK_TOKEN_THRESHOLD=1000
 
 
 torchrun \
+     --rdzv_endpoint=127.0.0.1:29501 \
+     --nproc_per_node=auto \
      $CODE_DIR/scripts/train_clt.py \
     --activation-source streaming \
     --output-dir $OUT_DIR \
@@ -117,8 +119,10 @@ torchrun \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
     --debug-anomaly \
-    --enable-wandb \
-    --wandb-project "cross-layer-transcoders" \
-    --wandb-entity "utah-clt" \
+    # --enable-wandb \
+    # --wandb-project "cross-layer-transcoders" \
+    # --wandb-entity "utah-clt" \
     # --resume_from_checkpoint_dir $CHECKPOINT_DIR \
     # --resume_step 1234
+
+date

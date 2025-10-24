@@ -1,5 +1,5 @@
 import torch
-from datasets import load_dataset, Dataset, IterableDataset, Features, Value, Sequence, interleave_datasets
+from datasets import load_dataset, Dataset, IterableDataset, Features, Value, Sequence, interleave_datasets, load_from_disk
 from nnsight import LanguageModel
 from tqdm import tqdm
 from typing import Generator, Dict, Tuple, Optional, Union, List
@@ -251,11 +251,13 @@ class ActivationExtractorCLT:
             # Olmo-mix-dataset isn't setup properly on huggingface, so we need to load each subset individually and then interleave the subsets.
             if dataset == "allenai/olmo-mix-1124":
                 # We have specified the fixed datapaths in a separate file.
-                subsets = [wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features]
+                # subsets = [wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features]
+                subsets = [wiki_features]
                 datafiles = hf_data_files
                 # get each separately loaded subset
                 ds = []
-                for sub, datafiles in zip(subsets[:3], datafiles):
+                for sub, sub_datafiles in zip(subsets, datafiles):
+                    print("sub=", sub)
                     olmomix_subset = load_dataset(
                         dataset,
                         split=dataset_split,
@@ -263,14 +265,18 @@ class ActivationExtractorCLT:
                         trust_remote_code=trust_remote_code,
                         cache_dir=cache_path,
                         features=sub,
-                        data_files=datafiles
+                        data_files=sub_datafiles
                     )
 
                     # keep only text column - unifies the schemas between different subsets
                     olmomix_subset = olmomix_subset.remove_columns(
                         [col for col in olmomix_subset.column_names if col != "text"]
                     )
+                    # shuffle the subset
+                    olmomix_subset = olmomix_subset.shuffle(seed=1, buffer_size=10000)
                     ds.append(olmomix_subset)
+                
+                logger.info(f'Olmomix subsets to be interleaved: {ds}')
                 ds = interleave_datasets(ds)
             else:
                 ds = load_dataset(
@@ -291,11 +297,41 @@ class ActivationExtractorCLT:
         )
 
         print('interleaved_dataset=', dataset)
-        print(dataset.shuffle(seed=1).take(10))
 
+        val_set = []
+        num_examples_iterated = 0
+        N_VAL = 1000
+
+        # while len(val_set) < N_VAL:
+        #     try:
+        #         val = next(dataset_iter)  # may raise the cast/null error
+        #         val_set.append(val)
+        #         num_examples_iterated += 1
+        #     except StopIteration:
+        #         print('stopped iteration')
+        #         break
+        #     except Exception as e:
+        #         if "Couldn't cast array of type list<item: null> to string" in str(e):
+        #             logger.warning(f"Skipping example due to cast or null error: {e}")
+        #             num_examples_iterated += 1
+        #             continue
+                
+        # Take fixed validation examples
+        val_examples = list(dataset.take(N_VAL))
+        dataset_skip = N_VAL
+
+        # Save val set
+        val_dataset = Dataset.from_list(val_examples)
+        val_dataset.save_to_disk("validation_set")
+
+        # skip val set examples
         if dataset_skip is not None:
             logger.info(f'skipping first {dataset_skip:,d} lines of dataset')
             dataset = dataset.skip(dataset_skip)
+
+        # Check you can load val set and save to json for inspection
+        # val_ds = load_from_disk("validation_set")
+        # val_ds.to_json("validation_set/val.json")
 
         if not isinstance(dataset, (Dataset, IterableDataset)):
             raise TypeError("Loaded dataset is not a Hugging Face Dataset or IterableDataset.")
@@ -307,6 +343,7 @@ class ActivationExtractorCLT:
 
         for item in dataset:
             text = item[dataset_text_column]
+            # print('text=', text)
             # Process potentially long texts into manageable chunks
             text_chunks = self._preprocess_text(text)
             # Add each chunk to batch_texts

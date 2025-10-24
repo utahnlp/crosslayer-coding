@@ -95,21 +95,57 @@ arxiv_features = Features({
     'version': Value('string')
 })
 
+# doesn't work
+# dclm_features = Features({
+#     'text': Value('string'),
+#     'added': Value('string'),
+#     'created': Value('string'),
+#     'id': Value('string'),
+#     'metadata': Features({
+#         'length': Value('int64'),
+#         'provenance': Value('string'),
+#         'revid': Value('string'),
+#         'url': Value('string')
+#     }),
+#     'source': Value('string'),
+#     'version': Value('string')
+# })
+
+# should work
 dclm_features = Features({
-    'text': Value('string'),
-    'added': Value('string'),
-    'created': Value('string'),
-    'id': Value('string'),
-    'metadata': Features({
-        'length': Value('int64'),
-        'provenance': Value('string'),
-        'revid': Value('string'),
-        'url': Value('string')
+    "text": Value("string"),
+    "added": Value("string"),
+    "created": Value("string"),
+    "id": Value("string"),
+    "version": Value("string"),
+    "source": Value("string"),
+    "url": Value("string"),
+    "warcinfo": Value("string"),
+    "bff_contained_ngram_count_before_dedupe": Value("int64"),
+    "previous_word_count": Value("int64"),
+    "fasttext_openhermes_reddit_eli5_vs_rw_v2_bigram_200k_train_prob": Value("float64"),
+    "language_id_whole_page_fasttext": Features({
+        "en": Value("float64")
     }),
-    'source': Value('string'),
-    'version': Value('string')
+    "metadata": Features({
+        "Content-Length": Value("string"),
+        "Content-Type": Value("string"),
+        "WARC-Block-Digest": Value("string"),
+        "WARC-Concurrent-To": Value("string"),
+        "WARC-Date": Value("timestamp[s]"),
+        "WARC-IP-Address": Value("string"),
+        "WARC-Payload-Digest": Value("string"),
+        "WARC-Record-ID": Value("string"),
+        "WARC-Target-URI": Value("string"),
+        "WARC-Type": Value("string"),
+        "WARC-Warcinfo-ID": Value("string"),
+        "WARC-Truncated": Value("string")
+    })
 })
 
+
+
+# should work
 openwebmath_features = Features({
     'text': Value('string'),
     'added': Value('string'),
@@ -178,7 +214,7 @@ openwebmath_features = Features({
     'version': Value('string')
 })
 
-# works
+# should work
 starcoder_features = Features({
     'text': Value('string'),
     'added': Value('string'),
@@ -224,19 +260,13 @@ starcoder_features = Features({
 })
 
 
-hf_data_files = ['data/wiki/*',
-             'data/pes2o/*',
-             'data/algebraic-stack/**',
-            #  'data/arxiv/**',
-            #  'data/dclm/**',
-            #  'data/openwebmath/**',
-            #  'data/starcoder/**'
-             ]
-
 # hf_data_files = ['data/wiki/*',
 #              'data/pes2o/*',
 #              'data/algebraic-stack/**',
 #              'data/arxiv/**',
 #              'data/dclm/**',
-#              'data/openwebmath/**',
-#              'data/starcoder/**']
+#              'data/open-web-math/train/*',
+#              'data/starcoder/v1-decon-100_to_20k-2star-top_token_030/documents/*'
+#              ]
+
+hf_data_files = ['data/wiki/*']
