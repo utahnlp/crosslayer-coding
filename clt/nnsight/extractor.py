@@ -6,7 +6,7 @@ from typing import Generator, Dict, Tuple, Optional, Union, List
 import logging
 
 # manually specified features for olmo_mix since the hf dataset is not setup properly
-from clt.nnsight.olmomix_features import wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features, hf_data_files
+from clt.nnsight.olmomix_features import wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features, olmomix_data_files, dolmino_data_files
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -246,45 +246,94 @@ class ActivationExtractorCLT:
             dataset_path = [dataset_path]
 
         streamed_datasets = []
+        print('dataset_path=', dataset_path)
         for dataset in dataset_path:
             logger.info(f'Loading dataset {dataset}')
-            # Olmo-mix-dataset isn't setup properly on huggingface, so we need to load each subset individually and then interleave the subsets.
-            if dataset == "allenai/olmo-mix-1124":
+            # Olmo-mix and Dolmino isn't setup properly on huggingface, so we need to load each subset individually and then interleave the subsets.
+            if dataset in ["allenai/dolmino-mix-1124", "allenai/olmo-mix-1124"]:
                 # We have specified the fixed datapaths in a separate file.
                 # subsets = [wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features]
-                subsets = [wiki_features]
-                datafiles = hf_data_files
+                # subsets = [algebraicstack_features]
+                datafiles = olmomix_data_files if dataset == "allenai/olmo-mix-1124" else dolmino_data_files
                 # get each separately loaded subset
                 ds = []
-                for sub, sub_datafiles in zip(subsets, datafiles):
-                    print("sub=", sub)
-                    olmomix_subset = load_dataset(
+                # for sub, sub_datafiles in zip(subsets, datafiles):
+                for sub_datafiles in datafiles:
+                    print("sub=", sub_datafiles)
+                    subset = load_dataset(
                         dataset,
                         split=dataset_split,
                         streaming=streaming,
                         trust_remote_code=trust_remote_code,
                         cache_dir=cache_path,
-                        features=sub,
+                        # features=sub,
                         data_files=sub_datafiles
                     )
+                    ss = sub_datafiles.split('/')[1]
+                    # track which dataset and subset the example came from
+                    # subset = subset.add_column() 
+                    # fn_kwargs={"dataset_source" dataset)
+                    # "subset_source": ss})
 
-                    # keep only text column - unifies the schemas between different subsets
-                    olmomix_subset = olmomix_subset.remove_columns(
-                        [col for col in olmomix_subset.column_names if col != "text"]
-                    )
+                    # Keep only text column to unify schema between datasets
+                    subset = subset.select_columns(["text"])
+                        
+                    # Add a constant column "data_source" with value = ss
+                    subset = subset.map(lambda x: {"data_source": ss})
+
+
                     # shuffle the subset
-                    olmomix_subset = olmomix_subset.shuffle(seed=1, buffer_size=10000)
-                    ds.append(olmomix_subset)
+                    subset = subset.shuffle(seed=1, buffer_size=10000)
+                    ds.append(subset)
                 
-                logger.info(f'Olmomix subsets to be interleaved: {ds}')
+                logger.info(f'Pretraining subsets to be interleaved: {ds}')
                 ds = interleave_datasets(ds)
+                
+
+            elif dataset in ["allenai/tulu-3-sft-olmo-2-mixture-0225"]:
+                ds = load_dataset(
+                        dataset,
+                        split=dataset_split,
+                        streaming=streaming,
+                        trust_remote_code=trust_remote_code,
+                        cache_dir=cache_path,
+                        # features=sub,
+                        # data_files=sub_datafiles
+                    )
+                # Map the query text from messages to a new column "text"
+                def extract_text(example):
+                    return {"text": example["messages"][0]["content"]}
+                
+                ds = ds.map(extract_text)
+                ds = ds.select_columns(["text"])
+                ds = ds.shuffle(seed=1, buffer_size=10000)
+
+            elif dataset in ["allenai/olmo-2-0425-1b-preference-mix"]:
+                ds = load_dataset(
+                dataset,
+                split=dataset_split,
+                streaming=streaming,
+                trust_remote_code=trust_remote_code,
+                cache_dir=cache_path,
+                # features=sub,
+                # data_files=sub_datafiles
+                )
+                # Map the query text from messages to a new column "text"
+                def extract_text(example):
+                    return {"text": example["chosen"][0]["content"]}
+                
+                ds = ds.map(extract_text)
+                ds = ds.select_columns(["text"])
+                ds = ds.shuffle(seed=1, buffer_size=10000)
+
             else:
                 ds = load_dataset(
                     dataset,
                     split=dataset_split,
                     streaming=streaming,
                     trust_remote_code=trust_remote_code,
-                    cache_dir=cache_path
+                    cache_dir=cache_path,
+                    # data_files="data/wiki/*"
                 )
             streamed_datasets.append(ds)
             logger.info(f'Datasets to be interleaved: {streamed_datasets}')
@@ -293,28 +342,12 @@ class ActivationExtractorCLT:
         #FIXME: fix the shuffling
         dataset = interleave_datasets(
             streamed_datasets,
-            stopping_strategy="all_exhausted"  # stops when 
+            stopping_strategy="all_exhausted"
         )
 
         print('interleaved_dataset=', dataset)
 
-        val_set = []
-        num_examples_iterated = 0
         N_VAL = 1000
-
-        # while len(val_set) < N_VAL:
-        #     try:
-        #         val = next(dataset_iter)  # may raise the cast/null error
-        #         val_set.append(val)
-        #         num_examples_iterated += 1
-        #     except StopIteration:
-        #         print('stopped iteration')
-        #         break
-        #     except Exception as e:
-        #         if "Couldn't cast array of type list<item: null> to string" in str(e):
-        #             logger.warning(f"Skipping example due to cast or null error: {e}")
-        #             num_examples_iterated += 1
-        #             continue
                 
         # Take fixed validation examples
         val_examples = list(dataset.take(N_VAL))
@@ -322,7 +355,7 @@ class ActivationExtractorCLT:
 
         # Save val set
         val_dataset = Dataset.from_list(val_examples)
-        val_dataset.save_to_disk("validation_set")
+        val_dataset.save_to_disk("validation_set_olmomix")
 
         # skip val set examples
         if dataset_skip is not None:
@@ -330,8 +363,8 @@ class ActivationExtractorCLT:
             dataset = dataset.skip(dataset_skip)
 
         # Check you can load val set and save to json for inspection
-        # val_ds = load_from_disk("validation_set")
-        # val_ds.to_json("validation_set/val.json")
+        val_ds = load_from_disk("validation_set_olmomix")
+        val_ds.to_json("validation_set_olmomix/val.json")
 
         if not isinstance(dataset, (Dataset, IterableDataset)):
             raise TypeError("Loaded dataset is not a Hugging Face Dataset or IterableDataset.")
@@ -341,9 +374,22 @@ class ActivationExtractorCLT:
         if pbar:
             pbar = tqdm(desc="Processing dataset")
 
+        # for i, item in enumerate(dataset):
+        #     try:
+        #         if i % 50000 == 0:
+        #             print(f'successful through e.g. {i}')
+        #             print(item['text'][:100])
+        #         ex = item['text']
+
+        #     except:
+        #         print("Error in example {i}")
+        #         jkl
+
+        # print('type(dataset)=', type(dataset))
         for item in dataset:
             text = item[dataset_text_column]
-            # print('text=', text)
+            print('text=', text)
+            asd
             # Process potentially long texts into manageable chunks
             text_chunks = self._preprocess_text(text)
             # Add each chunk to batch_texts

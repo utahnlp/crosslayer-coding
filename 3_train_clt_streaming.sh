@@ -75,6 +75,7 @@ export CHECKPOINT_INTERVAL=1000
 export DATA_DIR="$CODE_DIR/data"
 export MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
 export DATASET_NAME="olmo-mix-1124"
+export DATASET_NAME2="allenai/dolmino-mix-1124"
 export DATASET_SPLIT="train"
 export ACTIVATION_PATH="$DATA_DIR/activations/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}"
 export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}/${CLT_FEATURES}feats_${BATCH_SIZE}batchsize"
@@ -114,7 +115,7 @@ torchrun \
     --mlp-input-template "model.layers.{}.mlp.input" \
     --mlp-output-template "model.layers.{}.mlp.output" \
     --model-dtype $MODEL_DTYPE \
-    --dataset-path $DATASET_NAME \
+    --dataset-path $DATASET_NAME2 $DATASET_NAME \
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
