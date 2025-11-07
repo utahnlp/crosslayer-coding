@@ -261,20 +261,20 @@ starcoder_features = Features({
 
 
 olmomix_data_files = ['data/wiki/*',
-            #  'data/pes2o/*',
-            #  'data/algebraic-stack/**',
-            #  'data/arxiv/**',
-            #  'data/dclm/**',
-            #  'data/open-web-math/train/*',
-            #  'data/starcoder/v1-decon-100_to_20k-2star-top_token_030/documents/*'
+             'data/pes2o/*',
+             'data/algebraic-stack/**',
+             'data/arxiv/**',
+             'data/dclm/**',
+             'data/open-web-math/train/*',
+             'data/starcoder/v1-decon-100_to_20k-2star-top_token_030/documents/*'
              ]
 
 # commented out datasets which are duplicated in olmo
 dolmino_data_files = [
             ## 'data/wiki/*',
-            #  'data/pes2o/*',
+             'data/pes2o/*',
              'data/stackexchange/*',
             ##  'data/dclm/**',
-            #  'data/flan/*',
-            #  'data/math/**/**/*'
+             'data/flan/*',
+             'data/math/**/**/*'
 ]

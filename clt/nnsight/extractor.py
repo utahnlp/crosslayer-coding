@@ -245,6 +245,9 @@ class ActivationExtractorCLT:
         if isinstance(dataset_path, str):
             dataset_path = [dataset_path]
 
+        def add_source_columns(subset, ds_name, ss):
+            return subset.map(lambda x: {"data_source": ds_name, "subset_source": ss})
+
         streamed_datasets = []
         print('dataset_path=', dataset_path)
         for dataset in dataset_path:
@@ -269,18 +272,15 @@ class ActivationExtractorCLT:
                         # features=sub,
                         data_files=sub_datafiles
                     )
+                    # track which dataset and subset the example is coming from
                     ss = sub_datafiles.split('/')[1]
-                    # track which dataset and subset the example came from
-                    # subset = subset.add_column() 
-                    # fn_kwargs={"dataset_source" dataset)
-                    # "subset_source": ss})
+                    ds_name = dataset.split('/')[1]
 
                     # Keep only text column to unify schema between datasets
                     subset = subset.select_columns(["text"])
                         
-                    # Add a constant column "data_source" with value = ss
-                    subset = subset.map(lambda x: {"data_source": ss})
-
+                    # Add a constant columns
+                    subset = add_source_columns(subset, ds_name, ss)
 
                     # shuffle the subset
                     subset = subset.shuffle(seed=1, buffer_size=10000)
@@ -308,7 +308,7 @@ class ActivationExtractorCLT:
                 ds = ds.select_columns(["text"])
                 ds = ds.shuffle(seed=1, buffer_size=10000)
 
-            elif dataset in ["allenai/olmo-2-0425-1b-preference-mix"]:
+            elif dataset in ["allenai/olmo-2-0425-1b-preference-mix", "allenai/RLVR-GSM-MATH-IF-Mixed-Constraints"]:
                 ds = load_dataset(
                 dataset,
                 split=dataset_split,
@@ -373,17 +373,6 @@ class ActivationExtractorCLT:
 
         if pbar:
             pbar = tqdm(desc="Processing dataset")
-
-        # for i, item in enumerate(dataset):
-        #     try:
-        #         if i % 50000 == 0:
-        #             print(f'successful through e.g. {i}')
-        #             print(item['text'][:100])
-        #         ex = item['text']
-
-        #     except:
-        #         print("Error in example {i}")
-        #         jkl
 
         # print('type(dataset)=', type(dataset))
         for item in dataset:
