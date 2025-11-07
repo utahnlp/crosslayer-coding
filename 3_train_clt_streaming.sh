@@ -69,7 +69,7 @@ export MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
 export DATASET_NAME="olmo-mix-1124"
 export DATASET_SPLIT="train"
 export ACTIVATION_PATH="$DATA_DIR/activations/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}"
-export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}/${CLT_FEATURES}feats_${BATCH_SIZE}batchsize"
+export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}/${CLT_FEATURES}feats_${BATCH_SIZE}batchsize_${LEARNING_RATE}lr_${BATCHTOPK_K}batchtopk"
 
 # Streaming
 export DATASET_NAME="allenai/olmo-mix-1124"
@@ -101,7 +101,7 @@ torchrun \
     --log-interval $LOG_INTERVAL \
     --eval-interval $EVAL_INTERVAL \
     --checkpoint-interval $CHECKPOINT_INTERVAL \
-    --keep-n-checkpoints $KEEP_N_CHECKPOINTS
+    --keep-n-checkpoints $KEEP_N_CHECKPOINTS \
     --mlp-input-template "model.layers.{}.mlp.input" \
     --mlp-output-template "model.layers.{}.mlp.output" \
     --model-dtype $MODEL_DTYPE \
