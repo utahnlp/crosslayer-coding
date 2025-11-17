@@ -4,6 +4,10 @@ from nnsight import LanguageModel
 from tqdm import tqdm
 from typing import Generator, Dict, Tuple, Optional, Union, List
 import logging
+import os
+
+# manually specified features for olmo_mix since the hf dataset is not setup properly
+from clt.nnsight.olmomix_features import wiki_features, pes2o_features, algebraicstack_features, arxiv_features, dclm_features, openwebmath_features, starcoder_features, olmomix_data_files, dolmino_data_files
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -76,6 +80,7 @@ class ActivationExtractorCLT:
             "max_length": self.context_size,
             "padding": "longest",  # Ensure all sequences in the batch have the same length
             "return_tensors": "pt",  # Ensure PyTorch tensors are returned
+            "add_special_tokens": True
         }
 
         self._default_tracer_kwargs = {"scan": False, "validate": False}
@@ -238,33 +243,135 @@ class ActivationExtractorCLT:
         # Handle the case where dataset_trust_remote_code is None
         trust_remote_code = False if dataset_trust_remote_code is None else dataset_trust_remote_code
 
-        features = Features({
-            'text': Value('string'),
-            'added': Value('string'),
-            'created': Value('string'),
-            'id': Value('string'),
-            'metadata': Features({
-                'length': Value('int64'),
-                'provenance': Value('string'),
-                'revid': Value('string'),
-                'url': Value('string')
-            }),
-            'source': Value('string'),
-            'version': Value('string')
-        })
-        dataset = load_dataset(
-            dataset_path,
-            split=dataset_split,
-            streaming=streaming,
-            trust_remote_code=trust_remote_code,
-            cache_dir=cache_path,
-            features=features,
-            data_files='data/wiki/*'
-        )
+        # Normalize dataset_path to a list
+        if isinstance(dataset_path, str):
+            dataset_path = [dataset_path]
 
-        if dataset_skip is not None:
-            logger.info(f'skipping first {dataset_skip:,d} lines of dataset')
-            dataset = dataset.skip(dataset_skip)
+        def add_source_columns(subset, ds_name, ss=""):
+            return subset.map(lambda x: {"data_source": ds_name, "subset_source": ss})
+              
+        def extract_text(batch, col_names="messages"):
+            out_texts = []
+            # col_names is a list → preference dataset
+            if isinstance(col_names, list):
+                chosen_list = batch[col_names[0]]
+                rejected_list = batch[col_names[1]]
+
+                for chosen, rejected in zip(chosen_list, rejected_list):
+                    # chosen
+                    t1 = self.tokenizer.apply_chat_template(chosen, tokenize=False)
+                    # rejected
+                    t2 = self.tokenizer.apply_chat_template(rejected, tokenize=False)
+                    # query only (first message from chosen)
+                    t3 = self.tokenizer.apply_chat_template([chosen[0]], tokenize=False)
+
+                    out_texts.extend([t1, t2, t3])
+                return {"text": out_texts}
+
+            # single-column SFT dataset
+            else:
+                text = self.tokenizer.apply_chat_template(batch[col_names], tokenize=False)
+                return {"text": text}
+
+        
+        PRETRAINING = ["allenai/dolmino-mix-1124", "allenai/olmo-mix-1124"]
+        SFT = ["allenai/tulu-3-sft-olmo-2-mixture-0225"]
+        RL = ["allenai/olmo-2-0425-1b-preference-mix"] + ["allenai/RLVR-GSM-MATH-IF-Mixed-Constraints", "allenai/RLVR-MATH"]
+
+        streamed_datasets = []
+        val_set_names = set()
+        print('dataset_path=', dataset_path)
+        for dataset in dataset_path:
+            logger.info(f'Loading dataset {dataset}')
+            ds_name = "/".join(dataset.split('/'))
+            # Olmo-mix and Dolmino isn't setup properly on huggingface, so we need to load each subset individually and then interleave the subsets.
+            if dataset in PRETRAINING:
+                val_set_names.add('pretraining')
+                # We have specified the fixed datapaths in a separate file.
+                datafiles = olmomix_data_files if dataset == "allenai/olmo-mix-1124" else dolmino_data_files
+                # get each separately loaded subset
+                ds = []
+                # for sub, sub_datafiles in zip(subsets, datafiles):
+                for sub_datafiles in datafiles:
+                    # print("sub=", sub_datafiles)
+                    subset = load_dataset(
+                        dataset,
+                        split=dataset_split,
+                        streaming=streaming,
+                        trust_remote_code=trust_remote_code,
+                        cache_dir=cache_path,
+                        # features=sub,
+                        data_files=sub_datafiles
+                    )
+                    # track which dataset and subset the example is coming from
+                    ss = sub_datafiles.split('/')[1]
+                    # Keep only text column to unify schema between datasets
+                    subset = subset.select_columns(["text"]) 
+                    # Add a constant columns
+                    subset = add_source_columns(subset, ds_name, ss)
+                    # shuffle the subset
+                    subset = subset.shuffle(seed=1, buffer_size=10000)
+                    ds.append(subset)
+                
+                logger.info(f'Pretraining subsets to be interleaved: {ds}')
+                ds = interleave_datasets(ds)
+                
+            elif dataset in SFT + RL:
+                val_set_names.add('SFT') if dataset in SFT else val_set_names.add('RL')
+                ds = load_dataset(
+                        dataset,
+                        split=dataset_split,
+                        streaming=streaming,
+                        trust_remote_code=trust_remote_code,
+                        cache_dir=cache_path,
+                    )
+                # Preference data has accepted and rejected responses
+                if dataset in ["allenai/olmo-2-0425-1b-preference-mix"]:
+                    ds = ds.map(extract_text, fn_kwargs={"col_names":["chosen", "rejected"]}, batched=True)         
+                else:
+                    ds = ds.map(extract_text, fn_kwargs={"col_names":"messages"})
+                    
+                ds = ds.select_columns(["text"])
+                ds = ds = add_source_columns(ds, ds_name)
+                # ds = ds.shuffle(seed=1, buffer_size=10000)
+
+            else:
+                raise NotImplementedError("Dataset not implemented")
+            streamed_datasets.append(ds)
+            logger.info(f'Datasets to be interleaved: {streamed_datasets}')
+            
+        # multiple datasets in streaming mode. This alternates an example from each dataset
+        dataset = interleave_datasets(
+            streamed_datasets,
+            stopping_strategy="all_exhausted"
+        )
+        print('Final Dataset=', dataset)
+        N_VAL = 1000
+        VAL_SET_NAME = f"validation_set_{N_VAL}_{"_".join(val_set_names)}"
+
+        # Only create validation set since training from start of the dataset
+        if not os.path.exists(VAL_SET_NAME):
+            logger.info(f'Creating validation set with {N_VAL} examples at {VAL_SET_NAME}')
+            # Take fixed validation examples
+            val_examples = list(dataset.take(N_VAL))
+            val_dataset = Dataset.from_list(val_examples)
+            val_dataset.save_to_disk(VAL_SET_NAME)
+            logger.info(f'Created validation set with {N_VAL} examples at {VAL_SET_NAME}')
+
+            # Sanity check: load val set and save to JSON for inspection
+            val_ds = load_from_disk(VAL_SET_NAME)
+            val_ds.to_json(f"{VAL_SET_NAME}/val.json")
+        else:
+            logger.info(f"Validation set already exists at {VAL_SET_NAME}, skipping creation.")
+
+        
+        if dataset_skip is None:
+            dataset_skip = 0
+        # skip val set examples + number already trained on
+        logger.info(f'skipping {N_VAL:,d} validation examples and {dataset_skip:,d} examples already trained on')
+        dataset_skip += N_VAL
+        logger.info(f'Together, skipping first {dataset_skip:,d} lines of dataset')
+        dataset = dataset.skip(dataset_skip)
 
         if not isinstance(dataset, (Dataset, IterableDataset)):
             raise TypeError("Loaded dataset is not a Hugging Face Dataset or IterableDataset.")
@@ -276,6 +383,8 @@ class ActivationExtractorCLT:
 
         for item in dataset:
             text = item[dataset_text_column]
+            chat_template_applied = item["data_source"] in RL + SFT
+
             # Process potentially long texts into manageable chunks
             text_chunks = self._preprocess_text(text)
             # Add each chunk to batch_texts
@@ -288,6 +397,9 @@ class ActivationExtractorCLT:
 
                 try:
                     # Pre-tokenize the batch of text (key change from notebook)
+                    self.tokenizer_args["add_special_tokens"] = False if chat_template_applied else True
+                    # print(f"self.tokenizer_args", self.tokenizer_args)
+                    # print(self.tokenizer.decode([100277]))
                     tokenized_inputs = self.tokenizer(current_batch, **self.tokenizer_args)
 
                     # Move to device
