@@ -74,14 +74,25 @@ export CHECKPOINT_INTERVAL=1000
 # Paths
 export DATA_DIR="$CODE_DIR/data"
 export MODEL_NAME="allenai/OLMo-2-0425-1B-Instruct"
-export DATASET_NAME="olmo-mix-1124"
-export DATASET_NAME2="allenai/dolmino-mix-1124"
 export DATASET_SPLIT="train"
 export ACTIVATION_PATH="$DATA_DIR/activations/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}"
 export OUT_DIR="$DATA_DIR/clt/$MODEL_NAME/${DATASET_NAME}_${DATASET_SPLIT}_${DATASET_SIZE}_${ACTIVATION_DTYPE}/${CLT_FEATURES}feats_${BATCH_SIZE}batchsize"
 
+# Datasets
+export OLMO_MIX="allenai/olmo-mix-1124"
+export DOLMINO_MIX="allenai/dolmino-mix-1124"
+export TULU_SFT="allenai/tulu-3-sft-olmo-2-mixture-0225"
+export OLMO_PREFERENCE="allenai/olmo-2-0425-1b-preference-mix"
+export RLVR_MATH_MIXED="allenai/RLVR-GSM-MATH-IF-Mixed-Constraints"
+export RLVR_MATH="allenai/RLVR-MATH"
+
+#Dataset groups
+export PRETRAINING="$OLMO_MIX $DOLMINO_MIX"
+export SFT="$TULU_SFT"
+export RL="$OLMO_PREFERENCE $RLVR_MATH_MIXED $RLVR_MATH"
+
 # Streaming
-export DATASET_NAME="allenai/olmo-mix-1124"
+# export DATASET_NAME="allenai/olmo-mix-1124"
 export CONTEXT_SIZE=4096
 export INFERENCE_BATCH_SIZE=4
 export NUM_TOKENS=1000000
@@ -115,7 +126,7 @@ torchrun \
     --mlp-input-template "model.layers.{}.mlp.input" \
     --mlp-output-template "model.layers.{}.mlp.output" \
     --model-dtype $MODEL_DTYPE \
-    --dataset-path $DATASET_NAME2 $DATASET_NAME \
+    --dataset-path $RL \
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
