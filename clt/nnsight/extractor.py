@@ -1,5 +1,5 @@
 import torch
-from datasets import load_dataset, Dataset, IterableDataset, Features, Value
+from datasets import load_dataset, Dataset, IterableDataset, Features, Value, interleave_datasets, load_from_disk
 from nnsight import LanguageModel
 from tqdm import tqdm
 from typing import Generator, Dict, Tuple, Optional, Union, List
