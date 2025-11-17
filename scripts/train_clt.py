@@ -498,7 +498,7 @@ def parse_args():
         default=None,
         help="Optional model dtype (e.g., 'float16').",
     )
-    streaming_group.add_argument("--dataset-path", type=str, required=True, help="Dataset name or path.")
+    streaming_group.add_argument("--dataset-path", nargs="+", type=str, required=True, help="Dataset name or path.")
     streaming_group.add_argument("--dataset-split", type=str, default="train", help="Dataset split.")
     streaming_group.add_argument(
         "--dataset-text-column",

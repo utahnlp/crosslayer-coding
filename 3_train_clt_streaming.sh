@@ -2,18 +2,21 @@
 
 #SBATCH --job-name train_clt
 #SBATCH --account rai
-#SBATCH --partition rai-gpu-grn
-#SBATCH --qos rai-gpu-grn
+##SBATCH --partition rai-gpu-grn
+##SBATCH --qos rai-gpu-grn
+#SBATCH --partition=rai-gpu-grn 
+#SBATCH --qos=rai-gpu-grn-short
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:h200:8
-#SBATCH --time=5-00:00:00
-#SBATCH --mem=1000GB
+#SBATCH --gres=gpu:h200:1
+#SBATCH --time=1:00:00
+#SBATCH --mem=100GB
 #SBATCH --requeue
 #SBATCH -o log_train_clt_%j
 
 
 # virtual environment
 export USER="oliver"
+export USER="nate"
 
 if [ "$USER" = "oliver" ]; then
     # virtual environment for Oliver
@@ -28,8 +31,8 @@ if [ "$USER" = "oliver" ]; then
 elif [ "$USER" = "nate" ]; then
     # virtual environment for Nate
     source ~/software/pkg/miniconda3/etc/profile.d/conda.sh
-    conda activate /uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/newclt
-    export CODE_DIR="/uufs/chpc.utah.edu/common/home/u0879092/scr/transcoders/open-clts/crosslayer-coding"
+    conda activate /scratch/rai/vast1/u0879092/envs/clt
+    export CODE_DIR="/scratch/rai/vast1/u0879092/clts/crosslayer-coding"
      # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 fi
 
@@ -89,7 +92,6 @@ export CONTEXT_SIZE=4096
 export INFERENCE_BATCH_SIZE=8
 export NUM_TOKENS=1000000000000000
 
-
 torchrun \
      --nproc_per_node=auto \
      $CODE_DIR/scripts/train_clt.py \
@@ -117,7 +119,7 @@ torchrun \
     --mlp-input-template "model.layers.{}.mlp.input" \
     --mlp-output-template "model.layers.{}.mlp.output" \
     --model-dtype $MODEL_DTYPE \
-    --dataset-path $RL \
+    --dataset-path $RL $SFT \
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
