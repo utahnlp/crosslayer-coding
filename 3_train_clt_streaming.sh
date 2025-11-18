@@ -1,15 +1,13 @@
 #!/bin/bash
 
-#SBATCH --job-name train_clt
-#SBATCH --account rai
-##SBATCH --partition rai-gpu-grn
-##SBATCH --qos rai-gpu-grn
+#SBATCH --job-name=train_clt
+#SBATCH --account=rai
 #SBATCH --partition=rai-gpu-grn 
 #SBATCH --qos=rai-gpu-grn-short
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:h200:1
-#SBATCH --time=1:00:00
-#SBATCH --mem=100GB
+#SBATCH --gres=gpu:h200:8
+#SBATCH --time=5-00:00:00
+#SBATCH --mem=1000GB
 #SBATCH --requeue
 #SBATCH -o log_train_clt_%j
 
@@ -119,7 +117,7 @@ torchrun \
     --mlp-input-template "model.layers.{}.mlp.input" \
     --mlp-output-template "model.layers.{}.mlp.output" \
     --model-dtype $MODEL_DTYPE \
-    --dataset-path $RL \
+    --dataset-path $PRETRAINING \
     --context-size $CONTEXT_SIZE \
     --inference-batch-size $INFERENCE_BATCH_SIZE \
     --prepend-bos \
