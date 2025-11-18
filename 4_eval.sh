@@ -9,7 +9,7 @@
 #SBATCH --time=5-00:00:00
 #SBATCH --mem=1000GB
 #SBATCH --requeue
-#SBATCH -o log_train_clt_%j
+#SBATCH -o log_eval_clt_%j
 
 
 # virtual environment
@@ -33,15 +33,8 @@ elif [ "$USER" = "nate" ]; then
      # export PYTHONHOME=/uufs/chpc.utah.edu/common/home/u0879092/scr/scr_envs/clts
 fi
 
-
-# weights and biases will cache >100gb of artifacts, need to point to storage dir
-export WANDB_DIR="$CODE_DIR/wandb"
-export WANDB_CACHE_DIR="$WANDB_DIR/cache"
-export WANDB_ARTIFACT_DIR="$WANDB_DIR/artifacts"
-export WANDB_DATA_DIR="$WANDB_DIR/data"
-
 # CLT Architecture
-export CLT_FEATURES=100000
+export CLT_FEATURES=10000
 export BATCHTOPK_K=200
 
 # Reduced Precision
@@ -60,7 +53,7 @@ export LEARNING_RATE=0.001
 # Logging And Evaluation
 export LOG_INTERVAL=10000
 export EVAL_INTERVAL=1000000000000000
-export CHECKPOINT_INTERVAL=18847
+export CHECKPOINT_INTERVAL=1000
 export KEEP_N_CHECKPOINTS=1000000000
 
 # Paths
@@ -80,7 +73,7 @@ export NUM_TOKENS=1000000000000000
 
 torchrun \
      --nproc_per_node=auto \
-     $CODE_DIR/scripts/train_clt.py \
+     $CODE_DIR/clt_eval.py \
     --activation-source streaming \
     --output-dir $OUT_DIR \
     --model-name $MODEL_NAME \
@@ -107,10 +100,10 @@ torchrun \
     --model-dtype $MODEL_DTYPE \
     --dataset-path $DATASET_NAME \
     --context-size $CONTEXT_SIZE \
-    --inference-batch-size $INFERENCE_BATCH_SIZE \
-    --prepend-bos \
-    --enable-wandb \
-    --wandb-project "cross-layer-transcoders" \
-    --wandb-entity "utah-clt" \
+    --inference-batch-size $INFERENCE_BATCH_SIZE #\
+    # --prepend-bos \
+    # --enable-wandb \
+    # --wandb-project "cross-layer-transcoders" \
+    # --wandb-entity "utah-clt" \
     # --resume_from_checkpoint_dir $CHECKPOINT_DIR \
     # --resume_step 1234

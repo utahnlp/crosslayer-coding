@@ -378,8 +378,8 @@ class ActivationExtractorCLT:
                         f"Error processing batch: {e}. Skipping this batch.",
                         exc_info=True,
                     )
-            
-            pbar.update()
+            if pbar is not None:
+                pbar.update()
 
         # Process any remaining texts
         if batch_texts:
