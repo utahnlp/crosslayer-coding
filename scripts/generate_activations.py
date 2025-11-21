@@ -39,7 +39,7 @@ def parse_arguments():
     )
 
     # --- Dataset Source ---
-    parser.add_argument("--dataset-path", type=str, required=True, help="Dataset name or path.")
+    parser.add_argument("--dataset-path", type=str, required=True, nargs='+', help="Dataset name or path.")
     parser.add_argument("--dataset-split", type=str, default="train", help="Dataset split.")
     parser.add_argument(
         "--dataset-text-column",

@@ -221,7 +221,7 @@ class ActivationExtractorCLT:
         streaming: bool = True,
         dataset_trust_remote_code: Optional[bool] = False,
         cache_path: Optional[str] = None,
-        pbar: bool = True
+        show_pbar: bool = True
     ) -> Generator[Tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]], None, None]:
         """
         Streams paired MLP input and output activations from the model for a given dataset.
@@ -276,7 +276,7 @@ class ActivationExtractorCLT:
         
         PRETRAINING = ["allenai/dolmino-mix-1124", "allenai/olmo-mix-1124"]
         SFT = ["allenai/tulu-3-sft-olmo-2-mixture-0225"]
-        RL = ["allenai/olmo-2-0425-1b-preference-mix"] + ["allenai/RLVR-GSM-MATH-IF-Mixed-Constraints", "allenai/RLVR-MATH"]
+        RL = ["allenai/olmo-2-0425-1b-preference-mix", "allenai/RLVR-GSM-MATH-IF-Mixed-Constraints", "allenai/RLVR-MATH"]
 
         streamed_datasets = []
         val_set_names = set()
@@ -310,11 +310,11 @@ class ActivationExtractorCLT:
                     # Add a constant columns
                     subset = add_source_columns(subset, ds_name, ss)
                     # shuffle the subset
-                    subset = subset.shuffle(seed=1, buffer_size=10000)
+                    subset = subset.shuffle(seed=1, buffer_size=100000)
                     ds.append(subset)
                 
                 logger.info(f'Pretraining subsets to be interleaved: {ds}')
-                ds = interleave_datasets(ds)
+                ds = interleave_datasets(ds, seed=1)
                 
             elif dataset in SFT + RL:
                 val_set_names.add('SFT') if dataset in SFT else val_set_names.add('RL')
@@ -343,7 +343,8 @@ class ActivationExtractorCLT:
         # multiple datasets in streaming mode. This alternates an example from each dataset
         dataset = interleave_datasets(
             streamed_datasets,
-            stopping_strategy="all_exhausted"
+            stopping_strategy="all_exhausted", 
+            seed=1
         )
         print('Final Dataset=', dataset)
         N_VAL = 1000
@@ -358,9 +359,9 @@ class ActivationExtractorCLT:
             val_dataset.save_to_disk(VAL_SET_NAME)
             logger.info(f'Created validation set with {N_VAL} examples at {VAL_SET_NAME}')
 
-            # Sanity check: load val set and save to JSON for inspection
-            val_ds = load_from_disk(VAL_SET_NAME)
-            val_ds.to_json(f"{VAL_SET_NAME}/val.json")
+            # # Sanity check: load val set and save to JSON for inspection
+            # val_ds = load_from_disk(VAL_SET_NAME)
+            # val_ds.to_json(f"{VAL_SET_NAME}/val.json")
         else:
             logger.info(f"Validation set already exists at {VAL_SET_NAME}, skipping creation.")
 
@@ -378,7 +379,7 @@ class ActivationExtractorCLT:
 
         batch_texts: List[str] = []
 
-        if pbar:
+        if show_pbar:
             pbar = tqdm(desc="Processing dataset")
 
         for item in dataset:
@@ -490,7 +491,7 @@ class ActivationExtractorCLT:
                         f"Error processing batch: {e}. Skipping this batch.",
                         exc_info=True,
                     )
-            if pbar:
+            if show_pbar:
                 pbar.update()
 
         # Process any remaining texts

@@ -506,6 +506,7 @@ def parse_args():
         default="text",
         help="Dataset text column name.",
     )
+    streaming_group.add_argument("--dataset-skip", type=int, default=None, help="Number of dataset rows to skip.")
     streaming_group.add_argument(
         "--context-size",
         type=int,
@@ -550,6 +551,8 @@ def main():
     """Main function to configure and run the CLTTrainer."""
     args = parse_args()
 
+    print(args)
+
     output_dir_for_trainer_str = args.output_dir
     actual_checkpoint_path_to_load: Optional[str] = None
     resuming_run = False
@@ -592,6 +595,7 @@ def main():
             # For now, output_dir is forced to be the resume_from_checkpoint_dir
             temp_args_dict["resume_from_checkpoint_dir"] = args.resume_from_checkpoint_dir
             temp_args_dict["resume_step"] = args.resume_step
+            temp_args_dict["dataset_skip"] = int(args.resume_step * args.train_batch_size_tokens)
             temp_args_dict["output_dir"] = (
                 output_dir_for_trainer_str  # Ensure output_dir is the one we are resuming into
             )
@@ -827,6 +831,7 @@ def main():
             exclude_special_tokens=args.exclude_special_tokens,
             dataset_split=args.dataset_split,
             dataset_text_column=args.dataset_text_column,
+            dataset_skip=args.dataset_skip,
             activation_dtype=args.activation_dtype,
             dataset_path=args.dataset_path,
             context_size=args.context_size,
